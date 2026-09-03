@@ -1,0 +1,8 @@
+{
+  "schema": "kiln.project-registry.v1",
+  "destination": "ItsNotAILABS/KILN",
+  "projects": [
+    {"id":"capsulabuilder","name":"CapsulaBuilder","repository":"ItsNotAILABS/CapsulaBuilder","role":"MonadBuilder+ web and THESIS Agent Desktop","defaultBranch":"main","workspace":"monadbuilder-thesis","mcp":{"endpoint":"http://127.0.0.1:8081","mode":"governed-local"},"capabilities":["web","desktop","mcp","contracts","monad","wallet","receipts","release"]},
+    {"id":"sovereign-engine","name":"Sovereign Engine","repository":"FreddyCreates/sovereign-engine","role":"Sovereign Engine OS and Sovereign Books substrate","defaultBranch":"main","workspace":"sovereign-books","mcp":{"endpoint":"http://127.0.0.1:8082","mode":"governed-local"},"capabilities":["python","books","agents","workflows","mcp","virtual-computer","receipts","release"]}
+  ]
+}
