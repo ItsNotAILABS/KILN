@@ -15,8 +15,9 @@
 
 ## Project lanes
 
+- **pocket-os**: POCKET host, PhoneAI, MCP apps, screen vision. Already in the ecosystem — not an optional import.
 - monadbuilder-thesis: CapsulaBuilder web, desktop, MCP Spine, contracts, and Monad integrations.
-- sovereign-books: Sovereign Engine OS, Sovereign Books, agent workflows, MCP adapters, and artifacts.
+- sovereign-books: Sovereign Engine OS, Sovereign Books, agent workflows, MCP adapters, finance/infra frontend, and artifacts.
 - neurospaceai-deep-lab: NeuroEmergence Core research, cognition, memory, brain atlas, doctrine, simulation, economics, ICP canisters, and React console.
 
 ## Port allocation
@@ -24,6 +25,19 @@
 - KILN web forge: 8080
 - CapsulaBuilder MCP Spine: 8081
 - Sovereign Engine MCP/control services: 8082 and above as needed
+- NeurospaceAI MCP: 8084
+- **POCKET host: 8787**
+
+## Ecosystem repos that already come in
+
+| Project | Repository | MCP |
+|---------|------------|-----|
+| **POCKET** | ItsNotAILABS/pocket | `http://127.0.0.1:8787` |
+| CapsulaBuilder | ItsNotAILABS/CapsulaBuilder | `http://127.0.0.1:8081` |
+| Sovereign Engine | FreddyCreates/sovereign-engine | `http://127.0.0.1:8082` |
+| NeurospaceAI | ItsNotAILABS/Neurospaceai | `http://127.0.0.1:8084` |
+
+POCKET is listed in `projects/registry.json` and seeded as `itsnotailabs/pocket` in the Kiln app (`E:\KILN`).
 
 ## Authority boundary
 

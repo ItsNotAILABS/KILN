@@ -3,26 +3,25 @@
   "destination": "ItsNotAILABS/KILN",
   "projects": [
     {
+      "id": "pocket",
+      "name": "POCKET",
+      "repository": "ItsNotAILABS/pocket",
+      "role": "Native Agent OS — habitat, screen, PhoneAI, MCP, registry — already in the KILN ecosystem",
+      "defaultBranch": "main",
+      "workspace": "pocket-os",
+      "mcp": { "endpoint": "http://127.0.0.1:8787", "mode": "host" },
+      "capabilities": ["python", "phoneai", "mcp", "screen", "vision", "registry", "voice", "agent", "receipts", "release"],
+      "family": ["ItsNotAILABS/pocket-agent", "ItsNotAILABS/pocket-voice-to-text", "ItsNotAILABS/PhoneAI"]
+    },
+    {
       "id": "capsulabuilder",
       "name": "CapsulaBuilder",
       "repository": "ItsNotAILABS/CapsulaBuilder",
       "role": "MonadBuilder+ web and THESIS Agent Desktop",
       "defaultBranch": "main",
       "workspace": "monadbuilder-thesis",
-      "mcp": {
-        "endpoint": "http://127.0.0.1:8081",
-        "mode": "governed-local"
-      },
-      "capabilities": [
-        "web",
-        "desktop",
-        "mcp",
-        "contracts",
-        "monad",
-        "wallet",
-        "receipts",
-        "release"
-      ]
+      "mcp": { "endpoint": "http://127.0.0.1:8081", "mode": "governed-local" },
+      "capabilities": ["web", "desktop", "mcp", "contracts", "monad", "wallet", "receipts", "release"]
     },
     {
       "id": "sovereign-engine",
@@ -31,20 +30,8 @@
       "role": "Sovereign Engine OS and Sovereign Books substrate",
       "defaultBranch": "main",
       "workspace": "sovereign-books",
-      "mcp": {
-        "endpoint": "http://127.0.0.1:8082",
-        "mode": "governed-local"
-      },
-      "capabilities": [
-        "python",
-        "books",
-        "agents",
-        "workflows",
-        "mcp",
-        "virtual-computer",
-        "receipts",
-        "release"
-      ]
+      "mcp": { "endpoint": "http://127.0.0.1:8082", "mode": "governed-local" },
+      "capabilities": ["python", "books", "agents", "workflows", "mcp", "virtual-computer", "receipts", "release", "finance", "infra"]
     },
     {
       "id": "neurospaceai",
@@ -54,25 +41,9 @@
       "sourceLineage": "FreddyCreates/BRAIN-AI-",
       "defaultBranch": "main",
       "workspace": "neurospaceai-deep-lab",
-      "runtime": {
-        "platform": "Internet Computer",
-        "backend": "Motoko",
-        "frontend": "React + TypeScript"
-      },
-      "mcp": {
-        "endpoint": "http://127.0.0.1:8084",
-        "mode": "governed-local"
-      },
-      "capabilities": [
-        "cognition",
-        "memory",
-        "brain-atlas",
-        "doctrine",
-        "simulation",
-        "economics",
-        "icp-canisters",
-        "react-console"
-      ]
+      "runtime": { "platform": "Internet Computer", "backend": "Motoko", "frontend": "React + TypeScript" },
+      "mcp": { "endpoint": "http://127.0.0.1:8084", "mode": "governed-local" },
+      "capabilities": ["cognition", "memory", "brain-atlas", "doctrine", "simulation", "economics", "icp-canisters", "react-console"]
     }
   ]
 }

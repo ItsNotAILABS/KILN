@@ -1,0 +1,19 @@
+{
+  "schema": "kiln.project.v1",
+  "projectId": "pocket",
+  "kiln": "ItsNotAILABS/KILN",
+  "repository": "ItsNotAILABS/pocket",
+  "workspace": "pocket-os",
+  "lane": "pocket",
+  "mcpEndpoint": "http://127.0.0.1:8787",
+  "defaultBranch": "main",
+  "authority": "Agents propose. Policy evaluates. Owners approve. Wallets sign. Receipts remember.",
+  "workSurfaces": ["src/pocket", "docs", "desktop-electron", "tests"],
+  "checks": ["python -m pytest tests/test_registry.py tests/test_phoneai_mcp_apps.py tests/test_host_control_policy.py -q"],
+  "family": [
+    "ItsNotAILABS/pocket-agent",
+    "ItsNotAILABS/pocket-voice-to-text",
+    "ItsNotAILABS/PhoneAI"
+  ],
+  "comesWithKiln": true
+}

@@ -6,8 +6,10 @@ It coordinates projects, workspaces, agents, memory, MCP tools, diffs, approvals
 
 ## Linked projects
 
+- [POCKET](https://github.com/ItsNotAILABS/pocket) — Native Agent OS (PhoneAI, MCP, screen, registry). Ships in the KILN ecosystem by default. Host MCP `http://127.0.0.1:8787`.
 - [CapsulaBuilder](https://github.com/ItsNotAILABS/CapsulaBuilder) — MonadBuilder+ and THESIS Agent Desktop.
 - [sovereign-engine](https://github.com/FreddyCreates/sovereign-engine) — Sovereign Engine OS and Sovereign Books substrate.
+- [NeurospaceAI](https://github.com/ItsNotAILABS/Neurospaceai) — NeuroEmergence Core deep lab.
 
 ## Operating law
 
