@@ -21,3 +21,8 @@ See Working in KILN, the project registry, and the MCP tool contract.
 ## L1 ownership foundation
 
 See [KILN L1: Code Ownership and Provenance](docs/KILN_L1_OWNERSHIP.md) for the account, code-commit anchoring, license, agent-capability, and receipt model.
+
+
+## L1 implementation
+
+The first executable primitive is [`KilnOwnershipRegistry`](contracts/KilnOwnershipRegistry.sol). It anchors Git commit/tree digests, records explicit licenses, scopes agent capabilities, and uses two-step project transfers. It is an initial contract surface and requires chain-specific tests and an independent security audit before production deployment.
