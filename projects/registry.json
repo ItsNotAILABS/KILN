@@ -11,7 +11,17 @@
       "workspace": "pocket-os",
       "mcp": { "endpoint": "http://127.0.0.1:8787", "mode": "host" },
       "capabilities": ["python", "phoneai", "mcp", "screen", "vision", "registry", "voice", "agent", "receipts", "release"],
-      "family": ["ItsNotAILABS/pocket-agent", "ItsNotAILABS/pocket-voice-to-text", "ItsNotAILABS/PhoneAI"]
+      "family": ["ItsNotAILABS/pocket-agent", "ItsNotAILABS/pocket-voice-to-text", "ItsNotAILABS/PhoneAI", "ItsNotAILABS/pocket-mailbox"]
+    },
+    {
+      "id": "pocket-mailbox",
+      "name": "POCKET Mailbox",
+      "repository": "ItsNotAILABS/pocket-mailbox",
+      "role": "First-class agent mailbox — threads, search, archive — agents.pocket.local",
+      "defaultBranch": "main",
+      "workspace": "pocket-mailbox",
+      "mcp": { "endpoint": "http://127.0.0.1:8792", "mode": "host" },
+      "capabilities": ["mail", "python", "threads", "receipts"]
     },
     {
       "id": "capsulabuilder",
