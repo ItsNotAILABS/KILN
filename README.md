@@ -43,3 +43,9 @@ forge test
 - [Ownership registry tests](test/KilnOwnershipRegistry.t.sol)
 
 Deployments must use a dedicated deployer key supplied through the environment and require explicit network approval.
+
+
+## Public verification and sovereign network
+
+- [Public project verifier](verification/index.html)
+- [Sovereign validator/network roadmap](docs/KILN_SOVEREIGN_NETWORK.md)
