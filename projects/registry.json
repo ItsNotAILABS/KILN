@@ -3,6 +3,19 @@
   "destination": "ItsNotAILABS/KILN",
   "projects": [
     {
+      "id": "kiln-workspace",
+      "name": "KILN Workspace",
+      "repository": "ItsNotAILABS/kiln-workspace",
+      "role": "Live Kiln forge app shared by Grok Build and Codex. Custom domain later (kiln.medinatechlabs.net).",
+      "defaultBranch": "main",
+      "workspace": "kiln-forge",
+      "mcp": { "endpoint": "http://127.0.0.1:8080", "mode": "app" },
+      "lanes": { "grok": "grok/work", "codex": "codex/work" },
+      "livePreview": "https://kiln-git.grok.me/",
+      "local": ["E:\\\\KILN", "E:\\\\workspaces\\\\kiln-codex"],
+      "capabilities": ["web", "git", "studio", "mcp", "preview"]
+    },
+    {
       "id": "pocket",
       "name": "POCKET",
       "repository": "ItsNotAILABS/pocket",
