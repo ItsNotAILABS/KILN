@@ -16,3 +16,8 @@ It coordinates projects, workspaces, agents, memory, MCP tools, diffs, approvals
 KILN is a destination and control plane. Product source remains in each linked repository. Workspaces in KILN provide the shared way to open, inspect, edit, validate, diff, approve, commit, and push changes.
 
 See Working in KILN, the project registry, and the MCP tool contract.
+
+
+## L1 ownership foundation
+
+See [KILN L1: Code Ownership and Provenance](docs/KILN_L1_OWNERSHIP.md) for the account, code-commit anchoring, license, agent-capability, and receipt model.
