@@ -1,0 +1,73 @@
+name: KILN L1
+
+on:
+  push:
+    paths:
+      - "contracts/**"
+      - "script/**"
+      - "test/**"
+      - "foundry.toml"
+      - ".github/workflows/kiln-l1.yml"
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "script/**"
+      - "test/**"
+      - "foundry.toml"
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Deployment target"
+        required: true
+        default: "monad-testnet"
+        type: choice
+        options:
+          - monad-testnet
+
+jobs:
+  test:
+    name: Foundry tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install forge-std
+        run: forge install foundry-rs/forge-std --no-commit
+      - name: Run tests
+        run: forge test -vvv
+      - name: Check formatting
+        run: forge fmt --check
+
+  anvil:
+    name: Local Anvil deployment
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install forge-std
+        run: forge install foundry-rs/forge-std --no-commit
+      - name: Start Anvil
+        run: anvil --host 127.0.0.1 --port 8545 > /tmp/anvil.log 2>&1 &
+      - name: Deploy registry to Anvil
+        env:
+          DEPLOYER_PRIVATE_KEY: "0x59c6995e998f97a5a0044976f0945389dc9e86dae88c7a5c4c5d1f8f6f1f6f1"
+        run: forge script script/DeployKilnOwnershipRegistry.s.sol:DeployKilnOwnershipRegistry --rpc-url http://127.0.0.1:8545 --broadcast -vvv
+      - name: Show Anvil log on failure
+        if: failure()
+        run: cat /tmp/anvil.log
+
+  monad-testnet:
+    name: Monad testnet deployment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.network == 'monad-testnet'
+    environment: monad-testnet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install forge-std
+        run: forge install foundry-rs/forge-std --no-commit
+      - name: Deploy ownership registry
+        env:
+          DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+        run: forge script script/DeployKilnOwnershipRegistry.s.sol:DeployKilnOwnershipRegistry --rpc-url ${{ secrets.MONAD_TESTNET_RPC_URL }} --broadcast --slow -vvv
