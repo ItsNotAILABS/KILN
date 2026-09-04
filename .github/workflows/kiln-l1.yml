@@ -51,7 +51,7 @@ jobs:
         run: anvil --host 127.0.0.1 --port 8545 > /tmp/anvil.log 2>&1 &
       - name: Deploy registry to Anvil
         env:
-          DEPLOYER_PRIVATE_KEY: "0x59c6995e998f97a5a0044976f0945389dc9e86dae88c7a5c4c5d1f8f6f1f6f1"
+          DEPLOYER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2a0c5"
         run: forge script script/DeployKilnOwnershipRegistry.s.sol:DeployKilnOwnershipRegistry --rpc-url http://127.0.0.1:8545 --broadcast -vvv
       - name: Show Anvil log on failure
         if: failure()
