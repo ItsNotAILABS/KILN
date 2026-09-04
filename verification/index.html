@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KILN Project Verification</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 760px; margin: 4rem auto; padding: 0 1.25rem; background: #0b1020; color: #e8eefc; }
+    h1 { letter-spacing: .04em; }
+    form, #result { background: #121a30; border: 1px solid #2b3a61; border-radius: 12px; padding: 1.25rem; margin-top: 1rem; }
+    label { display: block; margin: .8rem 0 .3rem; color: #aab9d9; }
+    input { width: 100%; box-sizing: border-box; padding: .7rem; border-radius: 8px; border: 1px solid #40527f; background: #0b1020; color: inherit; }
+    button { margin-top: 1rem; padding: .7rem 1rem; border: 0; border-radius: 8px; background: #6ee7d8; color: #07131d; font-weight: 700; cursor: pointer; }
+    dl { display: grid; grid-template-columns: 170px 1fr; gap: .65rem; overflow-wrap: anywhere; }
+    dt { color: #91a3ca; } dd { margin: 0; }
+    .muted { color: #aab9d9; }
+    .error { color: #ff9b9b; }
+  </style>
+</head>
+<body>
+  <h1>KILN Project Verification</h1>
+  <p class="muted">Read-only verification of an on-chain KILN ownership and Git provenance record.</p>
+  <form id="verify-form">
+    <label for="rpc">JSON-RPC URL</label>
+    <input id="rpc" required placeholder="https://..." />
+    <label for="registry">KilnOwnershipRegistry address</label>
+    <input id="registry" required placeholder="0x..." />
+    <label for="project">Project ID (bytes32 hex)</label>
+    <input id="project" required placeholder="0x..." />
+    <button type="submit">Verify project</button>
+  </form>
+  <section id="result" hidden></section>
+  <script type="module">
+    import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.15.0/+esm";
+
+    const abi = [
+      "function getProject(bytes32) view returns (tuple(address owner,address pendingOwner,string repositoryUri,bytes32 licenseId,bytes32 latestCommit,bytes32 latestTree,bytes32 metadataDigest,uint64 registeredAt,uint64 updatedAt))"
+    ];
+    const form = document.querySelector("#verify-form");
+    const result = document.querySelector("#result");
+
+    const row = (label, value) => "<dt>" + label + "</dt><dd>" + String(value) + "</dd>";
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      result.hidden = false;
+      result.className = "";
+      result.textContent = "Reading registry…";
+      try {
+        const provider = new ethers.JsonRpcProvider(document.querySelector("#rpc").value.trim());
+        const registry = new ethers.Contract(document.querySelector("#registry").value.trim(), abi, provider);
+        const project = await registry.getProject(document.querySelector("#project").value.trim());
+        result.innerHTML = "<h2>Verified registry record</h2><dl>"
+          + row("Owner", project.owner)
+          + row("Pending owner", project.pendingOwner)
+          + row("Repository", project.repositoryUri)
+          + row("License ID", project.licenseId)
+          + row("Latest Git commit", project.latestCommit)
+          + row("Latest Git tree", project.latestTree)
+          + row("Metadata digest", project.metadataDigest)
+          + row("Registered", new Date(Number(project.registeredAt) * 1000).toISOString())
+          + row("Updated", new Date(Number(project.updatedAt) * 1000).toISOString())
+          + "</dl>";
+      } catch (error) {
+        result.className = "error";
+        result.textContent = "Verification failed: " + (error.shortMessage || error.message || error);
+      }
+    });
+  </script>
+</body>
+</html>
