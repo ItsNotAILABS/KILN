@@ -17,6 +17,7 @@
 
 - monadbuilder-thesis: CapsulaBuilder web, desktop, MCP Spine, contracts, and Monad integrations.
 - sovereign-books: Sovereign Engine OS, Sovereign Books, agent workflows, MCP adapters, and artifacts.
+- neurospaceai-deep-lab: NeuroEmergence Core research, cognition, memory, brain atlas, doctrine, simulation, economics, ICP canisters, and React console.
 
 ## Port allocation
 
