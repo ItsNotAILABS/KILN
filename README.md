@@ -26,3 +26,20 @@ See [KILN L1: Code Ownership and Provenance](docs/KILN_L1_OWNERSHIP.md) for the 
 ## L1 implementation
 
 The first executable primitive is [`KilnOwnershipRegistry`](contracts/KilnOwnershipRegistry.sol). It anchors Git commit/tree digests, records explicit licenses, scopes agent capabilities, and uses two-step project transfers. It is an initial contract surface and requires chain-specific tests and an independent security audit before production deployment.
+
+
+## Build the ownership contract
+
+The contract scaffold uses Foundry:
+
+```bash
+forge install foundry-rs/forge-std --no-commit
+forge test
+```
+
+- [Account and signing flow](docs/KILN_ACCOUNT_FLOW.md)
+- [Foundry configuration](foundry.toml)
+- [Deployment script](script/DeployKilnOwnershipRegistry.s.sol)
+- [Ownership registry tests](test/KilnOwnershipRegistry.t.sol)
+
+Deployments must use a dedicated deployer key supplied through the environment and require explicit network approval.
