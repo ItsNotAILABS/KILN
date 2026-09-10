@@ -67,6 +67,33 @@
       "runtime": { "platform": "Internet Computer", "backend": "Motoko", "frontend": "React + TypeScript" },
       "mcp": { "endpoint": "http://127.0.0.1:8084", "mode": "governed-local" },
       "capabilities": ["cognition", "memory", "brain-atlas", "doctrine", "simulation", "economics", "icp-canisters", "react-console"]
+    },
+    {
+      "id": "auro14b",
+      "name": "Auro14B",
+      "repository": "ItsNotAILABS/Auro14B",
+      "role": "Medina native model family — composable checkpoints, micro/core models and governed orchestration lanes on the MESIE compute plane",
+      "defaultBranch": "main",
+      "workspace": "auro-family",
+      "capabilities": ["python", "models", "checkpoints", "orchestration", "receipts", "release"]
+    },
+    {
+      "id": "capsula",
+      "name": "CAPSULA",
+      "repository": "ItsNotAILABS/CAPSULA",
+      "role": "CAPSULA Studio — isolated runtime, build, preview and deployment-plan platform; bounded execution capsules for the POCKET/NEXUS ecosystem",
+      "defaultBranch": "main",
+      "workspace": "capsula-studio",
+      "capabilities": ["web", "typescript", "runtime", "receipts", "release"]
+    },
+    {
+      "id": "sovereign",
+      "name": "Sovereign",
+      "repository": "FreddyCreates/sovereign",
+      "role": "SOVEREIGN application surface (Caffeine project export)",
+      "defaultBranch": "main",
+      "workspace": "sovereign-app",
+      "capabilities": ["web", "typescript"]
     }
   ]
 }
