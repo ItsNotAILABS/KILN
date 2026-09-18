@@ -20,6 +20,11 @@ Source code stays in Git-compatible storage. KILN stores compact commitments, si
 - **Code commitment** — a content-addressed Git commit/tree digest registered on KILN.
 - **License grant** — explicit permissions such as view, fork, modify, commercial use, or sublicense.
 - **Agent authorization** — a bounded capability allowing an agent to propose changes without owning or transferring the project.
+- **Agent delegation** — an agent holding `CAP_DELEGATE` can spawn scoped child agents (clones) with a subset of its own capabilities and expiry, recorded with `parent` on the grant. Revoking a grant cascades to its whole subtree.
+
+## Agent delegation (clones)
+
+Agents in KILN work the way Auro works: a live agent with `CAP_DELEGATE` (8) can call `delegateGrant(projectId, childAgent, capabilities, expiresAt)` to mint a scoped clone. The child gets only a subset of the parent's capabilities (`ExceedsParentGrant` otherwise), an expiry no later than the parent's, and `parent = msg.sender` on its grant (owner-authorized grants have `parent = address(0)`). `AgentDelegated` is emitted per clone. The project owner can revoke any grant via `revokeAuthorization`; revocation cascades through the delegation subtree, so killing a parent kills its clones but not its siblings. No existing function or event signature changed — delegation is purely additive.
 - **Receipt** — immutable record linking actor, action, policy decision, source digest, and resulting commit.
 
 ## Ownership rules

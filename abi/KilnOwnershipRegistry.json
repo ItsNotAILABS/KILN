@@ -1,0 +1,665 @@
+{
+  "contractName": "KilnOwnershipRegistry",
+  "abi": [
+    {
+      "type": "function",
+      "name": "CAP_COMMIT",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "CAP_DELEGATE",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "CAP_PROPOSE",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "CAP_RELEASE",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "acceptTransfer",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "authorizeAgent",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agent",
+          "type": "address",
+          "internalType": "address"
+        },
+        {
+          "name": "capabilities",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "expiresAt",
+          "type": "uint64",
+          "internalType": "uint64"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "commitProject",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "gitCommit",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "treeDigest",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "metadataDigest",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "delegateGrant",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "childAgent",
+          "type": "address",
+          "internalType": "address"
+        },
+        {
+          "name": "capabilities",
+          "type": "uint256",
+          "internalType": "uint256"
+        },
+        {
+          "name": "expiresAt",
+          "type": "uint64",
+          "internalType": "uint64"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "getAgentGrant",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agent",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "tuple",
+          "internalType": "struct KilnOwnershipRegistry.AgentGrant",
+          "components": [
+            {
+              "name": "capabilities",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "expiresAt",
+              "type": "uint64",
+              "internalType": "uint64"
+            },
+            {
+              "name": "parent",
+              "type": "address",
+              "internalType": "address"
+            }
+          ]
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "getLicensePermissions",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "grantee",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "getProject",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "tuple",
+          "internalType": "struct KilnOwnershipRegistry.Project",
+          "components": [
+            {
+              "name": "owner",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "pendingOwner",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "repositoryUri",
+              "type": "string",
+              "internalType": "string"
+            },
+            {
+              "name": "licenseId",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "latestCommit",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "latestTree",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "metadataDigest",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "registeredAt",
+              "type": "uint64",
+              "internalType": "uint64"
+            },
+            {
+              "name": "updatedAt",
+              "type": "uint64",
+              "internalType": "uint64"
+            }
+          ]
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "grantLicense",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "grantee",
+          "type": "address",
+          "internalType": "address"
+        },
+        {
+          "name": "permissions",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "registerProject",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "repositoryUri",
+          "type": "string",
+          "internalType": "string"
+        },
+        {
+          "name": "owner",
+          "type": "address",
+          "internalType": "address"
+        },
+        {
+          "name": "licenseId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "revokeAuthorization",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agent",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "transferProject",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "recipient",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "event",
+      "name": "AgentAuthorizationRevoked",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agent",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "AgentAuthorized",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agent",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "capabilities",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "expiresAt",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "AgentDelegated",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "parentAgent",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "childAgent",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "capabilities",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "expiresAt",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "CommitAnchored",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "actor",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "gitCommit",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "treeDigest",
+          "type": "bytes32",
+          "indexed": false,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "metadataDigest",
+          "type": "bytes32",
+          "indexed": false,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "timestamp",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "LicenseGranted",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "grantee",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "permissions",
+          "type": "uint256",
+          "indexed": false,
+          "internalType": "uint256"
+        },
+        {
+          "name": "timestamp",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "ProjectRegistered",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "owner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "repositoryUri",
+          "type": "string",
+          "indexed": false,
+          "internalType": "string"
+        },
+        {
+          "name": "licenseId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "timestamp",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "TransferAccepted",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "previousOwner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "newOwner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "TransferProposed",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "currentOwner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "recipient",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "error",
+      "name": "ExceedsParentGrant",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "GrantExpired",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "InvalidOwner",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "InvalidProjectId",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "NotAuthorizedAgent",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "NotProjectOwner",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "ProjectAlreadyRegistered",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "ProjectNotFound",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "TransferNotPending",
+      "inputs": []
+    }
+  ]
+}
