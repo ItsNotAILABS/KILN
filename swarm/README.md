@@ -77,6 +77,30 @@ const nodes = await swarm.listNodes();
 const check = await swarm.verifyReceipts(); // { results, allOk }
 ```
 
+### depositCode — agents contributing code
+
+`depositCode({ repo, files, message })` is the first-class primitive for an
+agent (Muse, a forge agent, an external agent via the API) to contribute code
+into a KILN project. It spawns a fresh node with **only `CAP_COMMIT`**, which
+really `git clone`s the repo, writes the files, and commits:
+
+```js
+const deposit = await swarm.depositCode({
+  repo: "/path/to/project",          // or a git URL the worker can clone
+  files: [
+    { path: "src/hello.js", content: "export function hello() { return 1; }\n" },
+  ],
+  message: "deposit: hello module",
+});
+// deposit = { nodeId, nodeName, jobId, commitHash, summary, receipts }
+// receipts.allOk === true, receipts.results has the node's signed receipts
+```
+
+Without `CAP_COMMIT` the worker's `git.commit` is refused *before* anything
+runs — the job fails loudly and **no commit is created**. The commit hash
+returned is parsed from the worker's real `git commit` output; it is never
+invented.
+
 API surface: `POST /jobs`, `GET /jobs`, `GET /jobs/:id`, `POST /nodes`,
 `GET /nodes`, `POST /nodes/:id/stop`, `GET /nodes/:id/logs`,
 `POST /receipts/verify`, `GET /health`.

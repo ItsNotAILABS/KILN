@@ -13,6 +13,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { CAP_COMMIT } from "./grant.mjs";
 
 export class SwarmError extends Error {
   constructor(status, message) {
@@ -110,4 +111,63 @@ export class SwarmClient {
     const res = await fetch(this.baseUrl + "/health");
     return res.json();
   }
+
+  /**
+   * depositCode — THE primitive for agents contributing code into KILN.
+   * Spawns a fresh node with ONLY CAP_COMMIT (minimal grant), which really
+   * git-clones `repo`, writes each file, and commits with `message`.
+   * Returns {nodeId, nodeName, jobId, commitHash, summary, receipts}.
+   *
+   * The commit hash is parsed from the worker's real `git commit` output;
+   * receipts are the node's own signed receipts for the deposit. If the
+   * node lacked CAP_COMMIT, git.commit would be refused before running
+   * and no commit would be created — depositCode never invents a hash.
+   */
+  async depositCode({ repo, files, message, name, ttlSec = 86400, nodeTimeoutMs = 90000 } = {}) {
+    if (!repo || typeof repo !== "string") throw new Error("depositCode: repo is required (path or URL the worker clones)");
+    if (!Array.isArray(files) || !files.length) throw new Error("depositCode: files[] is required");
+    for (const f of files) {
+      if (!f || typeof f.path !== "string" || typeof f.content !== "string") {
+        throw new Error("depositCode: each file needs {path, content} strings");
+      }
+    }
+    if (!message || !String(message).trim()) throw new Error("depositCode: message is required");
+
+    const nodeName = name || `deposit-${Date.now().toString(36)}`;
+    const { id: nodeId } = await this.spawnNode({
+      name: nodeName, caps: CAP_COMMIT, ttlSec, repo, mind: "script",
+    });
+
+    // Wait for the daemon to start the worker (its next tick).
+    const t0 = Date.now();
+    for (;;) {
+      const nodes = await this.listNodes();
+      const node = nodes.find((n) => n.id === nodeId);
+      if (node && (node.status === "idle" || node.status === "working")) break;
+      if (Date.now() - t0 > nodeTimeoutMs) {
+        throw new Error(`depositCode: node ${nodeName} never came up (status=${node ? node.status : "missing"})`);
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    const plan = {
+      steps: [
+        ...files.map((f) => ({ tool: "fs.write", args: { path: f.path, content: f.content } })),
+        { tool: "git.commit", args: { message: String(message) } },
+      ],
+    };
+    const { id: jobId } = await this.submitJob({
+      name: `${nodeName}-deposit`, plan, mind: "script", node: nodeId,
+    });
+    const job = await this.waitForJob(jobId);
+    const commitHash = parseCommitHash(job.summary);
+    const receipts = await this.verifyReceipts(nodeId);
+    return { nodeId, nodeName, jobId, commitHash, summary: job.summary, receipts };
+  }
+}
+
+/** Pull the short hash out of `git commit` output: "[main c081437] msg". */
+function parseCommitHash(summary) {
+  const m = /\[.*\b([0-9a-f]{7,40})\]/.exec(String(summary || ""));
+  return m ? m[1] : null;
 }
