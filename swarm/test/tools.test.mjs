@@ -4,12 +4,25 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { runTool, jailPath } from "../lib/tools.mjs";
-import { CAP_COMMIT } from "../lib/grant.mjs";
+import { CAP_COMMIT, CAP_RELEASE } from "../lib/grant.mjs";
 import { makeStateDir, makeNode, makeGitRepo, gitLog } from "./helpers.mjs";
 import { verifyReceipts } from "../lib/receipts.mjs";
+
+/** A temp git repo containing a dummy release script. The script really runs. */
+function makeReleaseRepo() {
+  const repo = makeGitRepo();
+  writeFileSync(
+    join(repo, "release.mjs"),
+    `import { writeFileSync } from "node:fs";\nwriteFileSync("RELEASED.txt", "released by project.release\\n");\nconsole.log("release ok");\n`
+  );
+  spawnSync("git", ["add", "-A"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "add release script"], { cwd: repo });
+  return repo;
+}
 
 describe("jail", () => {
   it("rejects path traversal", () => {
@@ -99,6 +112,40 @@ describe("git tools", () => {
     const lg = await runTool(ctx, "git.log", { n: 3 });
     assert.equal(lg.ok, true);
     assert.match(lg.out, /seed commit/);
+  });
+});
+
+describe("project.release", () => {
+  it("is REFUSED without CAP_RELEASE and writes nothing", async () => {
+    const dir = makeStateDir();
+    const { ctx, node } = makeNode(dir, { caps: CAP_COMMIT, repo: makeReleaseRepo() });
+    await assert.rejects(
+      runTool(ctx, "project.release", { command: "node", args: ["release.mjs"] }),
+      (e) => e.code === "MISSING_CAPABILITY"
+    );
+    assert.equal(existsSync(join(node.workdir, "RELEASED.txt")), false);
+  });
+  it("runs the real release command with CAP_RELEASE", async () => {
+    const dir = makeStateDir();
+    const { ctx, node } = makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
+    const r = await runTool(ctx, "project.release", { command: "node", args: ["release.mjs"] });
+    assert.equal(r.ok, true);
+    assert.match(r.out, /release ok/);
+    assert.equal(readFileSync(join(node.workdir, "RELEASED.txt"), "utf8"), "released by project.release\n");
+  });
+  it("reports a failing release command honestly", async () => {
+    const dir = makeStateDir();
+    const { ctx } = makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
+    const r = await runTool(ctx, "project.release", { command: "node", args: ["-e", "process.exit(3)"] });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /exit 3/);
+  });
+  it("is jailed like shell.exec", async () => {
+    const dir = makeStateDir();
+    const { ctx } = makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
+    const r = await runTool(ctx, "project.release", { command: "node", args: ["-e", "x; y"] });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /denied pattern/);
   });
 });
 

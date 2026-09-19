@@ -3,7 +3,7 @@
  * (in-process enforcement; chain uses block.timestamp, here we use unix time).
  *
  *   CAP_COMMIT   = 1  (enforced: git.commit, and on-chain commitProject)
- *   CAP_RELEASE  = 2  (declared; reserved for release actions)
+ *   CAP_RELEASE  = 2  (enforced: project.release — running a repo's release command)
  *   CAP_PROPOSE  = 4  (enforced: swarm.submit — proposing work)
  *   CAP_DELEGATE = 8  (enforced: swarm.spawn / delegateGrant — spawning child nodes)
  */

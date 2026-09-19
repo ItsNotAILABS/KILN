@@ -3,6 +3,14 @@
   "destination": "ItsNotAILABS/KILN",
   "projects": [
     {
+      "id": "kiln",
+      "name": "KILN",
+      "repository": "ItsNotAILABS/KILN",
+      "role": "KILN on-chain registry contracts (Foundry) — KilnOwnershipRegistry and the swarm runtime",
+      "defaultBranch": "main",
+      "capabilities": ["contracts", "receipts"]
+    },
+    {
       "id": "kiln-workspace",
       "name": "KILN Workspace",
       "repository": "ItsNotAILABS/kiln-workspace",

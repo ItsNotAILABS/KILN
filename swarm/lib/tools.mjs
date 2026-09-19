@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
 import { join, resolve, sep, basename } from "node:path";
 import {
-  CAP_COMMIT, CAP_PROPOSE, CAP_DELEGATE, checkGrant, delegateGrant, nowSec, GrantError,
+  CAP_COMMIT, CAP_RELEASE, CAP_PROPOSE, CAP_DELEGATE, checkGrant, delegateGrant, nowSec, GrantError,
 } from "./grant.mjs";
 import { appendReceipt } from "./receipts.mjs";
 import { appendEvent, newJobId } from "./queue.mjs";
@@ -56,6 +56,24 @@ function checkShellArgs(command, args) {
 
 const MAX_OUTPUT = 64 * 1024;
 
+/** Shared jailed execution for shell.exec and project.release. */
+async function execJailed(workdir, command, cmdArgs, timeoutMs) {
+  const kind = checkShellArgs(command, cmdArgs);
+  let bin = command;
+  if (kind === "path-command") bin = jailPath(workdir, command);
+  return await runCmd(bin, cmdArgs.map(String), { cwd: workdir, timeoutMs });
+}
+
+function execArgs(workdir, args, what, defaultTimeoutMs) {
+  const command = needStr(args, "command");
+  const cmdArgs = args.args === undefined ? [] : needArr(args, "args");
+  const timeoutMs = args.timeoutMs === undefined ? defaultTimeoutMs : needNum(args, "timeoutMs");
+  if (!(timeoutMs >= 100 && timeoutMs <= 300000)) {
+    throw new ToolError(`${what}: timeoutMs out of range 100..300000`);
+  }
+  return execJailed(workdir, command, cmdArgs, timeoutMs);
+}
+
 function runCmd(command, args, { cwd, timeoutMs }) {
   return new Promise((resolveOut) => {
     let stdout = "", stderr = "", truncated = false, done = false;
@@ -101,6 +119,7 @@ export const TOOL_DEFS = [
   { name: "git.status", caps: 0, desc: "git status --porcelain in the work dir", args: {} },
   { name: "git.log", caps: 0, desc: "git log --oneline in the work dir", args: { n: "number?" } },
   { name: "git.commit", caps: CAP_COMMIT, desc: "git add -A && git commit (needs CAP_COMMIT)", args: { message: "string" } },
+  { name: "project.release", caps: CAP_RELEASE, desc: "Run a repo's release command, jailed like shell.exec (needs CAP_RELEASE)", args: { command: "string", args: "string[]?", timeoutMs: "number?" } },
   { name: "swarm.spawn", caps: CAP_DELEGATE, desc: "Spawn a child node with subset caps (needs CAP_DELEGATE)", args: { name: "string", capabilities: "number", ttlSec: "number", repo: "string?", mind: "string?" } },
   { name: "swarm.submit", caps: CAP_PROPOSE, desc: "Submit a job plan to the queue (needs CAP_PROPOSE)", args: { plan: "object", name: "string?", mind: "string?" } },
 ];
@@ -134,14 +153,7 @@ async function impl(ctx, name, args) {
       return { ok: true, out: readdirSync(p).join("\n") };
     }
     case "shell.exec": {
-      const command = needStr(args, "command");
-      const cmdArgs = args.args === undefined ? [] : needArr(args, "args");
-      const timeoutMs = args.timeoutMs === undefined ? 30000 : needNum(args, "timeoutMs");
-      if (!(timeoutMs >= 100 && timeoutMs <= 300000)) throw new ToolError("shell.exec: timeoutMs out of range 100..300000");
-      const kind = checkShellArgs(command, cmdArgs);
-      let bin = command;
-      if (kind === "path-command") bin = jailPath(workdir, command);
-      return await runCmd(bin, cmdArgs.map(String), { cwd: workdir, timeoutMs });
+      return await execArgs(workdir, args, "shell.exec", 30000);
     }
     case "git.status": {
       return await runCmd("git", ["status", "--porcelain=v1"], { cwd: workdir, timeoutMs: 15000 });
@@ -156,6 +168,11 @@ async function impl(ctx, name, args) {
       const add = await runCmd("git", ["add", "-A"], { cwd: workdir, timeoutMs: 30000 });
       if (!add.ok) return add;
       return await runCmd("git", ["commit", "-m", message], { cwd: workdir, timeoutMs: 30000 });
+    }
+    case "project.release": {
+      // CAP_RELEASE is enforced by runTool before we get here (TOOL_DEFS caps).
+      // Runs the repo's own release command, jailed exactly like shell.exec.
+      return await execArgs(workdir, args, "project.release", 60000);
     }
     case "swarm.spawn": {
       const childCaps = needNum(args, "capabilities");

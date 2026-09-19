@@ -34,8 +34,9 @@ as **an entire OS process**. Zero dependencies, plain Node `.mjs`.
 - **Tools** — all real, all jailed to the node's work dir (a git clone):
   `fs.read/write/list`, `shell.exec` (no shell, argv only, denylist, timeout,
   cwd jail — escape attempts fail), `git.status/log/commit`,
-  `swarm.spawn`, `swarm.submit`. Nothing is simulated; if something can't run,
-  it fails loudly.
+  `project.release` (runs a repo's release command — needs `CAP_RELEASE` (2),
+  refused loudly without it, no side effects), `swarm.spawn`, `swarm.submit`.
+  Nothing is simulated; if something can't run, it fails loudly.
 
 ## Quickstart
 
@@ -112,6 +113,62 @@ interface. Every route except `GET /health` requires
 reads it for you; `swarm.mjs daemon token` prints it for wiring other local
 services. There is no user system and no remote access by design.
 
+## Nightly test workers
+
+`nightly.mjs` runs the test suites of registered KILN projects on real worker
+nodes — one node per project, each a fresh clone, `CAP_COMMIT`, script mind:
+
+```sh
+node nightly.mjs                 # all configured projects
+node nightly.mjs --project kiln  # just one
+```
+
+It reads `../projects/registry.json` (canonical project list) and
+`nightly.config.json` (per-project local checkout + test command). A project
+runs only if it is **registered**, its local checkout exists, and its test
+binary is on `PATH` — anything else is skipped loudly, never silently. If the
+daemon is down it exits 1 and prints the exact `daemon start` fix command.
+
+Adding a project: (1) register it in `projects/registry.json`, (2) make sure a
+checkout exists on the machine, (3) add an entry to `nightly.config.json`:
+
+```json
+"my-project": {
+  "local": "~/workspace/repos/my-project",
+  "setup": [["npm", "ci", "--no-audit", "--no-fund"]],
+  "test": { "command": "npm", "args": ["test"], "timeoutMs": 300000 }
+}
+```
+
+Optional `"release": { "command": ..., "args": [...] }` declares the repo's
+real release command for `CAP_RELEASE`-gated release workers. Leave it out
+until the project has a real one — nightly never invents release processes.
+
+## Long-task offload (http mind)
+
+A job can run under the `http` mind instead of `script` — the worker hands the
+job to a real model, which then drives the same grant-checked, receipted
+tools. Mind selection is per job: `job.mind || node.mind || "script"`, so:
+
+```sh
+node swarm.mjs job submit --plan examples/long-task.json --name my-long-task --mind http
+# or: await swarm.submitJob({ name, plan: {...}, mind: "http" })
+```
+
+`examples/long-task.json` is the template: `{task, deliverable, constraints}` —
+the whole object becomes the model's task brief. Setup:
+
+```sh
+KILN_MIND_URL=https://your-endpoint/v1/chat/completions \
+KILN_MIND_MODEL=your-model \
+KILN_MIND_API_KEY=... \
+node swarm.mjs daemon start
+```
+
+Workers inherit the daemon's environment, so the URL must be set **before**
+`daemon start`. Without a real `KILN_MIND_URL` the http mind **refuses
+loudly** — the plumbing is real, the model is yours to plug in.
+
 ## Honesty notes
 
 - Tool calls really execute: real file writes, real `git`, real subprocesses.
@@ -125,8 +182,9 @@ services. There is no user system and no remote access by design.
 - Job submission via CLI/API is operator-level (like the contract owner);
   capability grants are enforced where work happens: inside the worker,
   before every tool call, and on delegation.
-- `CAP_RELEASE` (2) is declared and reserved, matching the on-chain registry;
-  no tool consumes it yet — the grant panel says so rather than implying it.
+- `CAP_RELEASE` (2) is enforced by `project.release`: without it the call is
+  refused before anything executes. The on-chain registry declares the same
+  bit; the swarm consumes it for real release commands.
 
 ## Tests
 
@@ -136,7 +194,10 @@ node --test test/*.test.mjs
 
 Covers: grant enforcement + delegation subset/expiry (mirrors the contract),
 receipt sign/verify/tamper/chain-break, queue persistence across a simulated
-restart, shell+fs jail escapes, real git commits, script-mind plans, the http
-mind against a stub completions server (plus its loud refusal with no URL),
-and a full worker-process end-to-end (real file, real commit, verified
-receipts), plus the HTTP API + SDK against a real daemon.
+restart, shell+fs jail escapes, real git commits, `project.release` gating on
+`CAP_RELEASE` (runs for real / refused with no side effects), script-mind
+plans, the http mind against a stub completions server (plus its loud refusal
+with no URL, and the `examples/long-task.json` template shape end to end),
+nightly plan building + the loud daemon-down failure, and a full
+worker-process end-to-end (real file, real commit, verified receipts), plus
+the HTTP API + SDK against a real daemon.

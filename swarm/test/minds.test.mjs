@@ -3,9 +3,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { runScriptMind, runHttpMind } from "../lib/minds.mjs";
 import { makeStateDir, makeNode } from "./helpers.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 describe("script mind", () => {
   it("executes a multi-step plan for real", async () => {
@@ -115,6 +118,52 @@ describe("http mind", () => {
     process.env.KILN_MIND_URL = `http://127.0.0.1:${port}/x`;
     try {
       await assert.rejects(() => runHttpMind(ctx, {}), /no choices\[0\]\.message|did not return JSON/);
+    } finally {
+      if (oldUrl === undefined) delete process.env.KILN_MIND_URL;
+      else process.env.KILN_MIND_URL = oldUrl;
+      server.close();
+    }
+  });
+
+  it("runs the examples/long-task.json template shape end to end", async () => {
+    // The worker hands a long-task job to the http mind as
+    //   brief = `${job.name}: ${JSON.stringify(job.plan)}`
+    // (see lib/worker.mjs runJob). Prove that exact shape works.
+    const plan = JSON.parse(readFileSync(join(HERE, "..", "examples", "long-task.json"), "utf8"));
+    assert.ok(typeof plan.task === "string" && plan.task.length > 0, "template needs a task brief");
+    let calls = 0;
+    let sawBrief = "";
+    const { server, port } = await stubServer((req) => {
+      calls++;
+      sawBrief = req.messages.find((m) => m.role === "user")?.content || "";
+      assert.ok(sawBrief.includes("my-long-task"), "stub: job name must reach the model in the brief");
+      assert.ok(sawBrief.includes(plan.task.slice(0, 40)), "stub: template task text must reach the model");
+      if (calls === 1) {
+        return {
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: "call_lt", type: "function",
+                function: { name: "fs.write", arguments: JSON.stringify({ path: "LONGTASK.md", content: "long task done\n" }) },
+              }],
+            },
+            finish_reason: "tool_calls",
+          }],
+        };
+      }
+      return { choices: [{ message: { content: "long task complete" }, finish_reason: "stop" }] };
+    });
+    const dir = makeStateDir();
+    const { ctx, node } = makeNode(dir);
+    const oldUrl = process.env.KILN_MIND_URL;
+    process.env.KILN_MIND_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
+    try {
+      // Exactly what worker.mjs does for a mind=http job:
+      const brief = `my-long-task: ${JSON.stringify(plan).slice(0, 2000)}`;
+      const summary = await runHttpMind(ctx, { brief });
+      assert.match(summary, /long task complete/);
+      assert.equal(calls, 2);
+      assert.equal(readFileSync(join(node.workdir, "LONGTASK.md"), "utf8"), "long task done\n");
     } finally {
       if (oldUrl === undefined) delete process.env.KILN_MIND_URL;
       else process.env.KILN_MIND_URL = oldUrl;
