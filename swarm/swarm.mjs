@@ -31,6 +31,7 @@ import { loadKeyFile } from "./lib/state.mjs";
 import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
 import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
+import { createRepo, listRepos } from "./lib/git.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -238,17 +239,79 @@ function apiBase(dir) {
 
 async function apiCall(dir, method, p, body) {
   const token = loadApiToken(dir);
-  const res = await fetch(apiBase(dir) + p, {
-    method,
-    headers: {
-      "authorization": `Bearer ${token}`,
-      ...(body ? { "content-type": "application/json" } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(apiBase(dir) + p, {
+      method,
+      headers: {
+        "authorization": `Bearer ${token}`,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    // fetch() throws a bare TypeError("fetch failed") when nothing listens.
+    // Translate connection-level failures into an actionable message.
+    if (isConnFailure(e)) throw new DaemonDownError(dir);
+    throw e;
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `api ${res.status}`);
   return data;
+}
+
+/** Thrown when the swarm daemon API doesn't answer. Carries the fix. */
+class DaemonDownError extends Error {
+  constructor(dir) {
+    super(daemonDownMessage(dir));
+    this.name = "DaemonDownError";
+  }
+}
+
+function daemonDownMessage(dir) {
+  const url = apiBase(dir);
+  const d = daemonJson(dir);
+  const startHint = "start it with: node swarm.mjs daemon start";
+  if (d && d.pid) {
+    return `swarm daemon not responding at ${url} ` +
+      `(it was started as pid ${d.pid}${d.startedAt ? ` at ${d.startedAt}` : ""} — it may have died). ${startHint}`;
+  }
+  return `swarm daemon is not running (no answer at ${url}). ${startHint}`;
+}
+
+/** Short stderr note for the repo local-fallback path. */
+function daemonDownNote(dir) {
+  const d = daemonJson(dir);
+  if (d && d.pid) return `(daemon was started as pid ${d.pid} but isn't responding — working from local state)`;
+  return `(daemon not running — working from local state)`;
+}
+
+function isConnFailure(e) {
+  if (!(e instanceof Error)) return false;
+  const code = e.cause && typeof e.cause === "object" ? e.cause.code : undefined;
+  if (code) {
+    return ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ECONNRESET", "ETIMEDOUT"].includes(code);
+  }
+  // undici throws TypeError("fetch failed") with a cause in practice, but
+  // match the message as a last resort so the user never sees the bare form.
+  return /fetch failed/i.test(e.message);
+}
+
+/** Clone URL the daemon will serve this repo at once it is up. */
+function localCloneUrl(dir, owner, repo) {
+  try {
+    const port = new URL(apiBase(dir)).port || "18787";
+    return `http://127.0.0.1:${port}/git/${owner}/${repo}`;
+  } catch {
+    return `http://127.0.0.1:18787/git/${owner}/${repo}`;
+  }
+}
+
+function printRepoRows(repos) {
+  if (!repos.length) { console.log("(no repos)"); return; }
+  for (const x of repos) {
+    console.log(`${x.owner}/${x.repo}${x.createdAt ? `  created ${x.createdAt}` : ""}`);
+  }
 }
 
 async function cmdRepo(args) {
@@ -258,14 +321,30 @@ async function cmdRepo(args) {
   if (sub === "create") {
     const owner = need(args, "owner");
     const repo = need(args, "repo");
-    const r = await apiCall(dir, "POST", `/git/${owner}/${repo}`);
-    console.log(`created repo ${r.owner}/${r.repo}`);
-    console.log(`  clone: ${r.cloneUrl}`);
+    try {
+      const r = await apiCall(dir, "POST", `/git/${owner}/${repo}`);
+      console.log(`created repo ${r.owner}/${r.repo}`);
+      console.log(`  clone: ${r.cloneUrl}`);
+    } catch (e) {
+      if (!(e instanceof DaemonDownError)) throw e;
+      // Local fallback: the daemon's create path is literally this same
+      // function (lib/git.mjs createRepo), so a locally-created repo is
+      // served identically once the daemon starts.
+      const r = createRepo(dir, owner, repo);
+      console.log(`created repo ${r.owner}/${r.repo} ${daemonDownNote(dir)}`);
+      console.log(`  clone: ${localCloneUrl(dir, r.owner, r.repo)} (works once the daemon is up)`);
+      console.log(`  start it with: node swarm.mjs daemon start`);
+    }
   } else if (sub === "list") {
-    const r = await apiCall(dir, "GET", "/git");
-    if (!r.repos.length) { console.log("(no repos)"); return; }
-    for (const x of r.repos) {
-      console.log(`${x.owner}/${x.repo}${x.createdAt ? `  created ${x.createdAt}` : ""}`);
+    try {
+      const r = await apiCall(dir, "GET", "/git");
+      printRepoRows(r.repos);
+    } catch (e) {
+      if (!(e instanceof DaemonDownError)) throw e;
+      // Local fallback: the daemon's list path scans the same directory.
+      const repos = listRepos(dir);
+      if (repos.length) console.error(daemonDownNote(dir));
+      printRepoRows(repos);
     }
   } else { console.error("usage: repo create|list"); process.exit(2); }
 }
