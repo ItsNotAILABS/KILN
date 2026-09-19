@@ -13,7 +13,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 describe("script mind", () => {
   it("executes a multi-step plan for real", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir);
+    const { ctx, node } = await makeNode(dir);
     const summary = await runScriptMind(ctx, {
       steps: [
         { tool: "fs.write", args: { path: "plan.txt", content: "step one\n" } },
@@ -26,7 +26,7 @@ describe("script mind", () => {
   });
   it("fails fast on a bad step and says which one", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     await assert.rejects(
       () => runScriptMind(ctx, {
         steps: [
@@ -39,7 +39,7 @@ describe("script mind", () => {
   });
   it("rejects a plan without steps", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     await assert.rejects(() => runScriptMind(ctx, {}), /plan\.steps\[\] is required/);
   });
 });
@@ -82,7 +82,7 @@ describe("http mind", () => {
       return { choices: [{ message: { content: "file written, task complete" }, finish_reason: "stop" }] };
     });
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir);
+    const { ctx, node } = await makeNode(dir);
     const oldUrl = process.env.KILN_MIND_URL;
     process.env.KILN_MIND_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
     try {
@@ -99,7 +99,7 @@ describe("http mind", () => {
 
   it("REFUSES LOUDLY with no KILN_MIND_URL — never pretends", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const oldUrl = process.env.KILN_MIND_URL;
     delete process.env.KILN_MIND_URL;
     try {
@@ -113,7 +113,7 @@ describe("http mind", () => {
     const { server, port } = await stubServer(() => "not json shaped");
     // handler returns a string; server JSON.stringifies it -> valid JSON but wrong shape
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const oldUrl = process.env.KILN_MIND_URL;
     process.env.KILN_MIND_URL = `http://127.0.0.1:${port}/x`;
     try {
@@ -154,7 +154,7 @@ describe("http mind", () => {
       return { choices: [{ message: { content: "long task complete" }, finish_reason: "stop" }] };
     });
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir);
+    const { ctx, node } = await makeNode(dir);
     const oldUrl = process.env.KILN_MIND_URL;
     process.env.KILN_MIND_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
     try {

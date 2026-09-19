@@ -45,20 +45,25 @@ async function waitForEvent(dir, jobId, timeoutMs = 90000) {
   throw new Error(`timed out waiting for job ${jobId}`);
 }
 
-let daemon = null;
+let daemonPid = null;
 
 after(async () => {
-  if (daemon && !daemon.killed) daemon.kill("SIGTERM");
+  // Kill the REAL daemon pid from daemon.json — NOT the `daemon start` starter
+  // child, which exits right after spawning the detached daemon. Killing the
+  // starter leaks the daemon (seen: 4 scratch daemons surviving full runs).
+  if (daemonPid) { try { process.kill(daemonPid, "SIGTERM"); } catch {} daemonPid = null; }
 });
 
 describe("depositCode (real daemon, real clone, real commit)", () => {
   it("deposits files into a temp repo: real commit, matching contents, verified receipts", async () => {
     const dir = makeStateDir();
-    daemon = spawn(process.execPath, [DAEMON, "daemon", "start"], {
+    const starter = spawn(process.execPath, [DAEMON, "daemon", "start"], {
       env: { ...process.env, KILN_SWARM_DIR: dir, KILN_SWARM_API_PORT: "0" },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    starter.on("error", () => {});
     await waitForDaemonJson(dir);
+    daemonPid = JSON.parse(readFileSync(join(dir, "daemon.json"), "utf8")).pid;
     const client = await SwarmClient.connect({ dir });
 
     const repo = makeGitRepo();
@@ -97,14 +102,14 @@ describe("depositCode (real daemon, real clone, real commit)", () => {
     assert.deepEqual(me.capNames, ["commit"]);
 
     await client.stopNode(result.nodeId);
-    daemon.kill("SIGTERM");
-    daemon = null;
+    try { process.kill(daemonPid, "SIGTERM"); } catch {}
+    daemonPid = null;
   });
 
   it("refuses loudly without CAP_COMMIT: no commit is created", async () => {
     const dir = makeStateDir();
     // A node with zero capabilities — like a worker that was never granted commit.
-    const { node } = makeNode(dir, { name: "no-commit", caps: 0 });
+    const { node } = await makeNode(dir, { name: "no-commit", caps: 0 });
 
     const jobId = "job_deposit_refused";
     writeJobFile(dir, node.id, {

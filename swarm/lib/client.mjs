@@ -102,6 +102,13 @@ export class SwarmClient {
     return this._req("GET", `/nodes/${id}/logs?tail=${tail}&stream=${stream}`);
   }
 
+  // ---- repos (KILN-native git hosting) ----
+  async listRepos() { return (await this._req("GET", "/git")).repos; }
+  async createRepo({ owner, repo }) {
+    if (!owner || !repo) throw new Error("createRepo: owner and repo are required");
+    return this._req("POST", `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});

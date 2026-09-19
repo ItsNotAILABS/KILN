@@ -38,9 +38,9 @@ export function gitLog(repo, n = 5) {
 }
 
 /** Create a real node (keypair, clone) and return a tool ctx for it. */
-export function makeNode(dir, opts = {}) {
+export async function makeNode(dir, opts = {}) {
   const repo = opts.repo === undefined ? makeGitRepo() : opts.repo;
-  const node = createNode(dir, {
+  const node = await createNode(dir, {
     name: opts.name || "testnode",
     caps: opts.caps ?? 15,
     expiresAt: opts.expiresAt ?? nowSec() + 3600,

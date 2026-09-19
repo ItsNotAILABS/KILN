@@ -123,6 +123,33 @@ function reapExited(dir) {
   }
 }
 
+/** Jobs waiting on a node that is still being cloned. Guards the tick. */
+const autospawnInflight = new Set();
+
+async function autospawnForJob(dir, cfg, job) {
+  if (autospawnInflight.has(job.id)) return;
+  autospawnInflight.add(job.id);
+  try {
+    const wd = cfg.workerDefaults || {};
+    const node = await createNode(dir, {
+      name: `job-${job.id.slice(4, 10)}`,
+      caps: wd.caps ?? 15,
+      expiresAt: nowSec() + (wd.ttlSec ?? 86400),
+      repo: job.repo || wd.repo || null,
+      mind: job.mind || wd.mind || "script",
+      restartPolicy: wd.restartPolicy || "on-failure",
+      maxRestarts: wd.maxRestarts ?? 3,
+    });
+    spawnWorker(dir, node.id);
+    log(`autospawned ${node.name} for ${job.id}`);
+  } catch (e) {
+    // createNode already cleaned up its node dir on clone failure.
+    log(`autospawn for ${job.id} failed: ${e.message}`);
+  } finally {
+    autospawnInflight.delete(job.id);
+  }
+}
+
 function tick(dir, cfg) {
   try {
     reapExited(dir);
@@ -152,18 +179,11 @@ function tick(dir, cfg) {
       if (!node && cfg.autospawn) {
         const count = listNodeIds(dir).length;
         if (count < (cfg.maxNodes || 8)) {
-          const wd = cfg.workerDefaults || {};
-          node = createNode(dir, {
-            name: `job-${job.id.slice(4, 10)}`,
-            caps: wd.caps ?? 15,
-            expiresAt: nowSec() + (wd.ttlSec ?? 86400),
-            repo: job.repo || wd.repo || null,
-            mind: job.mind || wd.mind || "script",
-            restartPolicy: wd.restartPolicy || "on-failure",
-            maxRestarts: wd.maxRestarts ?? 3,
-          });
-          spawnWorker(dir, node.id);
-          log(`autospawned ${node.name} for ${job.id}`);
+          // Async: the clone must not block the tick (self-deadlock when the
+          // repo URL points at this daemon). The job stays pending; the next
+          // tick picks it up once the node is idle.
+          autospawnForJob(dir, cfg, job).catch((e) => log(`autospawn error: ${e.message}`));
+          continue;
         }
       }
       if (!node) { log(`no capacity for ${job.id} — waiting`); continue; }
@@ -212,6 +232,15 @@ async function main() {
   };
   process.on("SIGTERM", onStop);
   process.on("SIGINT", onStop);
+  // Never die silently: an uncaught exception in a tick would otherwise kill
+  // the daemon with no explanation in the log (see ticket E2). Log it loudly
+  // and keep supervising — the workers are persistent and depend on us.
+  process.on("uncaughtException", (err) => {
+    try { log(`FATAL uncaughtException (staying alive): ${err && err.stack ? err.stack : err}`); } catch {}
+  });
+  process.on("unhandledRejection", (reason) => {
+    try { log(`FATAL unhandledRejection (staying alive): ${reason && reason.stack ? reason.stack : reason}`); } catch {}
+  });
 
   reconcile(dir, cfg); // boot reconcile: adopt live, respawn dead per policy
   const timer = setInterval(() => { if (!stopping) tick(dir, cfg); }, cfg.tickMs || 2000);

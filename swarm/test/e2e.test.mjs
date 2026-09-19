@@ -35,7 +35,7 @@ async function waitFor(dir, jobId, timeoutMs = 60000) {
 describe("worker end-to-end (real OS process)", () => {
   it("runs a multi-step job: write file, run command, real git commit", async () => {
     const dir = makeStateDir();
-    const { node, keypair } = makeNode(dir, { name: "e2e", caps: 15 });
+    const { node, keypair } = await makeNode(dir, { name: "e2e", caps: 15 });
 
     const jobId = "job_e2e_1";
     writeJobFile(dir, node.id, {
@@ -122,7 +122,7 @@ describe("worker end-to-end (real OS process)", () => {
     const port = server.address().port;
 
     const dir = makeStateDir();
-    const { node, keypair } = makeNode(dir, { name: "e2e-http", caps: 15 });
+    const { node, keypair } = await makeNode(dir, { name: "e2e-http", caps: 15 });
     const jobId = "job_e2e_http_1";
     writeJobFile(dir, node.id, {
       id: jobId,

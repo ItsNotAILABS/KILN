@@ -12,6 +12,7 @@ import {
 import { appendReceipt } from "./receipts.mjs";
 import { appendEvent, newJobId } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
+import { loadApiToken } from "./state.mjs";
 
 export class ToolError extends Error {
   constructor(message) {
@@ -74,12 +75,12 @@ function execArgs(workdir, args, what, defaultTimeoutMs) {
   return execJailed(workdir, command, cmdArgs, timeoutMs);
 }
 
-function runCmd(command, args, { cwd, timeoutMs }) {
+function runCmd(command, args, { cwd, timeoutMs, env }) {
   return new Promise((resolveOut) => {
     let stdout = "", stderr = "", truncated = false, done = false;
     let child;
     try {
-      child = spawn(command, args, { cwd, timeout: timeoutMs, shell: false });
+      child = spawn(command, args, { cwd, timeout: timeoutMs, shell: false, env: env || process.env });
     } catch (e) {
       resolveOut({ ok: false, error: `spawn failed: ${e.message}` });
       return;
@@ -119,6 +120,7 @@ export const TOOL_DEFS = [
   { name: "git.status", caps: 0, desc: "git status --porcelain in the work dir", args: {} },
   { name: "git.log", caps: 0, desc: "git log --oneline in the work dir", args: { n: "number?" } },
   { name: "git.commit", caps: CAP_COMMIT, desc: "git add -A && git commit (needs CAP_COMMIT)", args: { message: "string" } },
+  { name: "git.push", caps: CAP_COMMIT, desc: "push local commits to the cloned KILN-native remote (needs CAP_COMMIT)", args: { remote: "string?" } },
   { name: "project.release", caps: CAP_RELEASE, desc: "Run a repo's release command, jailed like shell.exec (needs CAP_RELEASE)", args: { command: "string", args: "string[]?", timeoutMs: "number?" } },
   { name: "swarm.spawn", caps: CAP_DELEGATE, desc: "Spawn a child node with subset caps (needs CAP_DELEGATE)", args: { name: "string", capabilities: "number", ttlSec: "number", repo: "string?", mind: "string?" } },
   { name: "swarm.submit", caps: CAP_PROPOSE, desc: "Submit a job plan to the queue (needs CAP_PROPOSE)", args: { plan: "object", name: "string?", mind: "string?" } },
@@ -169,6 +171,27 @@ async function impl(ctx, name, args) {
       if (!add.ok) return add;
       return await runCmd("git", ["commit", "-m", message], { cwd: workdir, timeoutMs: 30000 });
     }
+    case "git.push": {
+      // Publish the node's local commits to the KILN-native remote it cloned.
+      // Auth: the daemon's bearer token, injected as a git http.extraHeader
+      // for this ONE git invocation via env. The token never touches the
+      // workdir, the job plan, or any log — job steps are jailed shell/file
+      // ops and cannot read the worker process's memory. Grant-gated by
+      // CAP_COMMIT like git.commit (TOOL_DEFS caps, checked before we run).
+      const remote = args.remote === undefined ? "origin" : needStr(args, "remote");
+      if (!/^[A-Za-z0-9_.-]+$/.test(remote)) throw new ToolError("git.push: illegal remote name");
+      const token = loadApiToken(ctx.dir);
+      return await runCmd("git", ["push", remote, "HEAD"], {
+        cwd: workdir,
+        timeoutMs: 60000,
+        env: {
+          ...process.env,
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "http.extraHeader",
+          GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+        },
+      });
+    }
     case "project.release": {
       // CAP_RELEASE is enforced by runTool before we get here (TOOL_DEFS caps).
       // Runs the repo's own release command, jailed exactly like shell.exec.
@@ -179,7 +202,7 @@ async function impl(ctx, name, args) {
       const ttlSec = needNum(args, "ttlSec");
       if (!(ttlSec > 0 && ttlSec <= 10 * 365 * 24 * 3600)) throw new ToolError("swarm.spawn: ttlSec out of range");
       const childGrant = delegateGrant(ctx.grant, ctx.nodeId, childCaps, nowSec() + Math.floor(ttlSec));
-      const child = createNode(ctx.dir, {
+      const child = await createNode(ctx.dir, {
         name: needStr(args, "name"),
         caps: childGrant.capabilities,
         expiresAt: childGrant.expiresAt,

@@ -226,7 +226,7 @@ export function startApiServer(dir, cfg) {
         try { caps = parseCaps(b.caps ?? 15); } catch (e) { return send(res, 400, { error: e.message }); }
         const ttl = parseInt(b.ttlSec ?? 86400, 10);
         if (!(ttl > 0)) return send(res, 400, { error: "ttlSec must be positive seconds" });
-        const node = createNode(dir, {
+        const node = await createNode(dir, {
           name: String(b.name),
           caps,
           expiresAt: nowSec() + ttl,
@@ -294,7 +294,7 @@ export function startApiServer(dir, cfg) {
 
   const wanted = process.env.KILN_SWARM_API_PORT !== undefined
     ? parseInt(process.env.KILN_SWARM_API_PORT, 10)
-    : (cfg.apiPort || 18787);
+    : (cfg.apiPort ?? 18787); // 0 = ephemeral; ?? keeps 0, || would eat it
   return new Promise((resolve, reject) => {
     server.on("error", reject);
     // 127.0.0.1 ONLY — the API never binds a public interface.

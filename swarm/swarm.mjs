@@ -3,7 +3,7 @@
  * swarm.mjs — CLI for the KILN headless agent runtime.
  *
  *   swarm.mjs init [--dir PATH]
- *   swarm.mjs daemon start|stop|status|token [--dir PATH]
+ *   swarm.mjs daemon start|stop|status|token|watchdog [--dir PATH]
  *   swarm.mjs node spawn --name N --caps CAPS --ttl SEC [--repo PATH] [--mind script|http]
  *                        [--policy never|on-failure|always] [--max-restarts N] [--dir PATH]
  *   swarm.mjs node list [--dir PATH]
@@ -18,7 +18,7 @@
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, openSync, closeSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -76,31 +76,104 @@ function daemonJson(dir) {
   return existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : null;
 }
 
-function cmdDaemon(args) {
+function daemonStart(dir) {
+  const d = daemonJson(dir);
+  if (d && pidAlive(d.pid)) { console.error(`daemon already running pid=${d.pid}`); process.exit(1); }
+  const out = openSync(join(dir, "daemon.log"), "a");
+  const child = spawn(process.execPath, [join(HERE, "lib", "daemon.mjs")], {
+    detached: true, stdio: ["ignore", out, out],
+    env: { ...process.env, KILN_SWARM_DIR: dir },
+  });
+  child.unref();
+  closeSync(out);
+  console.log(`daemon starting pid=${child.pid} dir=${dir}`);
+  return child.pid;
+}
+
+/**
+ * True daemon health: the pid must be alive AND the HTTP API must answer.
+ * A pid can be alive while the API is wedged, and (as ticket E2 showed) the
+ * process can vanish with no log line — so check both, every time.
+ */
+async function daemonStatus(dir) {
+  const d = daemonJson(dir);
+  if (!d || !d.pid) return { up: false, reason: "no daemon.json — the daemon was never started here" };
+  if (!pidAlive(d.pid)) {
+    return { up: false, pid: d.pid, startedAt: d.startedAt, reason: `pid ${d.pid} is not alive` };
+  }
+  const apiUrl = d.apiUrl || "http://127.0.0.1:18787";
+  try {
+    const res = await fetch(apiUrl + "/health", { signal: AbortSignal.timeout(5000) });
+    if (res.ok) return { up: true, pid: d.pid, startedAt: d.startedAt, apiUrl };
+    return { up: false, pid: d.pid, startedAt: d.startedAt, reason: `pid ${d.pid} alive but API returned HTTP ${res.status}` };
+  } catch {
+    return { up: false, pid: d.pid, startedAt: d.startedAt, reason: `pid ${d.pid} alive but API not responding at ${apiUrl}` };
+  }
+}
+
+function watchdogLog(dir, msg) {
+  const line = `[watchdog ${new Date().toISOString()}] ${msg}\n`;
+  try { appendFileSync(join(dir, "watchdog.log"), line); } catch { /* best effort */ }
+}
+
+/**
+ * daemon watchdog — meant to run on a schedule (every 1–2 min). Checks true
+ * health; restarts the daemon if down. Crash-loop guard: more than 5
+ * watchdog restarts in the last hour means something is fundamentally wrong —
+ * stop restarting and say so loudly instead of spinning forever.
+ */
+async function daemonWatchdog(dir) {
+  const st = await daemonStatus(dir);
+  if (st.up) return; // healthy — stay silent, the log is noise otherwise
+  const statePath = join(dir, "watchdog.json");
+  let state = { restarts: [] };
+  try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* fresh */ }
+  const hourAgo = Date.now() - 3600_000;
+  state.restarts = (state.restarts || []).filter((t) => t > hourAgo);
+  if (state.restarts.length >= 5) {
+    const msg = `daemon down (${st.reason}) — NOT restarting: ${state.restarts.length} watchdog restarts in the last hour, crash loop suspected. Investigate ${join(dir, "daemon.log")} manually.`;
+    watchdogLog(dir, msg);
+    console.error(msg);
+    process.exit(1);
+  }
+  watchdogLog(dir, `daemon down (${st.reason}) — restarting`);
+  daemonStart(dir);
+  // Give it a moment, then verify the restart actually took.
+  await new Promise((r) => setTimeout(r, 4000));
+  const st2 = await daemonStatus(dir);
+  if (st2.up) {
+    state.restarts.push(Date.now());
+    try { writeFileSync(statePath, JSON.stringify(state) + "\n"); } catch { /* best effort */ }
+    watchdogLog(dir, `restarted ok pid=${st2.pid}`);
+    console.log(`daemon restarted pid=${st2.pid}`);
+  } else {
+    const msg = `daemon restart attempted but still down (${st2.reason})`;
+    watchdogLog(dir, msg);
+    console.error(msg);
+    process.exit(1);
+  }
+}
+
+async function cmdDaemon(args) {
   const sub = args._[1];
   const dir = dirOf(args);
   ensureStateDir(dir);
   if (sub === "start") {
-    const d = daemonJson(dir);
-    if (d && pidAlive(d.pid)) { console.error(`daemon already running pid=${d.pid}`); process.exit(1); }
-    const out = openSync(join(dir, "daemon.log"), "a");
-    const child = spawn(process.execPath, [join(HERE, "lib", "daemon.mjs")], {
-      detached: true, stdio: ["ignore", out, out],
-      env: { ...process.env, KILN_SWARM_DIR: dir },
-    });
-    child.unref();
-    closeSync(out);
-    console.log(`daemon starting pid=${child.pid} dir=${dir}`);
+    daemonStart(dir);
   } else if (sub === "stop") {
     const d = daemonJson(dir);
     if (!d || !pidAlive(d.pid)) { console.log("daemon not running"); return; }
     process.kill(d.pid, "SIGTERM");
     console.log(`daemon stop signaled pid=${d.pid} (workers left running — persistent)`);
   } else if (sub === "status") {
-    const d = daemonJson(dir);
-    const alive = !!(d && pidAlive(d.pid));
-    console.log(`daemon: ${alive ? `running pid=${d.pid} since ${d.startedAt}` : "not running"}`);
-    if (alive && d.apiUrl) console.log(`api: ${d.apiUrl} (127.0.0.1 only, bearer token in ${join(dir, "api.token")})`);
+    const st = await daemonStatus(dir);
+    if (st.up) {
+      console.log(`daemon: running pid=${st.pid} since ${st.startedAt}`);
+      console.log(`api: ${st.apiUrl} (127.0.0.1 only, bearer token in ${join(dir, "api.token")})`);
+    } else {
+      console.log(`daemon: DOWN (${st.reason})`);
+      console.log(`fix: start it with: node swarm.mjs daemon start`);
+    }
     const ids = listNodeIds(dir);
     let idle = 0, working = 0, dead = 0;
     for (const id of ids) {
@@ -113,14 +186,17 @@ function cmdDaemon(args) {
     const jobs = replay(dir);
     const pending = [...jobs.values()].filter((j) => j.status === "pending").length;
     console.log(`nodes: ${ids.length} (idle=${idle} working=${working} dead=${dead})  jobs: ${jobs.size} total, ${pending} pending`);
+    if (!st.up) process.exit(1);
+  } else if (sub === "watchdog") {
+    await daemonWatchdog(dir);
   } else if (sub === "token") {
     console.log(loadApiToken(dir));
-  } else { console.error("usage: daemon start|stop|status|token"); process.exit(2); }
+  } else { console.error("usage: daemon start|stop|status|token|watchdog"); process.exit(2); }
 }
 
 // ---------------------------------------------------------------- node
 
-function cmdNode(args) {
+async function cmdNode(args) {
   const sub = args._[1];
   const dir = dirOf(args);
   ensureStateDir(dir);
@@ -129,7 +205,7 @@ function cmdNode(args) {
     const caps = parseCaps(need(args, "caps"));
     const ttl = parseInt(need(args, "ttl"), 10);
     if (!(ttl > 0)) { console.error("--ttl must be positive seconds"); process.exit(2); }
-    const node = createNode(dir, {
+    const node = await createNode(dir, {
       name: String(name),
       caps,
       expiresAt: nowSec() + ttl,
@@ -355,8 +431,8 @@ const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
 try {
   if (cmd === "init") cmdInit(args);
-  else if (cmd === "daemon") cmdDaemon(args);
-  else if (cmd === "node") cmdNode(args);
+  else if (cmd === "daemon") await cmdDaemon(args);
+  else if (cmd === "node") await cmdNode(args);
   else if (cmd === "job") cmdJob(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);

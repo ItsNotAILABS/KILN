@@ -25,49 +25,49 @@ function makeReleaseRepo() {
 }
 
 describe("jail", () => {
-  it("rejects path traversal", () => {
+  it("rejects path traversal", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     assert.throws(() => jailPath(ctx.workdir, "../../etc/passwd"), /escapes work dir/);
     assert.throws(() => jailPath(ctx.workdir, "/etc/passwd"), /escapes work dir/);
   });
   it("fs.write outside the work dir fails and writes nothing", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir);
+    const { ctx, node } = await makeNode(dir);
     const r = await runTool(ctx, "fs.write", { path: "../../evil.txt", content: "x" });
     assert.equal(r.ok, false);
     assert.match(r.error, /escapes work dir/);
   });
   it("shell.exec rejects shell metacharacters", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const r = await runTool(ctx, "shell.exec", { command: "echo", args: ["hi; rm -rf /"] });
     assert.equal(r.ok, false);
     assert.match(r.error, /denied pattern/);
   });
   it("shell.exec rejects shell binaries", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const r = await runTool(ctx, "shell.exec", { command: "sh", args: ["-c", "echo hi"] });
     assert.equal(r.ok, false);
     assert.match(r.error, /shell binaries/);
   });
   it("shell.exec rejects command substitution", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const r = await runTool(ctx, "shell.exec", { command: "echo", args: ["$(whoami)"] });
     assert.equal(r.ok, false);
   });
   it("shell.exec really runs and captures output", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const r = await runTool(ctx, "shell.exec", { command: "echo", args: ["hello-kiln"] });
     assert.equal(r.ok, true);
     assert.match(r.out, /hello-kiln/);
   });
   it("shell.exec enforces timeout for real", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const t0 = Date.now();
     const r = await runTool(ctx, "shell.exec", { command: "sleep", args: ["30"], timeoutMs: 800 });
     const ms = Date.now() - t0;
@@ -77,7 +77,7 @@ describe("jail", () => {
   });
   it("shell.exec reports nonzero exits honestly", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const r = await runTool(ctx, "shell.exec", { command: "ls", args: ["/nonexistent-kiln-dir"] });
     assert.equal(r.ok, false);
     assert.match(r.error, /exit/);
@@ -87,7 +87,7 @@ describe("jail", () => {
 describe("git tools", () => {
   it("git.commit without CAP_COMMIT is refused and creates no commit", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir, { caps: 0 }); // no caps at all
+    const { ctx, node } = await makeNode(dir, { caps: 0 }); // no caps at all
     const before = gitLog(node.workdir, 5);
     await assert.rejects(
       runTool(ctx, "git.commit", { message: "should never land" }),
@@ -97,7 +97,7 @@ describe("git tools", () => {
   });
   it("git.commit with CAP_COMMIT makes a REAL commit", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir, { caps: CAP_COMMIT });
+    const { ctx, node } = await makeNode(dir, { caps: CAP_COMMIT });
     await runTool(ctx, "fs.write", { path: "real.txt", content: "real content\n" });
     const r = await runTool(ctx, "git.commit", { message: "kiln test commit" });
     assert.equal(r.ok, true);
@@ -106,7 +106,7 @@ describe("git tools", () => {
   });
   it("git.status and git.log read the real repo", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir);
+    const { ctx } = await makeNode(dir);
     const st = await runTool(ctx, "git.status", {});
     assert.equal(st.ok, true);
     const lg = await runTool(ctx, "git.log", { n: 3 });
@@ -118,7 +118,7 @@ describe("git tools", () => {
 describe("project.release", () => {
   it("is REFUSED without CAP_RELEASE and writes nothing", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir, { caps: CAP_COMMIT, repo: makeReleaseRepo() });
+    const { ctx, node } = await makeNode(dir, { caps: CAP_COMMIT, repo: makeReleaseRepo() });
     await assert.rejects(
       runTool(ctx, "project.release", { command: "node", args: ["release.mjs"] }),
       (e) => e.code === "MISSING_CAPABILITY"
@@ -127,7 +127,7 @@ describe("project.release", () => {
   });
   it("runs the real release command with CAP_RELEASE", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
+    const { ctx, node } = await makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
     const r = await runTool(ctx, "project.release", { command: "node", args: ["release.mjs"] });
     assert.equal(r.ok, true);
     assert.match(r.out, /release ok/);
@@ -135,14 +135,14 @@ describe("project.release", () => {
   });
   it("reports a failing release command honestly", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
+    const { ctx } = await makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
     const r = await runTool(ctx, "project.release", { command: "node", args: ["-e", "process.exit(3)"] });
     assert.equal(r.ok, false);
     assert.match(r.error, /exit 3/);
   });
   it("is jailed like shell.exec", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
+    const { ctx } = await makeNode(dir, { caps: CAP_RELEASE, repo: makeReleaseRepo() });
     const r = await runTool(ctx, "project.release", { command: "node", args: ["-e", "x; y"] });
     assert.equal(r.ok, false);
     assert.match(r.error, /denied pattern/);
@@ -152,7 +152,7 @@ describe("project.release", () => {
 describe("grant-gated swarm tools", () => {
   it("swarm.spawn without CAP_DELEGATE is refused", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir, { caps: CAP_COMMIT });
+    const { ctx } = await makeNode(dir, { caps: CAP_COMMIT });
     await assert.rejects(
       runTool(ctx, "swarm.spawn", { name: "child", capabilities: 1, ttlSec: 60 }),
       (e) => e.code === "MISSING_CAPABILITY"
@@ -160,7 +160,7 @@ describe("grant-gated swarm tools", () => {
   });
   it("swarm.spawn with CAP_DELEGATE creates a real child node with subset caps", async () => {
     const dir = makeStateDir();
-    const { ctx, node } = makeNode(dir, { caps: CAP_COMMIT | 8 });
+    const { ctx, node } = await makeNode(dir, { caps: CAP_COMMIT | 8 });
     const r = await runTool(ctx, "swarm.spawn", { name: "child1", capabilities: CAP_COMMIT, ttlSec: 600 });
     assert.equal(r.ok, true);
     assert.match(r.out, /spawned child node child1/);
@@ -174,18 +174,63 @@ describe("grant-gated swarm tools", () => {
   });
   it("swarm.spawn refuses caps exceeding the parent", async () => {
     const dir = makeStateDir();
-    const { ctx } = makeNode(dir, { caps: 8 }); // delegate only
+    const { ctx } = await makeNode(dir, { caps: 8 }); // delegate only
     const r = await runTool(ctx, "swarm.spawn", { name: "childx", capabilities: CAP_COMMIT, ttlSec: 60 });
     assert.equal(r.ok, false);
     assert.match(r.error, /EXCEEDS_PARENT_GRANT/);
   });
   it("every tool call leaves a verifiable receipt", async () => {
     const dir = makeStateDir();
-    const { ctx, node, keypair } = makeNode(dir);
+    const { ctx, node, keypair } = await makeNode(dir);
     await runTool(ctx, "fs.write", { path: "r.txt", content: "x" });
     await runTool(ctx, "fs.read", { path: "r.txt" });
     const v = verifyReceipts(dir, node.id, keypair);
     assert.equal(v.ok, true);
     assert.equal(v.count, 2);
+  });
+});
+
+describe("git.push", () => {
+  it("is REFUSED without CAP_COMMIT and pushes nothing", async () => {
+    const dir = makeStateDir();
+    const bare = join(dir, "upstream.git");
+    spawnSync("git", ["init", "-q", "--bare", bare]);
+    const { ctx } = await makeNode(dir, { caps: 0, repo: bare }); // no caps at all
+    await assert.rejects(
+      runTool(ctx, "git.push", {}),
+      (e) => e.code === "MISSING_CAPABILITY"
+    );
+    // Refused before anything ran: the remote has no commits at all.
+    const log = spawnSync("git", ["log", "--oneline"], { cwd: bare, encoding: "utf8" });
+    assert.ok(log.status !== 0 || !log.stdout.trim(), "refused push must not create remote commits");
+  });
+  it("pushes local commits to the cloned remote for real", async () => {
+    const dir = makeStateDir();
+    // A bare repo as the "remote": the node clones it, commits, pushes back.
+    const bare = join(dir, "upstream.git");
+    spawnSync("git", ["init", "-q", "--bare", bare]);
+    const { ctx, node } = await makeNode(dir, { caps: CAP_COMMIT, repo: bare });
+    await runTool(ctx, "fs.write", { path: "pushed.txt", content: "pushed for real\n" });
+    const c = await runTool(ctx, "git.commit", { message: "kiln test push commit" });
+    assert.equal(c.ok, true);
+    const p = await runTool(ctx, "git.push", {});
+    assert.equal(p.ok, true, `push failed: ${p.error || p.out}`);
+    // The commit REALLY landed in the bare remote.
+    const log = spawnSync("git", ["log", "--oneline", "-n", "3"], { cwd: bare, encoding: "utf8" });
+    assert.equal(log.status, 0);
+    assert.match(log.stdout, /kiln test push commit/);
+    // The bearer token never leaked into the workdir or the push output.
+    const token = readFileSync(join(dir, "api.token"), "utf8").trim();
+    assert.ok(!String(p.out || "").includes(token), "token must not appear in push output");
+    assert.ok(!readFileSync(join(node.workdir, ".git", "config"), "utf8").includes(token), "token must not be written to git config");
+  });
+  it("rejects an illegal remote name", async () => {
+    const dir = makeStateDir();
+    const { ctx } = await makeNode(dir, { caps: CAP_COMMIT });
+    // runTool converts case-body ToolErrors to { ok:false } (only the grant
+    // check rejects), so assert on the honest failure result.
+    const r = await runTool(ctx, "git.push", { remote: "origin; rm -rf /" });
+    assert.equal(r.ok, false);
+    assert.match(String(r.error), /illegal remote/);
   });
 });
