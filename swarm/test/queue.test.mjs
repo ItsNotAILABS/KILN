@@ -38,6 +38,17 @@ describe("queue", () => {
     assert.equal(j.node, "nodeB");
     assert.deepEqual(j.plan.steps, [{ tool: "fs.list", args: {} }]);
   });
+  it("preserves the submitter's node pin through replay", () => {
+    const dir = makeStateDir();
+    const job = { id: newJobId(), name: "pinned", plan: { steps: [] }, mind: "script", node: "nodePinned" };
+    appendEvent(dir, "submit", { job });
+    const pending = pendingJobs(dir);
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].node, "nodePinned");
+    // after assignment the pin is replaced by the actual assignee
+    appendEvent(dir, "assign", { jobId: job.id, node: "nodeOther" });
+    assert.equal(replay(dir).get(job.id).node, "nodeOther");
+  });
   it("events are append-only and sequenced", () => {
     const dir = makeStateDir();
     appendEvent(dir, "submit", { job: { id: "a", name: "a", plan: { steps: [] }, mind: "script" } });

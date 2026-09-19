@@ -158,20 +158,22 @@ async function main() {
     const setup = [];
     let skipReason = null;
     for (const [command, ...rest] of pcfg.setup || []) {
-      const bin = whichBin(command);
-      if (!bin) {
+      // Validate the binary exists, but keep the BARE command name in the
+      // plan: shell.exec's jail rejects absolute paths outside the work dir,
+      // so workers resolve commands via the daemon's PATH instead.
+      if (!whichBin(command)) {
         skipReason = `${id}: setup binary "${command}" not on PATH — install it or fix nightly.config.json`;
         break;
       }
-      setup.push([bin, ...rest]);
+      setup.push([command, ...rest]);
     }
     if (skipReason) {
       skipped.push(skipReason);
       continue;
     }
-    const testBin = whichBin(pcfg.test?.command || "");
-    if (!testBin) {
-      skipped.push(`${id}: test binary "${pcfg.test?.command}" not on PATH — install it or fix nightly.config.json`);
+    const testCommand = pcfg.test?.command || "";
+    if (!whichBin(testCommand)) {
+      skipped.push(`${id}: test binary "${testCommand}" not on PATH — install it or fix nightly.config.json`);
       continue;
     }
 
@@ -185,7 +187,7 @@ async function main() {
       const plan = buildNightlyPlan({
         project: id,
         setup,
-        test: { bin: testBin, args: pcfg.test.args || [], timeoutMs: pcfg.test.timeoutMs || 300000 },
+        test: { bin: testCommand, args: pcfg.test.args || [], timeoutMs: pcfg.test.timeoutMs || 300000 },
         stamp: new Date().toISOString(),
       });
       const { id: jobId } = await swarm.submitJob({ name: `nightly-${id}-${stamp}`, plan, mind: "script", node: nodeId });

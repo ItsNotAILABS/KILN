@@ -57,7 +57,10 @@ export function replay(dir) {
   const jobs = new Map();
   for (const e of readEvents(dir)) {
     if (e.type === "submit") {
-      jobs.set(e.job.id, { ...e.job, node: null, status: "pending", submittedAt: e.ts });
+      // Preserve the submitter's node pin (e.job.node) — the daemon's tick
+      // honors it when that node is idle. (Was: node: null, which silently
+      // dropped pins and sent pinned jobs to arbitrary idle nodes.)
+      jobs.set(e.job.id, { ...e.job, node: e.job.node ?? null, status: "pending", submittedAt: e.ts });
     } else if (e.type === "assign") {
       const j = jobs.get(e.jobId);
       if (j) { j.status = "assigned"; j.node = e.node; j.assignedAt = e.ts; }
