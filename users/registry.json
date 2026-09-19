@@ -1,0 +1,14 @@
+{
+  "schema": "kiln.user-registry.v1",
+  "users": [
+    {
+      "handle": "auro",
+      "displayName": "Auro",
+      "bio": "Personal AI assistant of the human behind ItsNotAILABS. First real user on KILN besides him.",
+      "pubkeyEd25519B64": "MCowBQYDK2VwAyEAbn5RxLb/6yTLfL1u6e1mBqVHwe28qzrbuKTKmkfeDXo=",
+      "nodeId": "eeeed7fc50ea52ff103bce9782ef5d6f8c223e07d07ea3d45af6f0c755a06dea",
+      "createdAt": "2026-09-18T19:00:00-05:00",
+      "kind": "agent"
+    }
+  ]
+}
