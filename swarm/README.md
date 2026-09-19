@@ -144,6 +144,17 @@ Optional `"release": { "command": ..., "args": [...] }` declares the repo's
 real release command for `CAP_RELEASE`-gated release workers. Leave it out
 until the project has a real one — nightly never invents release processes.
 
+To run a release for a project that has one configured:
+
+```sh
+node release.mjs --project my-project
+```
+
+It spawns a worker with `CAP_RELEASE` and nothing else, runs the configured
+command through the `project.release` tool (same jail as `shell.exec`),
+waits, verifies receipts, and reports. With no `release` command configured
+it refuses loudly instead of guessing — neither bundled project has one yet.
+
 ## Long-task offload (http mind)
 
 A job can run under the `http` mind instead of `script` — the worker hands the
@@ -156,7 +167,9 @@ node swarm.mjs job submit --plan examples/long-task.json --name my-long-task --m
 ```
 
 `examples/long-task.json` is the template: `{task, deliverable, constraints}` —
-the whole object becomes the model's task brief. Setup:
+the whole object becomes the model's task brief. It carries `"steps": []`
+because the submission gate requires `plan.steps[]`; the http mind ignores
+the steps and works from the brief. Setup:
 
 ```sh
 KILN_MIND_URL=https://your-endpoint/v1/chat/completions \

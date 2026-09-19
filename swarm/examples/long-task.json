@@ -1,1 +1,11 @@
-{"_note":"LONG-TASK OFFLOAD. This is not a script-mind plan — submit it with mind \"http\" (CLI: swarm.mjs job submit --plan examples/long-task.json --mind http, or SDK submitJob({mind:\"http\"})). The worker hands this whole object to the model as its task brief; the model then works through REAL tools (fs/shell/git/swarm), every call grant-checked and receipted. Requires KILN_MIND_URL in the DAEMON's environment (workers inherit it) — without it the http mind REFUSES LOUDLY instead of pretending. See swarm/README.md.","constraints":["Work only inside the work dir — the tool jail enforces this anyway.","Commit finished work with git.commit (needs CAP_COMMIT on the node).","If the task cannot be completed, say so in the final summary instead of faking it."],"deliverable":"The observable end state: files written, tests green, a commit hash — whatever 'done' means for this task.","task":"Describe the long task here. Be concrete: what should exist when the work is done, and how to verify it."}
+{
+  "_note": "LONG-TASK OFFLOAD. This is not a script-mind plan \u2014 submit it with mind \"http\" (CLI: swarm.mjs job submit --plan examples/long-task.json --mind http, or SDK submitJob({mind:\"http\"})). The worker hands this whole object to the model as its task brief; the model then works through REAL tools (fs/shell/git/swarm), every call grant-checked and receipted. Requires KILN_MIND_URL in the DAEMON's environment (workers inherit it) \u2014 without it the http mind REFUSES LOUDLY instead of pretending. See swarm/README.md. \"steps\" is [] because the submission gate requires plan.steps[]; the http mind gets the whole object as its brief.",
+  "constraints": [
+    "Work only inside the work dir \u2014 the tool jail enforces this anyway.",
+    "Commit finished work with git.commit (needs CAP_COMMIT on the node).",
+    "If the task cannot be completed, say so in the final summary instead of faking it."
+  ],
+  "deliverable": "The observable end state: files written, tests green, a commit hash \u2014 whatever 'done' means for this task.",
+  "task": "Describe the long task here. Be concrete: what should exist when the work is done, and how to verify it.",
+  "steps": []
+}
