@@ -214,3 +214,34 @@ with no URL, and the `examples/long-task.json` template shape end to end),
 nightly plan building + the loud daemon-down failure, and a full
 worker-process end-to-end (real file, real commit, verified receipts), plus
 the HTTP API + SDK against a real daemon.
+
+## KILN-native git hosting
+
+The swarm daemon is also a git forge: real bare repositories under
+`<stateDir>/git/<owner>/<repo>.git`, served over real Git smart HTTP via
+`git http-backend`. No simulation — `git clone`, `fetch`, and `push` all work
+against it with a normal git client.
+
+```sh
+node swarm.mjs repo create --owner auro --repo auro   # needs the daemon token
+node swarm.mjs repo list                              # public
+git clone http://127.0.0.1:18787/git/auro/auro       # public, no token
+```
+
+Rules:
+
+- **Public:** `GET /git` (repo listing), clone, and fetch.
+- **Authenticated:** repo creation and `push`. Auth is checked *before*
+  `git-http-backend` ever runs — an unauthenticated push never reaches git.
+  Clients authenticate with the daemon bearer token, either as
+  `Authorization: Bearer <token>` or HTTP Basic with the token as the
+  password (what `http.extraHeader` sends).
+- Owner/repo names are lowercase alphanumeric plus hyphens; traversal and
+  uppercase are rejected.
+- Current boundary: the daemon listens on loopback only, so clone/push URLs
+  are localhost URLs for now.
+
+Tests (`test/git.test.mjs`, 9 tests): authenticated create (201), duplicate
+(409), bad names (400), unauthenticated create refused (401), public listing,
+a real clone → push → fresh-clone round trip, and a real unauthenticated push
+that is refused and lands nothing.

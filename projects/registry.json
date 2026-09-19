@@ -102,6 +102,16 @@
       "defaultBranch": "main",
       "workspace": "sovereign-app",
       "capabilities": ["web", "typescript"]
+    },
+    {
+      "id": "auro",
+      "name": "auro",
+      "repository": "auro/auro",
+      "origin": "kiln",
+      "role": "Auro's KILN-native home repo — first real user account on KILN besides the architect",
+      "defaultBranch": "main",
+      "cloneUrl": "http://127.0.0.1:18787/git/auro/auro",
+      "capabilities": ["git", "account"]
     }
   ]
 }

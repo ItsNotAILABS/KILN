@@ -12,6 +12,8 @@
  *   swarm.mjs job submit --plan FILE [--name N] [--mind M] [--node ID] [--dir PATH]
  *   swarm.mjs job list [--dir PATH]
  *   swarm.mjs receipts verify [--node ID] [--dir PATH]
+ *   swarm.mjs repo create --owner O --repo R [--dir PATH]
+ *   swarm.mjs repo list [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -226,6 +228,48 @@ function cmdReceipts(args) {
   } else { console.error("usage: receipts verify"); process.exit(2); }
 }
 
+// ---------------------------------------------------------------- repo (KILN-native git hosting)
+
+function apiBase(dir) {
+  const d = daemonJson(dir);
+  if (d && d.apiUrl) return d.apiUrl;
+  return "http://127.0.0.1:18787";
+}
+
+async function apiCall(dir, method, p, body) {
+  const token = loadApiToken(dir);
+  const res = await fetch(apiBase(dir) + p, {
+    method,
+    headers: {
+      "authorization": `Bearer ${token}`,
+      ...(body ? { "content-type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `api ${res.status}`);
+  return data;
+}
+
+async function cmdRepo(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  if (sub === "create") {
+    const owner = need(args, "owner");
+    const repo = need(args, "repo");
+    const r = await apiCall(dir, "POST", `/git/${owner}/${repo}`);
+    console.log(`created repo ${r.owner}/${r.repo}`);
+    console.log(`  clone: ${r.cloneUrl}`);
+  } else if (sub === "list") {
+    const r = await apiCall(dir, "GET", "/git");
+    if (!r.repos.length) { console.log("(no repos)"); return; }
+    for (const x of r.repos) {
+      console.log(`${x.owner}/${x.repo}${x.createdAt ? `  created ${x.createdAt}` : ""}`);
+    }
+  } else { console.error("usage: repo create|list"); process.exit(2); }
+}
+
 // ---------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
@@ -236,8 +280,9 @@ try {
   else if (cmd === "node") cmdNode(args);
   else if (cmd === "job") cmdJob(args);
   else if (cmd === "receipts") cmdReceipts(args);
+  else if (cmd === "repo") await cmdRepo(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|node|job|receipts");
+    console.error("usage: swarm.mjs init|daemon|node|job|receipts|repo");
     process.exit(2);
   }
 } catch (e) {

@@ -18,6 +18,12 @@
  *   POST /nodes/:id/stop            -> {ok:true}
  *   GET  /nodes/:id/logs?tail=N&stream=stdout|stderr -> {stream, log}
  *   POST /receipts/verify           {node?} -> {results:[...]}
+ * Git hosting (KILN-native repos, served via git http-backend CGI):
+ *   POST /git/:owner/:repo            create repo (auth required)
+ *   GET  /git                         list repos (public)
+ *   GET  /git/:owner/:repo/info/refs?service=...   (public)
+ *   POST /git/:owner/:repo/git-upload-pack          (public — clone/fetch)
+ *   POST /git/:owner/:repo/git-receive-pack         (auth required — push)
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -33,6 +39,7 @@ import { parseCaps, capsToNames, nowSec } from "./grant.mjs";
 import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
+import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -86,8 +93,31 @@ function send(res, code, obj) {
   res.end(body);
 }
 
+/**
+ * Bearer <token>, or HTTP Basic where the password is the token — that's how
+ * `git` sends credentials embedded in a URL (http://oauth2:<token>@host/...).
+ */
+function checkAuth(req, token) {
+  const auth = req.headers.authorization || "";
+  if (auth.startsWith("Bearer ")) {
+    const p = auth.slice(7);
+    return p.length === token.length && timingSafeEqual(Buffer.from(p), Buffer.from(token));
+  }
+  if (auth.startsWith("Basic ")) {
+    let decoded;
+    try { decoded = Buffer.from(auth.slice(6), "base64").toString("utf8"); }
+    catch { return false; }
+    const i = decoded.indexOf(":");
+    const pass = i >= 0 ? decoded.slice(i + 1) : decoded;
+    return pass.length > 0 && pass.length === token.length &&
+      timingSafeEqual(Buffer.from(pass), Buffer.from(token));
+  }
+  return false;
+}
+
 export function startApiServer(dir, cfg) {
   const token = loadApiToken(dir);
+  let apiPort = 0; // filled in once listening; used for clone URLs
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://127.0.0.1");
@@ -97,13 +127,66 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, { ok: true, version: 1, service: "kiln-swarm" });
       }
 
+      // ---- git hosting: public routes (list/clone/fetch need no token) ----
+      if (req.method === "GET" && path === "/git") {
+        return send(res, 200, { repos: listRepos(dir) });
+      }
+      // gitReceive is set for receive-pack; served after the auth gate below.
+      // NOTE: only paths WITH a trailing smart-http segment are intercepted
+      // here; bare /git/:owner/:repo (repo create) falls through to auth.
+      let gitReceive = null;
+      {
+        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(\/.*)?$/);
+        if (m && m[3]) {
+          const owner = m[1], repo = m[2], rest = m[3] || "";
+          const kind =
+            req.method === "GET" && rest === "/info/refs" ? "smart"
+            : req.method === "POST" && rest === "/git-upload-pack" ? "smart"
+            : req.method === "POST" && rest === "/git-receive-pack" ? "receive"
+            : null;
+          if (!kind) return send(res, 404, { error: "not found" });
+          if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
+            return send(res, 404, { error: "no such repo" });
+          }
+          if (kind === "receive") {
+            gitReceive = { owner, repo };
+          } else {
+            await serveGitHttp(dir, req, res);
+            return;
+          }
+        }
+      }
+
       // ---- auth (everything below here) ----
-      const auth = req.headers.authorization || "";
-      const presented = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-      const okAuth =
-        presented.length === token.length &&
-        timingSafeEqual(Buffer.from(presented), Buffer.from(token));
-      if (!okAuth) return send(res, 401, { error: "unauthorized: bearer token required" });
+      if (!checkAuth(req, token)) {
+        return send(res, 401, { error: "unauthorized: bearer token required" });
+      }
+
+      // Authenticated push path — the token was verified BEFORE the backend
+      // runs, so an unauthenticated push never reaches git at all.
+      if (gitReceive) {
+        await serveGitHttp(dir, req, res);
+        return;
+      }
+
+      // ---- git repo create ----
+      {
+        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "POST" && m) {
+          try {
+            const r = createRepo(dir, m[1], m[2]);
+            return send(res, 201, {
+              ok: true,
+              owner: r.owner,
+              repo: r.repo,
+              cloneUrl: `http://127.0.0.1:${apiPort}/git/${r.owner}/${r.repo}`,
+            });
+          } catch (e) {
+            if (e.code === "EXISTS") return send(res, 409, { error: e.message });
+            return send(res, 400, { error: e.message });
+          }
+        }
+      }
 
       // ---- jobs ----
       if (req.method === "POST" && path === "/jobs") {
@@ -217,6 +300,7 @@ export function startApiServer(dir, cfg) {
     // 127.0.0.1 ONLY — the API never binds a public interface.
     server.listen(wanted, "127.0.0.1", () => {
       const port = server.address().port;
+      apiPort = port;
       resolve({ server, port, url: `http://127.0.0.1:${port}` });
     });
   });
