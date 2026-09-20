@@ -3,6 +3,19 @@
   "abi": [
     {
       "type": "function",
+      "name": "CAP_ALL",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
       "name": "CAP_COMMIT",
       "inputs": [],
       "outputs": [
@@ -96,6 +109,19 @@
     },
     {
       "type": "function",
+      "name": "cancelTransfer",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
       "name": "commitProject",
       "inputs": [
         {
@@ -178,6 +204,11 @@
             },
             {
               "name": "expiresAt",
+              "type": "uint64",
+              "internalType": "uint64"
+            },
+            {
+              "name": "authorizationEpoch",
               "type": "uint64",
               "internalType": "uint64"
             },
@@ -275,6 +306,11 @@
               "name": "updatedAt",
               "type": "uint64",
               "internalType": "uint64"
+            },
+            {
+              "name": "authorizationEpoch",
+              "type": "uint64",
+              "internalType": "uint64"
             }
           ]
         }
@@ -303,6 +339,35 @@
       ],
       "outputs": [],
       "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "hasCapability",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "internalType": "bytes32"
+        },
+        {
+          "name": "agent",
+          "type": "address",
+          "internalType": "address"
+        },
+        {
+          "name": "capability",
+          "type": "uint256",
+          "internalType": "uint256"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool",
+          "internalType": "bool"
+        }
+      ],
+      "stateMutability": "view"
     },
     {
       "type": "function",
@@ -411,6 +476,12 @@
         },
         {
           "name": "expiresAt",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        },
+        {
+          "name": "authorizationEpoch",
           "type": "uint64",
           "indexed": false,
           "internalType": "uint64"
@@ -587,6 +658,37 @@
           "type": "address",
           "indexed": true,
           "internalType": "address"
+        },
+        {
+          "name": "authorizationEpoch",
+          "type": "uint64",
+          "indexed": false,
+          "internalType": "uint64"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "TransferCancelled",
+      "inputs": [
+        {
+          "name": "projectId",
+          "type": "bytes32",
+          "indexed": true,
+          "internalType": "bytes32"
+        },
+        {
+          "name": "owner",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        },
+        {
+          "name": "recipient",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
         }
       ],
       "anonymous": false
@@ -628,6 +730,16 @@
     },
     {
       "type": "error",
+      "name": "InvalidCapabilities",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "InvalidDigest",
+      "inputs": []
+    },
+    {
+      "type": "error",
       "name": "InvalidOwner",
       "inputs": []
     },
@@ -644,6 +756,11 @@
     {
       "type": "error",
       "name": "NotProjectOwner",
+      "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "OwnerConsentRequired",
       "inputs": []
     },
     {
