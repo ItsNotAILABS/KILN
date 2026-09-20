@@ -33,6 +33,21 @@ function log(...a) {
   console.log(`[daemon ${new Date().toISOString()}]`, ...a);
 }
 
+/**
+ * Ticket E4: the supervisor runs on every tick, so a node that is
+ * terminally dead (policy=never, or max restarts reached) got its "not
+ * respawning / leaving dead" line re-logged every tick — ~25k lines and a
+ * 10MB daemon.log in a day. Terminal states never change on their own, so
+ * log each distinct terminal state once per daemon lifetime; a genuinely
+ * new situation (policy edited, restarts incremented) still logs.
+ */
+const terminalLogged = new Set();
+function logTerminalOnce(key, msg) {
+  if (terminalLogged.has(key)) return;
+  terminalLogged.add(key);
+  log(msg);
+}
+
 function lockPath(dir) { return join(dir, "daemon.lock"); }
 function daemonJsonPath(dir) { return join(dir, "daemon.json"); }
 
@@ -96,9 +111,9 @@ function reconcile(dir, cfg) {
     // dead worker: respawn per policy
     const policy = node.restartPolicy || "on-failure";
     const should = policy === "always" || (policy === "on-failure" && node.lastExit !== 0);
-    if (!should) { log(`node ${node.name}: dead, policy=${policy} — not respawning`); continue; }
+    if (!should) { logTerminalOnce(`${node.id}:dead:${policy}`, `node ${node.name}: dead, policy=${policy} — not respawning`); continue; }
     if (node.restarts >= (node.maxRestarts ?? 3)) {
-      log(`node ${node.name}: max restarts (${node.maxRestarts}) reached — leaving dead`);
+      logTerminalOnce(`${node.id}:maxrestarts:${node.restarts}`, `node ${node.name}: max restarts (${node.maxRestarts}) reached — leaving dead`);
       continue;
     }
     node.restarts += 1;
