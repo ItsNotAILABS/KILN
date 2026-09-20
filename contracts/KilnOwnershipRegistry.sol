@@ -51,6 +51,7 @@ contract KilnOwnershipRegistry {
     error GrantExpired();
     error ExceedsParentGrant();
     error OwnerConsentRequired();
+    error TransferToSelf();
 
     event ProjectRegistered(bytes32 indexed projectId, address indexed owner, string repositoryUri, bytes32 indexed licenseId, uint64 timestamp);
     event CommitAnchored(bytes32 indexed projectId, address indexed actor, bytes32 indexed gitCommit, bytes32 treeDigest, bytes32 metadataDigest, uint64 timestamp);
@@ -135,6 +136,7 @@ contract KilnOwnershipRegistry {
         uint64 expiresAt
     ) external {
         if (childAgent == address(0)) revert InvalidOwner();
+        if (capabilities == 0 || capabilities & ~CAP_ALL != 0) revert InvalidCapabilities();
         if (!_hasCapability(projectId, msg.sender, CAP_DELEGATE)) revert NotAuthorizedAgent();
 
         AgentGrant memory parentGrant = agentGrants[projectId][msg.sender];
@@ -169,8 +171,6 @@ contract KilnOwnershipRegistry {
 
         delete agentGrants[projectId][agent];
         emit AgentAuthorizationRevoked(projectId, agent);
-        delete agentGrants[projectId][agent];
-        emit AgentAuthorizationRevoked(projectId, agent);
 
         address[] storage children = delegationChildren[projectId][agent];
         uint256 childCount = children.length;
@@ -182,6 +182,7 @@ contract KilnOwnershipRegistry {
 
     function transferProject(bytes32 projectId, address recipient) external projectOwner(projectId) {
         if (recipient == address(0)) revert InvalidOwner();
+        if (recipient == msg.sender) revert TransferToSelf();
         projects[projectId].pendingOwner = recipient;
         projects[projectId].updatedAt = uint64(block.timestamp);
         emit TransferProposed(projectId, msg.sender, recipient);

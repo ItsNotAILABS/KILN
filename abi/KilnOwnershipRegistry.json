@@ -777,6 +777,11 @@
       "type": "error",
       "name": "TransferNotPending",
       "inputs": []
+    },
+    {
+      "type": "error",
+      "name": "TransferToSelf",
+      "inputs": []
     }
   ]
 }

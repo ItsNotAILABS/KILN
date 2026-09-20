@@ -24,7 +24,7 @@ Source code stays in Git-compatible storage. KILN stores compact commitments, si
 
 ## Agent delegation (clones)
 
-Agents in KILN work the way Auro works: a live agent with `CAP_DELEGATE` (8) can call `delegateGrant(projectId, childAgent, capabilities, expiresAt)` to mint a scoped clone. The child gets only a subset of the parent's capabilities (`ExceedsParentGrant` otherwise), an expiry no later than the parent's, and `parent = msg.sender` on its grant (owner-authorized grants have `parent = address(0)`). `AgentDelegated` is emitted per clone. The project owner can revoke any grant via `revokeAuthorization`; revocation cascades through the delegation subtree, so killing a parent kills its clones but not its siblings. Delegated grants carry the project's current `authorizationEpoch`, so an ownership transfer (which bumps the epoch) invalidates delegated grants along with direct ones. `CAP_ALL` covers all four capabilities including `CAP_DELEGATE`; `authorizeAgent` rejects unknown capability bits with `InvalidCapabilities`.
+Agents in KILN work the way Auro works: a live agent with `CAP_DELEGATE` (8) can call `delegateGrant(projectId, childAgent, capabilities, expiresAt)` to mint a scoped clone. The child gets only a subset of the parent's capabilities (`ExceedsParentGrant` otherwise), an expiry no later than the parent's, and `parent = msg.sender` on its grant (owner-authorized grants have `parent = address(0)`). `AgentDelegated` is emitted per clone. The project owner can revoke any grant via `revokeAuthorization`; revocation cascades through the delegation subtree, so killing a parent kills its clones but not its siblings. Delegated grants carry the project's current `authorizationEpoch`, so an ownership transfer (which bumps the epoch) invalidates delegated grants along with direct ones. `CAP_ALL` covers all four capabilities including `CAP_DELEGATE`; `authorizeAgent` and `delegateGrant` reject empty or unknown capability bits with `InvalidCapabilities`.
 - **Receipt** — immutable record linking actor, action, policy decision, source digest, and resulting commit.
 
 ## Ownership rules
@@ -32,7 +32,7 @@ Agents in KILN work the way Auro works: a live agent with `CAP_DELEGATE` (8) can
 1. Registering a digest proves control of the signing account at registration time; it is not a substitute for legal title.
 2. Every project has an owner account or organization and an explicit license.
 3. Agents may propose and prepare changes, but cannot transfer ownership or grant broader rights.
-4. Ownership transfer requires the current owner signature and recipient acceptance.
+4. Ownership transfer requires the current owner signature and recipient acceptance. Transfer to self is rejected (`TransferToSelf`) since accepting it would needlessly invalidate every agent grant via the epoch bump.
 5. Releases, deployments, wallet actions, and destructive repository operations require explicit policy approval.
 6. Public metadata is readable by everyone; private workspace content, secrets, prompts, and memory remain tenant-isolated.
 7. A KILN receipt must never contain private keys, API secrets, or raw private source.

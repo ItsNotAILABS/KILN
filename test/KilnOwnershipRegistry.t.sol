@@ -311,4 +311,69 @@ contract KilnOwnershipRegistryTest is Test {
         assertEq(registry.getAgentGrant(projectId, childC).expiresAt, 0);
         assertEq(registry.getAgentGrant(projectId, grandchildD).expiresAt, 0);
     }
+
+    // ---------- L1 hardening regressions ----------
+
+    event AgentAuthorizationRevoked(bytes32 indexed projectId, address indexed agent);
+
+    function testRevokeEmitsExactlyOneRevocationEvent() public {
+        uint256 commitCap = registry.CAP_COMMIT();
+        uint256 delegateCap = registry.CAP_DELEGATE();
+        uint64 expiry = uint64(block.timestamp + 1 days);
+        _registerAndAuthorize(agent, commitCap | delegateCap, expiry);
+
+        // Exactly one AgentAuthorizationRevoked must be emitted (no duplicates).
+        vm.prank(owner);
+        vm.expectEmit(true, true, false, false);
+        emit AgentAuthorizationRevoked(projectId, agent);
+        registry.revokeAuthorization(projectId, agent);
+
+        // A second revoke is a no-op: no grant, no event.
+        vm.prank(owner);
+        registry.revokeAuthorization(projectId, agent);
+        assertEq(registry.getAgentGrant(projectId, agent).expiresAt, 0);
+    }
+
+    function testDelegateRejectsZeroCapabilities() public {
+        uint256 commitCap = registry.CAP_COMMIT();
+        uint256 delegateCap = registry.CAP_DELEGATE();
+        address child = address(0xC111D);
+        _registerAndAuthorize(agent, commitCap | delegateCap, uint64(block.timestamp + 1 days));
+
+        vm.prank(agent);
+        vm.expectRevert(KilnOwnershipRegistry.InvalidCapabilities.selector);
+        registry.delegateGrant(projectId, child, 0, uint64(block.timestamp + 12 hours));
+
+        assertEq(registry.getAgentGrant(projectId, child).expiresAt, 0);
+    }
+
+    function testDelegateRejectsUnknownCapabilityBits() public {
+        uint256 commitCap = registry.CAP_COMMIT();
+        uint256 delegateCap = registry.CAP_DELEGATE();
+        address child = address(0xC111D);
+        _registerAndAuthorize(agent, commitCap | delegateCap, uint64(block.timestamp + 1 days));
+
+        // Bit 16 is not a known capability: InvalidCapabilities, not ExceedsParentGrant.
+        vm.prank(agent);
+        vm.expectRevert(KilnOwnershipRegistry.InvalidCapabilities.selector);
+        registry.delegateGrant(projectId, child, 16, uint64(block.timestamp + 12 hours));
+
+        assertEq(registry.getAgentGrant(projectId, child).expiresAt, 0);
+    }
+
+    function testTransferToSelfIsRejected() public {
+        register();
+        uint256 commitCap = registry.CAP_COMMIT();
+        vm.prank(owner);
+        registry.authorizeAgent(projectId, agent, commitCap, uint64(block.timestamp + 7 days));
+
+        // Self-transfer would bump the epoch and nuke every grant: forbid it.
+        vm.prank(owner);
+        vm.expectRevert(KilnOwnershipRegistry.TransferToSelf.selector);
+        registry.transferProject(projectId, owner);
+
+        // No transfer pending, grants untouched, epoch unchanged.
+        assertEq(registry.getProject(projectId).authorizationEpoch, 1);
+        assertTrue(registry.hasCapability(projectId, agent, commitCap));
+    }
 }
