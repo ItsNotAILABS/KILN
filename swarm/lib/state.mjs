@@ -137,6 +137,27 @@ export function pidAlive(pid) {
   }
 }
 
+/// True if pid is a live process running the swarm daemon for `dir` — not a
+/// pid-reuse impostor. kill(pid,0) alone is racy: a dead daemon's pid can be
+/// recycled by an unrelated process, making a stale lock / stale daemon.json
+/// look live (seen 2026-09-21: watchdog restart refused while no daemon ran).
+/// On non-Linux (/proc unavailable) falls back to trusting pidAlive.
+export function pidIsDaemon(pid, dir) {
+  if (!pidAlive(pid)) return false;
+  try {
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    if (!cmd.includes("daemon.mjs")) return false;
+    // Same script could serve another state dir — check the env marker too.
+    try {
+      const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+      if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
+    } catch { /* environ unreadable — cmdline match is enough */ }
+    return true;
+  } catch {
+    return true; // /proc unavailable: fall back to pidAlive behavior
+  }
+}
+
 export function readJobFile(dir, id) {
   const p = join(nodeDir(dir, id), "job.json");
   if (!existsSync(p)) return null;

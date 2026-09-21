@@ -19,7 +19,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir, ensureStateDir, loadConfig, listNodeIds, loadNode, saveNode,
-  pidAlive, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
+  pidAlive, pidIsDaemon, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
 } from "./state.mjs";
 import { appendEvent, pendingJobs } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
@@ -58,10 +58,15 @@ function acquireLock(dir) {
     return true;
   } catch (e) {
     if (e.code !== "EEXIST") throw e;
-    // Possibly stale — check the recorded pid.
+    // Possibly stale — check the recorded pid. kill(pid,0) alone is racy: a
+    // dead daemon's pid can be reused by an unrelated process in the window
+    // between the check and the claim, making a stale lock look live (seen
+    // 2026-09-21: restart refused with "lock held by live pid" while no
+    // daemon ran). pidIsDaemon verifies the cmdline actually belongs to
+    // this daemon.
     try {
       const d = JSON.parse(readFileSync(daemonJsonPath(dir), "utf8"));
-      if (pidAlive(d.pid)) return false; // genuinely running
+      if (pidIsDaemon(d.pid, dir)) return false; // genuinely running
     } catch { /* fall through: stale */ }
     unlinkSync(lockPath(dir));
     const fd = openSync(lockPath(dir), "wx");

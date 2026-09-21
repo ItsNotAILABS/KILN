@@ -174,3 +174,57 @@ describe("daemon watchdog", () => {
     assert.equal(dj.pid, 999999);
   });
 });
+
+describe("stale lock vs pid reuse (2026-09-21 incident)", () => {
+  it("pidIsDaemon rejects a live pid that is not the daemon", async () => {
+    const { pidIsDaemon, pidAlive } = await import("../lib/state.mjs");
+    const dir = makeStateDir();
+    const decoy = spawn(process.execPath, ["-e", "setInterval(()=>{}, 1000)"], { stdio: "ignore" });
+    try {
+      assert.equal(pidAlive(decoy.pid), true, "decoy must be alive for the test to mean anything");
+      assert.equal(pidIsDaemon(decoy.pid, dir), false, "a live non-daemon pid must not pass as the daemon");
+      assert.equal(pidIsDaemon(999999, dir), false, "a dead pid must not pass");
+    } finally {
+      decoy.kill("SIGKILL");
+    }
+  });
+
+  it("daemon start reclaims the lock when daemon.json points at a reused pid", async () => {
+    const dir = makeStateDir();
+    // Ephemeral port so the new daemon never collides with the live one.
+    const cfgPath = join(dir, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+    cfg.apiPort = 0;
+    writeFileSync(cfgPath, JSON.stringify(cfg) + "\n");
+
+    // Simulate the incident: the recorded pid is alive but is NOT the daemon
+    // (pid reuse) and the lock file exists. Old code refused with
+    // "already running (lock held by live pid)"; fixed code must reclaim it.
+    const decoy = spawn(process.execPath, ["-e", "setInterval(()=>{}, 1000)"], { stdio: "ignore" });
+    try {
+      writeFileSync(
+        join(dir, "daemon.json"),
+        JSON.stringify({ pid: decoy.pid, startedAt: new Date().toISOString(), apiPort: 19999, apiUrl: "http://127.0.0.1:19999" }) + "\n"
+      );
+      writeFileSync(join(dir, "daemon.lock"), "");
+      const r = cli(dir, "daemon", "start");
+      assert.doesNotMatch(r.stderr, /already running/, `start must not refuse: ${r.stderr}`);
+      assert.match(r.stdout, /daemon starting pid=/, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+      // The child writes daemon.json asynchronously after reclaiming the lock — wait for it.
+      let dj = null;
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        try {
+          const cur = JSON.parse(readFileSync(join(dir, "daemon.json"), "utf8"));
+          if (cur.pid !== decoy.pid) { dj = cur; break; }
+        } catch { /* not written yet */ }
+        await new Promise((res) => setTimeout(res, 250));
+      }
+      assert.ok(dj, "daemon.json must be rewritten with the new daemon pid");
+      assert.ok(pidAlive(dj.pid), "new daemon must be alive");
+      spawnedDaemons.push(dj.pid);
+    } finally {
+      decoy.kill("SIGKILL");
+    }
+  });
+});

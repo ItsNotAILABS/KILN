@@ -23,7 +23,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir as defaultStateDir, ensureStateDir, listNodeIds, loadNode, saveNode,
-  resolveNode, pidAlive, heartbeatAgeMs, nodeDir, loadApiToken,
+  resolveNode, pidAlive, pidIsDaemon, heartbeatAgeMs, nodeDir, loadApiToken,
 } from "./lib/state.mjs";
 import { createNode } from "./lib/nodes.mjs";
 import { loadKeypair } from "./lib/keys.mjs";
@@ -78,7 +78,7 @@ function daemonJson(dir) {
 
 function daemonStart(dir) {
   const d = daemonJson(dir);
-  if (d && pidAlive(d.pid)) { console.error(`daemon already running pid=${d.pid}`); process.exit(1); }
+  if (d && pidIsDaemon(d.pid, dir)) { console.error(`daemon already running pid=${d.pid}`); process.exit(1); }
   const out = openSync(join(dir, "daemon.log"), "a");
   const child = spawn(process.execPath, [join(HERE, "lib", "daemon.mjs")], {
     detached: true, stdio: ["ignore", out, out],
@@ -162,7 +162,7 @@ async function cmdDaemon(args) {
     daemonStart(dir);
   } else if (sub === "stop") {
     const d = daemonJson(dir);
-    if (!d || !pidAlive(d.pid)) { console.log("daemon not running"); return; }
+    if (!d || !pidIsDaemon(d.pid, dir)) { console.log("daemon not running"); return; }
     process.kill(d.pid, "SIGTERM");
     console.log(`daemon stop signaled pid=${d.pid} (workers left running — persistent)`);
   } else if (sub === "status") {
