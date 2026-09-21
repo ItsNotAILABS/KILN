@@ -137,6 +137,39 @@ describe("KILN-native git hosting", () => {
     assert.ok(log.includes("first commit"), `unexpected log: ${log}`);
   });
 
+  it("401 carries a WWW-Authenticate challenge (git needs it to retry)", async () => {
+    const res = await fetch(`${base}/git/testowner/testrepo/git-receive-pack`, { method: "POST" });
+    assert.equal(res.status, 401);
+    const www = res.headers.get("www-authenticate") || "";
+    assert.ok(
+      www.includes("Basic"),
+      `401 must advertise a Basic challenge so git retries with URL credentials, got: ${www}`
+    );
+    await res.arrayBuffer(); // drain
+  });
+
+  it("round trip: push via oauth2:<token>@ URL (Basic challenge-response flow)", async () => {
+    // Exact repro of the filed ticket: credentials embedded in the URL are NOT
+    // sent preemptively by git — it waits for a 401 with WWW-Authenticate,
+    // then retries with Basic. Without the challenge header the push died with
+    // "unexpected disconnect while reading sideband packet".
+    const r = await apiCall("POST", "/git/testowner/urlrepo");
+    assert.equal(r.status, 201);
+    const authedUrl = base.replace("http://", `http://oauth2:${token}@`) + "/git/testowner/urlrepo";
+    const work = mkdtempSync(join(tmpdir(), "kiln-git-url-"));
+    await gitOk(work, ["clone", "-q", authedUrl, "w1"]);
+    const w1 = join(work, "w1");
+    writeFileSync(join(w1, "url.txt"), "pushed via URL credentials\n");
+    await gitOk(w1, ["-c", "user.email=u@kiln.local", "-c", "user.name=kiln-test", "add", "url.txt"]);
+    await gitOk(w1, ["-c", "user.email=u@kiln.local", "-c", "user.name=kiln-test", "commit", "-q", "-m", "url-auth commit"]);
+    await gitOk(w1, ["push", "-q", "origin", "main"]);
+
+    const w2 = join(work, "w2");
+    await gitOk(work, ["clone", "-q", `${base}/git/testowner/urlrepo`, "w2"]);
+    const content = readFileSync(join(w2, "url.txt"), "utf8");
+    assert.equal(content, "pushed via URL credentials\n");
+  });
+
   it("push WITHOUT a token is refused and lands nothing", async () => {
     const cloneUrl = `${base}/git/testowner/testrepo`;
     const work = mkdtempSync(join(tmpdir(), "kiln-git-evil-"));

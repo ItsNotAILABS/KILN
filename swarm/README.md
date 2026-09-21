@@ -234,14 +234,16 @@ Rules:
 - **Authenticated:** repo creation and `push`. Auth is checked *before*
   `git-http-backend` ever runs — an unauthenticated push never reaches git.
   Clients authenticate with the daemon bearer token, either as
-  `Authorization: Bearer <token>` or HTTP Basic with the token as the
-  password (what `http.extraHeader` sends).
+  `Authorization: Bearer <token>` (what `http.extraHeader` sends) or HTTP
+  Basic with the token as the password (what `http://oauth2:<token>@host/...`
+  URLs send — git retries the 401 challenge with it).
 - Owner/repo names are lowercase alphanumeric plus hyphens; traversal and
   uppercase are rejected.
 - Current boundary: the daemon listens on loopback only, so clone/push URLs
   are localhost URLs for now.
 
-Tests (`test/git.test.mjs`, 9 tests): authenticated create (201), duplicate
+Tests (`test/git.test.mjs`, 11 tests): authenticated create (201), duplicate
 (409), bad names (400), unauthenticated create refused (401), public listing,
-a real clone → push → fresh-clone round trip, and a real unauthenticated push
-that is refused and lands nothing.
+a real clone → push → fresh-clone round trip, a 401 `WWW-Authenticate`
+challenge assertion, a real push via `oauth2:<token>@` URL credentials, and a
+real unauthenticated push that is refused and lands nothing.

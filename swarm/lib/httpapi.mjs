@@ -87,10 +87,30 @@ function readBody(req) {
   });
 }
 
-function send(res, code, obj) {
+function send(res, code, obj, extraHeaders = {}) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  res.writeHead(code, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+    ...extraHeaders,
+  });
   res.end(body);
+}
+
+/**
+ * 401 challenge for the auth gate. RFC 7235: a 401 MUST carry
+ * WWW-Authenticate, otherwise clients (notably git, which relies on the
+ * 401 -> retry-with-credentials flow for userinfo URLs like
+ * http://oauth2:<token>@host/...) never retry and the push dies with a
+ * confusing transport error instead of authenticating.
+ */
+function unauthorized(res) {
+  return send(
+    res,
+    401,
+    { error: "unauthorized: valid token required (Bearer header or Basic password)" },
+    { "www-authenticate": 'Basic realm="kiln-swarm", Bearer realm="kiln-swarm"' }
+  );
 }
 
 /**
@@ -159,7 +179,7 @@ export function startApiServer(dir, cfg) {
 
       // ---- auth (everything below here) ----
       if (!checkAuth(req, token)) {
-        return send(res, 401, { error: "unauthorized: bearer token required" });
+        return unauthorized(res);
       }
 
       // Authenticated push path — the token was verified BEFORE the backend
