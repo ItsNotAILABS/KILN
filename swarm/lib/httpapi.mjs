@@ -18,6 +18,17 @@
  *   POST /nodes/:id/stop            -> {ok:true}
  *   GET  /nodes/:id/logs?tail=N&stream=stdout|stderr -> {stream, log}
  *   POST /receipts/verify           {node?} -> {results:[...]}
+ * Compute — serverless functions, parallel map, app hosting:
+ *   POST /v1/compute/invoke         {name?, code, args?, timeoutMs?, waitMs?}
+ *                                     waitMs omitted -> 201 {invocationId, jobId, status}
+ *                                     waitMs set     -> 200 full result (blocks)
+ *   GET  /v1/compute/invocations/:id -> {invocationId, status, ok?, result?, error?, logs?}
+ *   POST /v1/compute/map            {name?, code, items[], timeoutMs?} -> {mapId, invocationIds}
+ *   GET  /v1/compute/map/:mapId      -> {mapId, counts, results[]}
+ *   POST /v1/compute/apps           {name, repo, command, args?, env?, port?} -> {appId, name}
+ *   GET  /v1/compute/apps           -> {apps:[...]}
+ *   GET  /v1/compute/apps/:id/logs?tail=N -> {appId, log}
+ *   DELETE /v1/compute/apps/:id     -> {ok:true}
  * Git hosting (KILN-native repos, served via git http-backend CGI):
  *   POST /git/:owner/:repo            create repo (auth required)
  *   GET  /git                         list repos (public)
@@ -40,6 +51,10 @@ import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
+import {
+  ComputeError, submitInvocation, getInvocation, waitInvocation,
+  submitMap, getMap, deployApp, listApps, appLogs, undeployApp,
+} from "./compute.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -306,8 +321,70 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, { results, allOk: results.every((r) => r.ok) });
       }
 
+      // ---- compute: serverless functions ----
+      if (req.method === "POST" && path === "/v1/compute/invoke") {
+        const b = await readBody(req);
+        const { invocationId, jobId } = submitInvocation(dir, {
+          name: b.name, code: b.code, args: b.args, timeoutMs: b.timeoutMs,
+        });
+        if (b.waitMs !== undefined) {
+          const w = Number(b.waitMs);
+          if (!Number.isFinite(w) || w < 1000 || w > 300000) {
+            return send(res, 400, { error: "waitMs must be a number in 1000..300000" });
+          }
+          return send(res, 200, await waitInvocation(dir, invocationId, w));
+        }
+        return send(res, 201, { invocationId, jobId, status: "pending" });
+      }
+      {
+        const m = path.match(/^\/v1\/compute\/invocations\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "GET" && m) {
+          return send(res, 200, getInvocation(dir, m[1]));
+        }
+      }
+
+      // ---- compute: parallel map ----
+      if (req.method === "POST" && path === "/v1/compute/map") {
+        const b = await readBody(req);
+        const r = submitMap(dir, { name: b.name, code: b.code, items: b.items, timeoutMs: b.timeoutMs });
+        return send(res, 201, { ...r, count: r.invocationIds.length });
+      }
+      {
+        const m = path.match(/^\/v1\/compute\/map\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "GET" && m) {
+          return send(res, 200, getMap(dir, m[1]));
+        }
+      }
+
+      // ---- compute: app hosting ----
+      if (req.method === "POST" && path === "/v1/compute/apps") {
+        const b = await readBody(req);
+        const r = await deployApp(dir, {
+          name: b.name, repo: b.repo, command: b.command,
+          args: b.args, env: b.env, port: b.port,
+        });
+        return send(res, 201, r);
+      }
+      if (req.method === "GET" && path === "/v1/compute/apps") {
+        return send(res, 200, { apps: listApps(dir) });
+      }
+      {
+        const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)\/logs$/);
+        if (req.method === "GET" && m) {
+          const tail = url.searchParams.has("tail") ? parseInt(url.searchParams.get("tail"), 10) : 100;
+          return send(res, 200, appLogs(dir, m[1], Number.isFinite(tail) ? tail : 100));
+        }
+      }
+      {
+        const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "DELETE" && m) {
+          return send(res, 200, undeployApp(dir, m[1]));
+        }
+      }
+
       return send(res, 404, { error: "not found" });
     } catch (e) {
+      if (e instanceof ComputeError) return send(res, e.status, { error: e.message });
       return send(res, 500, { error: e.message });
     }
   });

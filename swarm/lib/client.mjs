@@ -45,7 +45,7 @@ export class SwarmClient {
     if (!alive) throw new Error(`SwarmClient: daemon pid ${dj.pid} is not alive — stale daemon.json`);
     const tokPath = join(d, "api.token");
     if (!existsSync(tokPath)) throw new Error(`SwarmClient: no api.token in ${d}`);
-    return new SwarmClient({ baseUrl: dj.apiUrl, token: readFileSync(tokPath, "utf8").trim() });
+    return new this({ baseUrl: dj.apiUrl, token: readFileSync(tokPath, "utf8").trim() });
   }
 
   async _req(method, path, body) {

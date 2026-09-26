@@ -78,6 +78,43 @@ const nodes = await swarm.listNodes();
 const check = await swarm.verifyReceipts(); // { results, allOk }
 ```
 
+### KILN Compute — serverless functions on the swarm
+
+The swarm is also a supercomputer other repos call like serverless. Full
+spec: `docs/KILN_COMPUTE.md`.
+
+```js
+import { ComputeClient } from "./lib/compute-client.mjs";
+const kiln = await ComputeClient.connect();
+
+// run a function, get the result back (code must export main(args))
+const r = await kiln.invoke({
+  code: `export async function main(args) { return args.x * 2; }`,
+  args: { x: 21 }, waitMs: 60000,
+});
+console.log(r.result); // 42
+
+// fan out across workers
+const m = await kiln.map({
+  code: `export async function main(n) { return n * n; }`,
+  items: [1, 2, 3, 4],
+});
+const done = await kiln.waitMap(m.mapId);
+console.log(done.results.map((x) => x.result)); // [1, 4, 9, 16]
+
+// pop a repo as a persistent supervised service
+const app = await kiln.deployApp({
+  name: "my-api", repo: "http://127.0.0.1:18787/git/auro/my-api",
+  command: "node", args: ["server.mjs"], port: 8901,
+});
+```
+
+```sh
+node swarm.mjs compute invoke --code "export async function main(a){ return a.x*2 }" --args '{"x":21}' --wait 60000
+node swarm.mjs compute map --code "export async function main(n){ return n*n }" --items '[1,2,3,4]' --wait 120000
+node swarm.mjs compute deploy --name my-api --repo <url> --command node --args '["server.mjs"]' --port 8901
+```
+
 ### depositCode — agents contributing code
 
 `depositCode({ repo, files, message })` is the first-class primitive for an

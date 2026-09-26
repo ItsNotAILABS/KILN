@@ -107,7 +107,52 @@ const { id } = await swarm.spawnNode({
 
 Check on it any time: `listNodes()`, `nodeLogs(id)`, `verifyReceipts(id)`.
 
-## 6. Rules (non-negotiable)
+## 6. KILN Compute — serverless functions, fan-out, app hosting
+
+`lib/compute-client.mjs` (`ComputeClient extends SwarmClient`) turns the
+swarm into serverless compute any repo can call. Same auth, same receipts.
+
+```js
+import { ComputeClient } from "<path-to>/KILN/swarm/lib/compute-client.mjs";
+const kiln = await ComputeClient.connect();
+
+// invoke: run a function, get the result. code MUST export main(args).
+// waitMs blocks (1000..300000); omit it for fire-and-forget + poll.
+const r = await kiln.invoke({
+  code: `export async function main(args) { return args.x * 2; }`,
+  args: { x: 21 },
+  waitMs: 60000,           // -> { status:"done", ok:true, result:42, logs, durationMs }
+});
+const v = await kiln.invocation(r.invocationId);          // poll later
+const v2 = await kiln.waitInvocation(r.invocationId);     // throws on failure/timeout
+
+// map: fan one function over many items — the supercomputer bit.
+// Each item is its own job; the daemon spreads them across idle workers
+// and autospawns up to maxNodes. Max 64 items per map.
+const m = await kiln.map({
+  code: `export async function main(n) { return n * n; }`,
+  items: [1, 2, 3, 4],
+});
+const done = await kiln.waitMap(m.mapId);                // throws if any item failed
+console.log(done.results.map((x) => x.result));         // [1, 4, 9, 16]
+
+// apps: deploy a repo as a persistent supervised service.
+// The worker boots `command` on (re)start, restarts it on crash, logs to app.log.
+// Survives daemon restarts and VM recycles via the watchdog path.
+const app = await kiln.deployApp({
+  name: "my-api",
+  repo: "http://127.0.0.1:18787/git/auro/my-api",
+  command: "node", args: ["server.mjs"], port: 8901,
+});
+const logs = await kiln.appLogs(app.appId, { tail: 50 });
+await kiln.undeployApp(app.appId); // stop for good
+```
+
+Function results are real: `ok:true` + JSON `result`, or `ok:false` + the
+function's real error. A module without `main()` fails loudly. Limits:
+code ≤ 256KB, `timeoutMs` 100..300000ms, results > 1MB are not returned.
+
+## 7. Rules (non-negotiable)
 
 1. **Real or loud failure.** Every tool executes for real or the job fails
    with the real error. Never invent output, hashes, receipts, or commits.

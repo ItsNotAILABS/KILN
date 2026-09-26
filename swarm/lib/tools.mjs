@@ -39,7 +39,8 @@ const DENY_PATTERNS = [
   "&&", "||", ";", "|", ">", "<", "\n", "\r", "\0",
 ];
 
-function checkShellArgs(command, args) {
+/** Exported for compute app validation: same jail philosophy, no shell. */
+export function checkShellArgs(command, args) {
   const bin = basename(String(command)).toLowerCase();
   if (SHELL_BINS.has(bin)) {
     throw new ToolError(`jail: shell binaries are not executable tools (got "${command}")`);

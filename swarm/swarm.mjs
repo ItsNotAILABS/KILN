@@ -425,6 +425,93 @@ async function cmdRepo(args) {
   } else { console.error("usage: repo create|list"); process.exit(2); }
 }
 
+// ---------------------------------------------------------------- compute (serverless)
+
+function readCode(args) {
+  if (args["code-file"]) return readFileSync(resolve(String(args["code-file"])), "utf8");
+  return need(args, "code");
+}
+
+async function cmdCompute(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  if (sub === "invoke") {
+    const body = {
+      code: readCode(args),
+      name: args.name,
+      timeoutMs: args.timeout ? Number(args.timeout) : undefined,
+      waitMs: args.wait ? Number(args.wait) : undefined,
+    };
+    if (args.args) body.args = JSON.parse(String(args.args));
+    const r = await apiCall(dir, "POST", "/v1/compute/invoke", body);
+    if (r.status === "done") {
+      console.log(`done ok=${r.ok} (${r.durationMs}ms)`);
+      if (r.ok) console.log(JSON.stringify(r.result, null, 2));
+      else console.log(`error: ${r.error}`);
+      if (r.logs && r.logs.length) console.log(`logs:\n${r.logs.join("\n")}`);
+      process.exit(r.ok ? 0 : 1);
+    }
+    console.log(`${r.invocationId} ${r.status} (job ${r.jobId})`);
+  } else if (sub === "invocation") {
+    const r = await apiCall(dir, "GET", `/v1/compute/invocations/${need(args, "id")}`);
+    console.log(JSON.stringify(r, null, 2));
+    process.exit(r.status === "done" && r.ok === false ? 1 : 0);
+  } else if (sub === "map") {
+    const body = {
+      code: readCode(args),
+      items: JSON.parse(need(args, "items")),
+      name: args.name,
+      timeoutMs: args.timeout ? Number(args.timeout) : undefined,
+    };
+    const r = await apiCall(dir, "POST", "/v1/compute/map", body);
+    console.log(`${r.mapId}  ${r.count} items`);
+    if (args.wait) {
+      const t0 = Date.now();
+      const waitMs = Number(args.wait) || 300000;
+      for (;;) {
+        const m = await apiCall(dir, "GET", `/v1/compute/map/${r.mapId}`);
+        const pending = (m.counts.pending || 0) + (m.counts.assigned || 0);
+        if (!pending) {
+          for (const x of m.results) {
+            console.log(`${x.status} ${x.ok === false ? "ok=false " : ""}${JSON.stringify(x.result)}${x.error ? ` ERROR: ${x.error}` : ""}`);
+          }
+          process.exit(m.results.some((x) => x.ok === false) ? 1 : 0);
+        }
+        if (Date.now() - t0 > waitMs) { console.error("map wait timed out"); process.exit(1); }
+        await new Promise((rr) => setTimeout(rr, 1500));
+      }
+    }
+  } else if (sub === "map-status") {
+    const r = await apiCall(dir, "GET", `/v1/compute/map/${need(args, "id")}`);
+    console.log(JSON.stringify(r.counts));
+  } else if (sub === "deploy") {
+    const body = {
+      name: need(args, "name"),
+      repo: need(args, "repo"),
+      command: need(args, "command"),
+      args: args.args ? JSON.parse(String(args.args)) : undefined,
+      port: args.port ? Number(args.port) : undefined,
+    };
+    const r = await apiCall(dir, "POST", "/v1/compute/apps", body);
+    console.log(`deployed ${r.name} -> app ${r.appId.slice(0, 12)}… (${r.status})`);
+  } else if (sub === "apps") {
+    const r = await apiCall(dir, "GET", "/v1/compute/apps");
+    if (!r.apps.length) { console.log("(no apps)"); return; }
+    for (const a of r.apps) console.log(`${a.appId.slice(0, 12)}…  ${a.status.padEnd(8)} ${a.name}  ${a.command}${a.port ? ` :${a.port}` : ""}`);
+  } else if (sub === "logs") {
+    const tail = args.tail ? Number(args.tail) : 100;
+    const r = await apiCall(dir, "GET", `/v1/compute/apps/${need(args, "app")}/logs?tail=${tail}`);
+    console.log(r.log);
+  } else if (sub === "undeploy") {
+    await apiCall(dir, "DELETE", `/v1/compute/apps/${need(args, "app")}`);
+    console.log("undeployed");
+  } else {
+    console.error("usage: compute invoke|invocation|map|map-status|deploy|apps|logs|undeploy");
+    process.exit(2);
+  }
+}
+
 // ---------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
@@ -434,10 +521,11 @@ try {
   else if (cmd === "daemon") await cmdDaemon(args);
   else if (cmd === "node") await cmdNode(args);
   else if (cmd === "job") cmdJob(args);
+  else if (cmd === "compute") await cmdCompute(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|node|job|receipts|repo");
+    console.error("usage: swarm.mjs init|daemon|node|job|compute|receipts|repo");
     process.exit(2);
   }
 } catch (e) {
