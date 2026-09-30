@@ -25,8 +25,11 @@
  *   GET  /v1/compute/invocations/:id -> {invocationId, status, ok?, result?, error?, logs?}
  *   POST /v1/compute/map            {name?, code, items[], timeoutMs?} -> {mapId, invocationIds}
  *   GET  /v1/compute/map/:mapId      -> {mapId, counts, results[]}
- *   POST /v1/compute/apps           {name, repo, command, args?, env?, port?} -> {appId, name}
- *   GET  /v1/compute/apps           -> {apps:[...]}
+ *   POST /v1/compute/apps           {name, repo, command, args?, env?, port?, public?} -> {appId, name}
+ *   GET  /v1/compute/apps           -> {apps:[...]} (each with previewUrl + preview)
+ *   GET  /v1/compute/apps/:id       -> {app, previewUrl, preview}
+ *   POST /v1/compute/apps/:id/preview   -> enable public preview (503 when no relay configured)
+ *   DELETE /v1/compute/apps/:id/preview -> disable public preview
  *   GET  /v1/compute/apps/:id/logs?tail=N -> {appId, log}
  *   DELETE /v1/compute/apps/:id     -> {ok:true}
  * Git hosting (KILN-native repos, served via git http-backend CGI):
@@ -53,8 +56,12 @@ import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import {
   ComputeError, submitInvocation, getInvocation, waitInvocation,
-  submitMap, getMap, deployApp, listApps, appLogs, undeployApp,
+  submitMap, getMap, deployApp, listApps, appConfig, appLogs, undeployApp,
 } from "./compute.mjs";
+import {
+  withPreview, enablePreview, disablePreview, teardownPreview,
+  startPreviewReconciler,
+} from "./preview.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -112,6 +119,11 @@ function send(res, code, obj, extraHeaders = {}) {
   res.end(body);
 }
 
+/** Preview subsystem log line (daemon.log). Never carries the relay token. */
+function plog(...a) {
+  console.log(`[preview ${new Date().toISOString()}]`, ...a);
+}
+
 /**
  * 401 challenge for the auth gate. RFC 7235: a 401 MUST carry
  * WWW-Authenticate, otherwise clients (notably git, which relies on the
@@ -153,6 +165,9 @@ function checkAuth(req, token) {
 export function startApiServer(dir, cfg) {
   const token = loadApiToken(dir);
   let apiPort = 0; // filled in once listening; used for clone URLs
+  // Public-preview sidecar reconciler: one ssh/pipe bundle for all public
+  // apps, respawned on drop. No-op until cfg.preview is set.
+  const previews = startPreviewReconciler(dir, cfg, plog);
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://127.0.0.1");
@@ -363,10 +378,38 @@ export function startApiServer(dir, cfg) {
           name: b.name, repo: b.repo, command: b.command,
           args: b.args, env: b.env, port: b.port,
         });
+        if (b.public) {
+          // Caffeine-style: public:true auto-enables preview on deploy.
+          // Deploy still succeeds privately when the relay isn't configured.
+          try {
+            const pv = await enablePreview(dir, cfg, r.appId, plog);
+            r.previewUrl = pv.previewUrl;
+            r.preview = pv.preview;
+          } catch (e) {
+            r.previewUrl = null;
+            r.preview = { enabled: false, url: null, relayPort: null, wanted: true, note: e.message };
+          }
+        }
         return send(res, 201, r);
       }
       if (req.method === "GET" && path === "/v1/compute/apps") {
-        return send(res, 200, { apps: listApps(dir) });
+        const apps = await listApps(dir);
+        return send(res, 200, { apps: apps.map((a) => withPreview(dir, cfg, a)) });
+      }
+      {
+        const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)\/preview$/);
+        if (m && req.method === "POST") {
+          return send(res, 200, await enablePreview(dir, cfg, m[1], plog));
+        }
+        if (m && req.method === "DELETE") {
+          return send(res, 200, await disablePreview(dir, cfg, m[1], plog));
+        }
+      }
+      {
+        const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "GET" && m) {
+          return send(res, 200, withPreview(dir, cfg, appConfig(dir, m[1])));
+        }
       }
       {
         const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)\/logs$/);
@@ -378,6 +421,7 @@ export function startApiServer(dir, cfg) {
       {
         const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "DELETE" && m) {
+          await teardownPreview(dir, cfg, m[1], plog);
           return send(res, 200, undeployApp(dir, m[1]));
         }
       }
@@ -392,6 +436,7 @@ export function startApiServer(dir, cfg) {
   const wanted = process.env.KILN_SWARM_API_PORT !== undefined
     ? parseInt(process.env.KILN_SWARM_API_PORT, 10)
     : (cfg.apiPort ?? 18787); // 0 = ephemeral; ?? keeps 0, || would eat it
+  server.on("close", () => { try { previews.stop(); } catch {} });
   return new Promise((resolve, reject) => {
     server.on("error", reject);
     // 127.0.0.1 ONLY — the API never binds a public interface.

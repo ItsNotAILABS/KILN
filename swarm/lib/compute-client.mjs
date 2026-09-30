@@ -119,11 +119,13 @@ export class ComputeClient extends SwarmClient {
   /**
    * Deploy a repo as a persistent supervised service. The worker boots
    * `command` on (re)start and restarts it on crash; logs stream to app.log.
-   * Returns {appId, name, status}.
+   * Pass public:true for a Caffeine-style public preview URL (needs the
+   * preview relay configured; the app still deploys privately without it).
+   * Returns {appId, name, status, previewUrl?, preview?}.
    */
-  async deployApp({ name, repo, command, args, env, port } = {}) {
+  async deployApp({ name, repo, command, args, env, port, public: isPublic } = {}) {
     if (!name || !repo || !command) throw new Error("deployApp: name, repo, command are required");
-    return this._req("POST", "/v1/compute/apps", { name, repo, command, args, env, port });
+    return this._req("POST", "/v1/compute/apps", { name, repo, command, args, env, port, public: isPublic });
   }
 
   async listApps() {
@@ -137,5 +139,15 @@ export class ComputeClient extends SwarmClient {
   /** Stop an app for good: worker SIGTERMed (kills the app child), never respawned. */
   async undeployApp(appId) {
     return this._req("DELETE", `/v1/compute/apps/${appId}`);
+  }
+
+  /** Enable the public preview URL for an app (503 when no relay configured). */
+  async enablePreview(appId) {
+    return this._req("POST", `/v1/compute/apps/${appId}/preview`);
+  }
+
+  /** Disable the public preview URL for an app. */
+  async disablePreview(appId) {
+    return this._req("DELETE", `/v1/compute/apps/${appId}/preview`);
   }
 }

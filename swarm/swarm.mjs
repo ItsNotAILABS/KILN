@@ -492,13 +492,34 @@ async function cmdCompute(args) {
       command: need(args, "command"),
       args: args.args ? JSON.parse(String(args.args)) : undefined,
       port: args.port ? Number(args.port) : undefined,
+      public: args.public ? true : undefined, // Caffeine-style: public app gets a preview URL
     };
     const r = await apiCall(dir, "POST", "/v1/compute/apps", body);
     console.log(`deployed ${r.name} -> app ${r.appId.slice(0, 12)}… (${r.status})`);
+    if (r.previewUrl) console.log(`  preview: ${r.previewUrl}`);
+    else if (r.preview && r.preview.note) console.log(`  preview: not enabled (${r.preview.note})`);
   } else if (sub === "apps") {
     const r = await apiCall(dir, "GET", "/v1/compute/apps");
     if (!r.apps.length) { console.log("(no apps)"); return; }
-    for (const a of r.apps) console.log(`${a.appId.slice(0, 12)}…  ${a.status.padEnd(8)} ${a.name}  ${a.command}${a.port ? ` :${a.port}` : ""}`);
+    for (const a of r.apps) console.log(`${a.appId.slice(0, 12)}…  ${a.status.padEnd(8)} ${a.name}  ${a.command}${a.port ? ` :${a.port}` : ""}${a.previewUrl ? `\n  preview: ${a.previewUrl}` : ""}`);
+  } else if (sub === "preview") {
+    const app = need(args, "app");
+    if (args.enable) {
+      const r = await apiCall(dir, "POST", `/v1/compute/apps/${app}/preview`);
+      console.log(r.previewUrl ? `preview enabled: ${r.previewUrl}` : `preview requested (tunnel pending: ${r.preview.note || "reconciling"})`);
+    } else if (args.disable) {
+      await apiCall(dir, "DELETE", `/v1/compute/apps/${app}/preview`);
+      console.log("preview disabled");
+    } else {
+      // --show (default)
+      const r = await apiCall(dir, "GET", `/v1/compute/apps/${app}`);
+      const p = r.preview || {};
+      console.log(`app:     ${r.name} (${r.appId.slice(0, 12)}…)`);
+      console.log(`preview: ${p.enabled ? "enabled" : "disabled"}`);
+      if (p.url) console.log(`url:     ${p.url}`);
+      if (p.relayPort) console.log(`relay:   127.0.0.1:${p.relayPort} -> 127.0.0.1:${r.port}`);
+      if (p.note) console.log(`note:    ${p.note}`);
+    }
   } else if (sub === "logs") {
     const tail = args.tail ? Number(args.tail) : 100;
     const r = await apiCall(dir, "GET", `/v1/compute/apps/${need(args, "app")}/logs?tail=${tail}`);
@@ -507,7 +528,7 @@ async function cmdCompute(args) {
     await apiCall(dir, "DELETE", `/v1/compute/apps/${need(args, "app")}`);
     console.log("undeployed");
   } else {
-    console.error("usage: compute invoke|invocation|map|map-status|deploy|apps|logs|undeploy");
+    console.error("usage: compute invoke|invocation|map|map-status|deploy|apps|logs|undeploy|preview");
     process.exit(2);
   }
 }

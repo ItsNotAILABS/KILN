@@ -40,6 +40,10 @@ export function ensureStateDir(dir) {
           heartbeatTimeoutMs: 30000,
           tickMs: 2000,
           apiPort: 18787, // 0 = ephemeral; override with KILN_SWARM_API_PORT
+          // Public previews (Caffeine-style URLs for compute apps). Absent =
+          // previews unavailable (apps still deploy privately). See
+          // docs/KILN_PREVIEW.md for the full shape.
+          preview: null,
         },
         null,
         2

@@ -27,7 +27,7 @@
  * so invoke() does not widen the trust boundary; it just makes it ergonomic.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { appendEvent, newJobId, replay } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
@@ -53,12 +53,18 @@ function computePath(dir) {
 
 function loadStore(dir) {
   const p = computePath(dir);
-  if (!existsSync(p)) return { invocations: {}, maps: {} };
+  if (!existsSync(p)) return { invocations: {}, maps: {}, previews: {} };
   try {
     const s = JSON.parse(readFileSync(p, "utf8"));
-    return { invocations: s.invocations || {}, maps: s.maps || {} };
+    return {
+      invocations: s.invocations || {},
+      maps: s.maps || {},
+      // previews: { [appId]: {slug, relayPort, enabled, updatedAt} } —
+      // owned by lib/preview.mjs; kept here so one atomic store covers it.
+      previews: s.previews || {},
+    };
   } catch {
-    return { invocations: {}, maps: {} };
+    return { invocations: {}, maps: {}, previews: {} };
   }
 }
 
@@ -69,6 +75,9 @@ function saveStore(dir, store) {
   writeFileSync(tmp, JSON.stringify(store, null, 2) + "\n");
   renameSync(tmp, p);
 }
+
+// Exported for lib/preview.mjs (single store, no duplication).
+export { loadStore, saveStore };
 
 export function newInvocationId() {
   return "inv_" + randomBytes(6).toString("hex");
@@ -408,7 +417,14 @@ export function appLogs(dir, appId, tail = 100) {
   return { appId, log: lines.slice(-n).join("\n") };
 }
 
-/** Stop an app: never respawn, SIGTERM the worker (which kills the app child). */
+/** Stop an app: never respawn, SIGTERM the worker (which kills the app child).
+ *
+ * Micro-fix (2026-09-30): the app record (app.json) is removed too. Leaving
+ * it behind made listApps keep reporting the undeployed app as "ready" on a
+ * false-positive port probe. The node dir, workdir, and app.log are kept.
+ * Preview teardown (if any) is handled by the httpapi DELETE path before
+ * this runs.
+ */
 export function undeployApp(dir, appId) {
   appConfig(dir, appId); // 404 if unknown
   const node = loadNode(dir, appId);
@@ -418,5 +434,10 @@ export function undeployApp(dir, appId) {
   try {
     if (node.workerPid) process.kill(node.workerPid, "SIGTERM");
   } catch { /* already gone */ }
+  try {
+    unlinkSync(join(nodeDir(dir, appId), "app.json"));
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
   return { ok: true, appId };
 }
