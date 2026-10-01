@@ -20,6 +20,7 @@ import { checkGrant, GrantError } from "./grant.mjs";
 import { checkShellArgs } from "./tools.mjs";
 import { appendEvent } from "./queue.mjs";
 import { runScriptMind, runHttpMind } from "./minds.mjs";
+import { ensureCheckout } from "./nodes.mjs";
 
 const HEARTBEAT_MS = 5000;
 const POLL_MS = 2000;
@@ -77,11 +78,44 @@ async function superviseApp(dir, nodeId) {
       log("app: workdir missing — not supervising");
       return;
     }
+    // Deploy-race gate (first-deploy ticket, 2026-09-27): never boot the app
+    // command into a workdir whose clone hasn't produced a checkout yet.
+    // `git clone` exits 0 with only `.git` when the remote HEAD points at a
+    // missing branch; booting there crash-loops with MODULE_NOT_FOUND.
+    // ensureCheckout() also self-heals the unborn-HEAD case. Wait up to ~60s
+    // for an in-flight clone, then back off and retry rather than booting
+    // into a broken tree.
+    let checkoutOk = false;
+    for (let i = 0; i < 30 && !stopping; i++) {
+      const co = ensureCheckout(workdir);
+      if (co.ok) {
+        checkoutOk = true;
+        if (co.repaired) log(`app: checkout repaired (branch ${co.branch})`);
+        break;
+      }
+      if (i % 5 === 0) log("app: waiting for repo checkout to complete — not booting yet");
+      await sleep(2000);
+    }
+    if (!checkoutOk) {
+      log("app: no valid checkout after 60s — backing off, will retry");
+      await sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30000);
+      continue;
+    }
     const logFd = openSync(join(nodeDir(dir, nodeId), "app.log"), "a");
     log(`app: starting ${app.command} ${(app.args || []).join(" ")}`);
+    // Explicit environment allowlist: the app gets a minimal env plus ONLY
+    // its declared env entries. It never inherits the worker's environment
+    // (which may hold daemon secrets) — declared env overrides the defaults.
     const child = spawn(app.command, (app.args || []).map(String), {
       cwd: workdir,
-      env: { ...process.env, ...(app.env || {}) },
+      env: {
+        PATH: "/usr/bin:/bin",
+        HOME: workdir,
+        TMPDIR: "/tmp",
+        ...(app.port ? { PORT: String(app.port) } : {}),
+        ...(app.env || {}),
+      },
       stdio: ["ignore", logFd, logFd],
     });
     closeSync(logFd);

@@ -442,6 +442,9 @@ async function cmdCompute(args) {
       name: args.name,
       timeoutMs: args.timeout ? Number(args.timeout) : undefined,
       waitMs: args.wait ? Number(args.wait) : undefined,
+      memoryMB: args.memory ? Number(args.memory) : undefined,
+      network: args.network ? true : undefined,
+      retries: args.retries ? Number(args.retries) : undefined,
     };
     if (args.args) body.args = JSON.parse(String(args.args));
     const r = await apiCall(dir, "POST", "/v1/compute/invoke", body);
@@ -450,6 +453,8 @@ async function cmdCompute(args) {
       if (r.ok) console.log(JSON.stringify(r.result, null, 2));
       else console.log(`error: ${r.error}`);
       if (r.logs && r.logs.length) console.log(`logs:\n${r.logs.join("\n")}`);
+      if (r.metrics) console.log(`metrics: wall=${r.metrics.wallMs}ms cpu=${r.metrics.cpuMs}ms rss=${Math.round((r.metrics.peakRssBytes || 0) / 1048576)}MB`);
+      if (r.billing) console.log(`billing: ${r.billing.gbSeconds} GB-s (${r.billing.billedMs}ms @ ${r.billing.memoryMB}MB)`);
       process.exit(r.ok ? 0 : 1);
     }
     console.log(`${r.invocationId} ${r.status} (job ${r.jobId})`);
@@ -463,6 +468,9 @@ async function cmdCompute(args) {
       items: JSON.parse(need(args, "items")),
       name: args.name,
       timeoutMs: args.timeout ? Number(args.timeout) : undefined,
+      memoryMB: args.memory ? Number(args.memory) : undefined,
+      network: args.network ? true : undefined,
+      retries: args.retries ? Number(args.retries) : undefined,
     };
     const r = await apiCall(dir, "POST", "/v1/compute/map", body);
     console.log(`${r.mapId}  ${r.count} items`);
@@ -501,7 +509,7 @@ async function cmdCompute(args) {
   } else if (sub === "apps") {
     const r = await apiCall(dir, "GET", "/v1/compute/apps");
     if (!r.apps.length) { console.log("(no apps)"); return; }
-    for (const a of r.apps) console.log(`${a.appId.slice(0, 12)}…  ${a.status.padEnd(8)} ${a.name}  ${a.command}${a.port ? ` :${a.port}` : ""}${a.previewUrl ? `\n  preview: ${a.previewUrl}` : ""}`);
+    for (const a of r.apps) console.log(`${a.appId.slice(0, 12)}…  ${a.status.padEnd(8)} ${a.name}  ${a.command}${a.port ? ` :${a.port}` : ""}${a.ready === false ? "  (port not accepting)" : ""}${a.previewUrl ? `\n  preview: ${a.previewUrl}` : ""}`);
   } else if (sub === "preview") {
     const app = need(args, "app");
     if (args.enable) {
@@ -520,6 +528,9 @@ async function cmdCompute(args) {
       if (p.relayPort) console.log(`relay:   127.0.0.1:${p.relayPort} -> 127.0.0.1:${r.port}`);
       if (p.note) console.log(`note:    ${p.note}`);
     }
+  } else if (sub === "app-status") {
+    const r = await apiCall(dir, "GET", `/v1/compute/apps/${need(args, "app")}`);
+    console.log(JSON.stringify(r, null, 2));
   } else if (sub === "logs") {
     const tail = args.tail ? Number(args.tail) : 100;
     const r = await apiCall(dir, "GET", `/v1/compute/apps/${need(args, "app")}/logs?tail=${tail}`);
@@ -527,8 +538,11 @@ async function cmdCompute(args) {
   } else if (sub === "undeploy") {
     await apiCall(dir, "DELETE", `/v1/compute/apps/${need(args, "app")}`);
     console.log("undeployed");
+  } else if (sub === "capacity") {
+    const r = await apiCall(dir, "GET", "/v1/compute/capacity");
+    console.log(JSON.stringify(r, null, 2));
   } else {
-    console.error("usage: compute invoke|invocation|map|map-status|deploy|apps|logs|undeploy|preview");
+    console.error("usage: compute invoke|invocation|map|map-status|deploy|apps|app-status|logs|undeploy|capacity|preview");
     process.exit(2);
   }
 }

@@ -25,6 +25,7 @@ import { appendEvent, pendingJobs } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
 import { nowSec } from "./grant.mjs";
 import { startApiServer } from "./httpapi.mjs";
+import { settleComputeJobs } from "./compute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, "worker.mjs");
@@ -174,6 +175,10 @@ function tick(dir, cfg) {
   try {
     reapExited(dir);
     reconcile(dir, cfg);
+    // Compute settlement: release admission slots at actual job completion,
+    // exactly once per attempt — never on poll. Guarded: a compute-store
+    // problem must never break the job-dispatch tick.
+    try { settleComputeJobs(dir); } catch (e) { log("compute settle error:", e.message); }
 
     const pending = pendingJobs(dir);
     if (!pending.length) return;

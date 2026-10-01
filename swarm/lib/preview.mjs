@@ -28,6 +28,12 @@
  * orphans (pidIsDaemon-style check) and reap the orphans.
  *
  * Stdlib only. Never logs the relay admin token.
+ *
+ * tailnet mode (additive, 2026-09-30): a second transport where the relay
+ * runs on the architect's own laptop (relay-py/server.py) instead of a VPS.
+ * The VM dials out to the laptop over the tailnet through a CONNECT proxy
+ * and multiplexes public connections over one framed TCP stream. The
+ * ssh/direct bundle paths below are untouched.
  */
 import { spawn } from "node:child_process";
 import { existsSync, statSync, readdirSync, readFileSync } from "node:fs";
@@ -101,9 +107,10 @@ export function previewConfig(cfg) {
   const p = cfg && cfg.preview;
   if (!p || typeof p !== "object") return null;
   const mode = p.mode || "ssh";
-  if (mode !== "ssh" && mode !== "direct") {
-    throw new ComputeError(400, `preview.mode must be "ssh" or "direct", got ${JSON.stringify(p.mode)}`);
+  if (mode !== "ssh" && mode !== "direct" && mode !== "tailnet") {
+    throw new ComputeError(400, `preview.mode must be "ssh", "direct" or "tailnet", got ${JSON.stringify(p.mode)}`);
   }
+  if (mode === "tailnet") return tailnetPreviewConfig(p);
   const domain = String(p.domain || "").trim().toLowerCase();
   if (!/^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$/.test(domain)) {
     throw new ComputeError(400, "preview.domain is required (e.g. \"preview.example.com\")");
@@ -315,7 +322,9 @@ export async function reconcilePreviews(dir, cfg, log = null) {
       let appPort = null;
       try { appPort = appConfig(dir, appId).port || null; } catch { appPort = null; }
       if (!appPort) {
-        try { await relayCall(pc, "DELETE", `/register/${rec.slug}`); } catch (e) { say(`preview: unregister ${rec.slug} failed: ${e.message}`); }
+        if (pc.mode !== "tailnet") {
+          try { await relayCall(pc, "DELETE", `/register/${rec.slug}`); } catch (e) { say(`preview: unregister ${rec.slug} failed: ${e.message}`); }
+        }
         delete store.previews[appId];
         dirty = true;
         say(`preview: dropped stale record for ${appId} (app gone or portless)`);
@@ -327,7 +336,7 @@ export async function reconcilePreviews(dir, cfg, log = null) {
     for (const [appId, rec] of Object.entries(store.previews)) {
       if (!rec.enabled) continue;
       const appPort = appConfig(dir, appId).port;
-      if (!rec.relayPort) {
+      if (!rec.relayPort && pc.mode !== "tailnet") {
         // eslint-disable-next-line no-await-in-loop
         rec.relayPort = await allocPort(store, pc.portRange);
         rec.updatedAt = new Date().toISOString();
@@ -335,7 +344,11 @@ export async function reconcilePreviews(dir, cfg, log = null) {
       }
       desired.push({ appId, slug: rec.slug, relayPort: rec.relayPort, appPort });
     }
-    desired.sort((a, b) => a.relayPort - b.relayPort);
+    desired.sort((a, b) => (a.relayPort || 0) - (b.relayPort || 0));
+    if (pc.mode === "tailnet") {
+      await reconcileTailnetTunnels(pc, desired, say);
+      return;
+    }
     const signature = JSON.stringify({
       mode: pc.mode,
       target: pc.mode === "ssh" ? `${pc.ssh.user}@${pc.ssh.host}:${pc.ssh.port}` : "direct",
@@ -410,8 +423,14 @@ export async function reconcilePreviews(dir, cfg, log = null) {
 function viewFor(store, pc, appId) {
   const rec = (store.previews || {})[appId];
   if (!rec) return { enabled: false, url: null, relayPort: null, wanted: false };
-  const effective = !!(rec.enabled && pc && bundleAlive() && bundle.apps && bundle.apps.includes(appId));
-  const url = effective ? `https://${rec.slug}.${pc.domain}` : null;
+  let effective, url;
+  if (pc && pc.mode === "tailnet") {
+    effective = !!(rec.enabled && tailnetTunnelUp(appId));
+    url = effective ? tailnetUrlFor(pc, rec.slug) : null;
+  } else {
+    effective = !!(rec.enabled && pc && bundleAlive() && bundle.apps && bundle.apps.includes(appId));
+    url = effective ? `https://${rec.slug}.${pc.domain}` : null;
+  }
   const v = { enabled: effective, url, relayPort: rec.relayPort || null, wanted: !!rec.enabled };
   if (rec.enabled && !pc) v.note = "preview relay not configured";
   else if (rec.enabled && !effective) v.note = "tunnel down — reconciler retrying";
@@ -438,7 +457,7 @@ export async function enablePreview(dir, cfg, appId, log = null) {
   const rec = store.previews[appId] || {};
   if (!rec.slug) rec.slug = allocSlug(store, app.name);
   if (!SLUG_RE.test(rec.slug)) rec.slug = allocSlug(store, app.name);
-  if (!rec.relayPort) rec.relayPort = await allocPort(store, pc.portRange);
+  if (!rec.relayPort && pc.mode !== "tailnet") rec.relayPort = await allocPort(store, pc.portRange);
   rec.enabled = true;
   rec.updatedAt = new Date().toISOString();
   store.previews[appId] = rec;
@@ -501,6 +520,7 @@ export function startPreviewReconciler(dir, cfg, log) {
     stop() {
       clearInterval(timer);
       if (bundle) { try { process.kill(bundle.pid, "SIGTERM"); } catch {} bundle = null; }
+      stopAllTailnetTunnels();
     },
   };
 }
@@ -509,3 +529,400 @@ export function startPreviewReconciler(dir, cfg, log) {
 export function _bundleState() {
   return bundle ? { pid: bundle.pid, apps: bundle.apps, signature: bundle.signature, alive: bundleAlive() } : null;
 }
+
+// ---------------------------------------------------------------- tailnet transport (additive)
+//
+// Second preview transport: the relay runs on the architect's own laptop
+// (relay-py/server.py, stdlib asyncio) instead of a VPS. This VM has no
+// inbound path, so the VM dials OUT to the laptop over the tailnet through
+// the runtime CONNECT proxy, then multiplexes public connections over one
+// framed TCP stream per app.
+//
+// Wire protocol (length-prefixed frames: u32 BE length, u8 type, payload;
+// length = 1 + len(payload)) — must match relay-py/server.py exactly:
+//   0x01 REGISTER      JSON {"token","slug"}            (VM -> relay)
+//   0x02 REGISTERED    JSON {"ok":true}|{"ok":false,...}
+//   0x10 STREAM_OPEN   u32 BE streamId                  (relay -> VM)
+//   0x11 STREAM_DATA   u32 BE streamId + bytes          (both ways)
+//   0x12 STREAM_CLOSE  u32 BE streamId                  (both ways)
+//   0x03 PING / 0x04 PONG keepalive (both ways, 25s interval, 90s drop)
+
+export const TAILNET_F = {
+  REGISTER: 0x01, REGISTERED: 0x02, PING: 0x03, PONG: 0x04,
+  STREAM_OPEN: 0x10, STREAM_DATA: 0x11, STREAM_CLOSE: 0x12,
+};
+
+export function encodeTailnetFrame(type, payload) {
+  const p = payload ? Buffer.from(payload) : Buffer.alloc(0);
+  const hdr = Buffer.alloc(5);
+  hdr.writeUInt32BE(p.length + 1, 0);
+  hdr.writeUInt8(type & 0xff, 4);
+  return Buffer.concat([hdr, p]);
+}
+
+export function createTailnetDecoder() {
+  let buf = Buffer.alloc(0);
+  return {
+    push(chunk) {
+      buf = Buffer.concat([buf, Buffer.from(chunk)]);
+      const out = [];
+      while (buf.length >= 5) {
+        const len = buf.readUInt32BE(0);
+        if (len < 1 || len > 16 * 1024 * 1024) throw new Error(`bad frame length ${len}`);
+        if (buf.length < 4 + len) break;
+        out.push([buf.readUInt8(4), buf.slice(5, 4 + len)]);
+        buf = buf.slice(4 + len);
+      }
+      return out;
+    },
+  };
+}
+
+function tailnetU32(n) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(n >>> 0, 0);
+  return b;
+}
+
+/** Normalized tailnet preview config (called from previewConfig above). */
+function tailnetPreviewConfig(p) {
+  const relayHost = String(p.relayHost || "").trim();
+  if (!relayHost) throw new ComputeError(400, 'preview.relayHost is required in tailnet mode (laptop tailnet IP)');
+  const relayPort = Number(p.relayPort || 8900);
+  if (!Number.isInteger(relayPort) || relayPort < 1 || relayPort > 65535) {
+    throw new ComputeError(400, "preview.relayPort out of bounds (1-65535)");
+  }
+  const token = String(p.token || "");
+  if (!token) throw new ComputeError(400, "preview.token is required in tailnet mode");
+  let publicBase;
+  try {
+    const u = new URL(String(p.publicBase || ""));
+    if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("must be http(s)");
+    publicBase = u.toString().replace(/\/+$/, "");
+  } catch (e) {
+    throw new ComputeError(400, `preview.publicBase invalid: ${e.message || e}`);
+  }
+  return { mode: "tailnet", relayHost, relayPort, relayAdminToken: token, publicBase,
+    subdomains: p.subdomains !== false };
+}
+
+/** Public URL for a slug: subdomain style, or /apps/<slug>/ when the base
+ *  host can't do subdomains (IP literal, localhost, or subdomains:false —
+ *  e.g. a cloudflared quick-tunnel URL). */
+export function tailnetUrlFor(pc, slug) {
+  const u = new URL(pc.publicBase);
+  const host = u.hostname;
+  const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":");
+  if (!pc.subdomains || host === "localhost" || isIp) return `${pc.publicBase}/apps/${slug}/`;
+  return `${u.protocol}//${slug}.${host}${u.port ? `:${u.port}` : ""}`;
+}
+
+/**
+ * CONNECT proxy target. Prefers KILN_TUNNEL_PROXY (test override), else
+ * $HTTPS_PROXY with the trailing :3128 replaced by :3130 (runtime Tailscale
+ * proxy). Returns null when no proxy is configured (direct TCP, loopback
+ * tests). Never includes the credential in the returned object beyond the
+ * ready-to-send header value.
+ */
+export function tailnetProxyTarget() {
+  let raw = (process.env.KILN_TUNNEL_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || "").trim();
+  if (!raw) return null;
+  let u;
+  try {
+    u = new URL(raw.includes("://") ? raw : `http://${raw}`);
+  } catch {
+    return null;
+  }
+  let port = u.port ? Number(u.port) : 3128;
+  if (port === 3128) port = 3130;
+  let auth = null;
+  if (u.username) {
+    auth = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password || "")}`).toString("base64");
+  }
+  return { host: u.hostname, port, auth };
+}
+
+function tcpConnect(host, port, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection({ host, port });
+    const timer = setTimeout(() => { try { sock.destroy(); } catch {} reject(new Error(`tcp connect timeout ${host}:${port}`)); }, timeoutMs);
+    sock.once("connect", () => { clearTimeout(timer); resolve(sock); });
+    sock.once("error", (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
+/** CONNECT through the proxy; resolves with any bytes that arrived after
+ *  the proxy's response headers (they belong to the framed stream). */
+function proxyConnect(sock, relayHost, relayPort, auth, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    const timer = setTimeout(() => { cleanup(); reject(new Error("proxy CONNECT timeout")); }, timeoutMs);
+    const cleanup = () => { clearTimeout(timer); sock.off("data", onData); sock.off("error", onErr); sock.off("close", onClose); };
+    const onData = (c) => {
+      buf = Buffer.concat([buf, c]);
+      const i = buf.indexOf("\r\n\r\n");
+      if (i >= 0) {
+        const status = buf.slice(0, i).toString("latin1").split("\r\n")[0];
+        const rest = buf.slice(i + 4);
+        cleanup();
+        if (/^HTTP\/\d(\.\d)?\s+200\b/.test(status)) resolve(rest);
+        else reject(new Error(`proxy CONNECT failed: ${status}`));
+      } else if (buf.length > 8192) {
+        cleanup();
+        reject(new Error("proxy CONNECT response too large"));
+      }
+    };
+    const onErr = (e) => { cleanup(); reject(e); };
+    const onClose = () => { cleanup(); reject(new Error("proxy closed during CONNECT")); };
+    sock.on("data", onData);
+    sock.on("error", onErr);
+    sock.on("close", onClose);
+    let req = `CONNECT ${relayHost}:${relayPort} HTTP/1.1\r\nHost: ${relayHost}:${relayPort}\r\n`;
+    if (auth) req += `Proxy-Authorization: Basic ${auth}\r\n`;
+    req += "\r\n";
+    sock.write(req);
+  });
+}
+
+const tailnetTunnels = new Map(); // appId -> session
+
+function tailnetSend(session, type, payload) {
+  try {
+    if (session.sock && !session.sock.destroyed) {
+      session.sock.write(encodeTailnetFrame(type, payload));
+    }
+  } catch { /* drop on next watchdog pass */ }
+}
+
+function tailnetCloseAppSock(session, streamId) {
+  const s = session.appSocks.get(streamId);
+  if (s) {
+    session.appSocks.delete(streamId);
+    tailnetSend(session, TAILNET_F.STREAM_CLOSE, tailnetU32(streamId));
+    try { s.destroy(); } catch {}
+  }
+}
+
+function tailnetDialApp(session, streamId) {
+  const appSock = createConnection({ host: "127.0.0.1", port: session.appPort });
+  session.appSocks.set(streamId, appSock);
+  appSock.on("data", (chunk) => {
+    tailnetSend(session, TAILNET_F.STREAM_DATA, Buffer.concat([tailnetU32(streamId), chunk]));
+  });
+  const done = () => tailnetCloseAppSock(session, streamId);
+  appSock.on("error", done);
+  appSock.on("close", done);
+}
+
+function tailnetDispatch(session, type, payload) {
+  if (type === TAILNET_F.PING) {
+    tailnetSend(session, TAILNET_F.PONG);
+  } else if (type === TAILNET_F.PONG) {
+    session.lastPong = Date.now();
+  } else if (type === TAILNET_F.STREAM_OPEN) {
+    if (payload.length >= 4) tailnetDialApp(session, payload.readUInt32BE(0));
+  } else if (type === TAILNET_F.STREAM_DATA) {
+    if (payload.length >= 4) {
+      const sid = payload.readUInt32BE(0);
+      const s = session.appSocks.get(sid);
+      if (s && !s.destroyed) {
+        try { s.write(payload.slice(4)); } catch { tailnetCloseAppSock(session, sid); }
+      }
+    }
+  } else if (type === TAILNET_F.STREAM_CLOSE) {
+    if (payload.length >= 4) {
+      const s = session.appSocks.get(payload.readUInt32BE(0));
+      if (s) { try { s.destroy(); } catch {} }
+    }
+  }
+  // unknown types ignored
+}
+
+function tailnetStartKeepalive(session) {
+  tailnetStopKeepalive(session);
+  session.pingTimer = setInterval(() => {
+    tailnetSend(session, TAILNET_F.PING);
+  }, 25000);
+  session.watchTimer = setInterval(() => {
+    if (Date.now() - session.lastPong > 90000) {
+      session.say(`tailnet ${session.slug}: silent >90s, dropping`);
+      try { session.sock.destroy(); } catch {}
+    }
+  }, 10000);
+  if (session.pingTimer.unref) session.pingTimer.unref();
+  if (session.watchTimer.unref) session.watchTimer.unref();
+}
+
+function tailnetStopKeepalive(session) {
+  if (session.pingTimer) { clearInterval(session.pingTimer); session.pingTimer = null; }
+  if (session.watchTimer) { clearInterval(session.watchTimer); session.watchTimer = null; }
+}
+
+/** One connected attempt: handshake, then hold until the socket drops. */
+async function tailnetConnectOnce(session) {
+  const pc = session.pc;
+  const proxy = tailnetProxyTarget();
+  const sock = proxy
+    ? await tcpConnect(proxy.host, proxy.port)
+    : await tcpConnect(pc.relayHost, pc.relayPort);
+  session.sock = sock;
+  session.appSocks = new Map();
+  const decoder = createTailnetDecoder();
+  let onRegistered = null;
+  const registeredP = new Promise((resolve, reject) => { onRegistered = { resolve, reject }; });
+  const regTimer = setTimeout(() => {
+    if (onRegistered) { onRegistered.reject(new Error("REGISTERED timeout")); onRegistered = null; }
+  }, 10000);
+  if (regTimer.unref) regTimer.unref();
+
+  const closedP = new Promise((resolve) => {
+    sock.once("close", () => resolve());
+    sock.once("error", () => { /* close follows */ });
+  });
+  // NOTE: the session's frame listener is attached only AFTER the proxy
+  // handshake — proxyConnect owns the socket's "data" events until the
+  // CONNECT response is consumed. Attaching earlier would feed the
+  // "HTTP/1.1 200 ..." bytes into the frame decoder and kill the socket.
+  const onData = (chunk) => {
+    let frames;
+    try {
+      frames = decoder.push(chunk);
+    } catch (e) {
+      session.say(`tailnet ${session.slug}: frame error: ${e.message}`);
+      try { sock.destroy(); } catch {}
+      return;
+    }
+    for (const [type, payload] of frames) {
+      if (type === TAILNET_F.REGISTERED && onRegistered) {
+        const cb = onRegistered;
+        onRegistered = null;
+        clearTimeout(regTimer);
+        let r = null;
+        try { r = JSON.parse(payload.toString("utf8")); } catch (e) { cb.reject(e); continue; }
+        if (r && r.ok) cb.resolve(true);
+        else { session.authFailed = true; cb.reject(new Error(`register rejected: ${(r && r.error) || "unknown"}`)); }
+        continue;
+      }
+      try { tailnetDispatch(session, type, payload); }
+      catch (e) { session.say(`tailnet ${session.slug}: dispatch error: ${e.message}`); }
+    }
+  };
+
+  try {
+    if (proxy) {
+      const leftover = await proxyConnect(sock, pc.relayHost, pc.relayPort, proxy.auth);
+      sock.on("data", onData);
+      if (leftover.length) onData(leftover);
+    } else {
+      sock.on("data", onData);
+    }
+    tailnetSend(session, TAILNET_F.REGISTER, Buffer.from(JSON.stringify({ token: pc.relayAdminToken, slug: session.slug })));
+    await registeredP;
+    session.state = "open";
+    session.lastPong = Date.now();
+    tailnetStartKeepalive(session);
+    session.say(`tailnet ${session.slug}: tunnel open (${proxy ? `via proxy ${proxy.host}:${proxy.port}` : "direct"})`);
+    await closedP;
+  } finally {
+    tailnetStopKeepalive(session);
+    for (const s of session.appSocks.values()) { try { s.destroy(); } catch {} }
+    session.appSocks.clear();
+    try { sock.destroy(); } catch {}
+    session.sock = null;
+    if (session.state === "open") session.state = "reconnecting";
+  }
+}
+
+/** Supervised session with backoff: 1s, 2s, 4s, ... max 30s. */
+async function tailnetRunSession(session) {
+  let delay = 1000;
+  while (!session.stopped) {
+    try {
+      await tailnetConnectOnce(session);
+      delay = 1000; // fresh backoff after a lived session
+      if (!session.stopped && !session.authFailed) {
+        session.say(`tailnet ${session.slug}: connection dropped — reconnecting`);
+      }
+    } catch (e) {
+      if (!session.stopped) session.say(`tailnet ${session.slug}: ${e.message} — retry in ${Math.round(delay / 1000)}s`);
+    }
+    if (session.stopped || session.authFailed) return;
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(30000, delay * 2);
+  }
+}
+
+function startTailnetSession(pc, appId, slug, appPort, say) {
+  const session = {
+    pc, appId, slug, appPort,
+    say: say || (() => {}),
+    state: "connecting",
+    stopped: false,
+    authFailed: false,
+    sock: null,
+    appSocks: new Map(),
+    pingTimer: null,
+    watchTimer: null,
+    lastPong: Date.now(),
+    stop() {
+      this.stopped = true;
+      tailnetStopKeepalive(this);
+      for (const s of this.appSocks.values()) { try { s.destroy(); } catch {} }
+      this.appSocks.clear();
+      try { this.sock.destroy(); } catch {}
+      this.sock = null;
+      this.state = "closed";
+    },
+  };
+  tailnetTunnels.set(appId, session);
+  tailnetRunSession(session).catch((e) => session.say(`tailnet ${slug}: session crashed: ${e.message}`));
+  return session;
+}
+
+/** Reconcile per-app tailnet sessions with desired state (tailnet only). */
+async function reconcileTailnetTunnels(pc, desired, say) {
+  const want = new Map(desired.map((d) => [d.appId, d]));
+  for (const d of desired) {
+    const s = tailnetTunnels.get(d.appId);
+    if (!s || s.stopped || s.authFailed || s.slug !== d.slug || s.appPort !== d.appPort) {
+      if (s) { try { s.stop(); } catch {} }
+      startTailnetSession(pc, d.appId, d.slug, d.appPort, say);
+      say(`preview: tailnet tunnel starting for ${d.slug}`);
+    }
+  }
+  for (const appId of [...tailnetTunnels.keys()]) {
+    if (!want.has(appId)) {
+      const s = tailnetTunnels.get(appId);
+      try { s.stop(); } catch {}
+      tailnetTunnels.delete(appId);
+      say(`preview: tailnet tunnel stopped for ${appId}`);
+    }
+  }
+}
+
+function stopAllTailnetTunnels() {
+  for (const s of tailnetTunnels.values()) { try { s.stop(); } catch {} }
+  tailnetTunnels.clear();
+}
+
+function tailnetTunnelUp(appId) {
+  const s = tailnetTunnels.get(appId);
+  return !!(s && !s.stopped && !s.authFailed && s.state === "open");
+}
+
+/** Test hook: tailnet session states (no secrets). */
+export function _tailnetState() {
+  const out = {};
+  for (const [appId, s] of tailnetTunnels) {
+    out[appId] = { slug: s.slug, state: s.state, stopped: s.stopped, authFailed: s.authFailed };
+  }
+  return out;
+}
+
+/** Test hook: drive the real session code without the daemon. */
+export const _tailnetTest = {
+  startSession: startTailnetSession,
+  stopAll: stopAllTailnetTunnels,
+  proxyTarget: tailnetProxyTarget,
+  urlFor: tailnetUrlFor,
+};

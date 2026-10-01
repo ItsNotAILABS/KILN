@@ -2,7 +2,9 @@
 
 KILN is a supercomputer you call like serverless. Three primitives, all over
 the local HTTP API (Bearer `<api.token>`, 127.0.0.1 only), all executed for
-real by swarm workers with signed receipts:
+real by swarm workers with signed receipts. The runtime underneath — the
+sandbox, the scheduler math, metering — is documented in
+`docs/KILN_COMPUTE_RUNTIME.md`.
 
 ## 1. `invoke` — run a function, get the result
 
@@ -13,26 +15,46 @@ real by swarm workers with signed receipts:
   "code": "export async function main(args) { return args.x * 2; }",
   "args": { "x": 21 },
   "timeoutMs": 30000,
+  "memoryMB": 256,
+  "network": false,
+  "retries": 0,
   "name": "double-it",
   "waitMs": 60000
 }
 ```
 
-`code` is a JS module that **must export `main(args)`**. It runs jailed in a
-worker's work dir (the same jail as `shell.exec`: no shell, argv only,
-timeout), `console.log` is captured, and the return value is JSON-serialized
-back. Without `waitMs` you get `201 {invocationId, jobId, status:"pending"}`;
-with `waitMs` (1000..300000) the call blocks until done and returns the full
-result:
+`code` is a JS module that **must export `main(args)`**. It runs inside the
+KILN Linux sandbox on a worker: fresh mount/pid/uts/ipc namespaces, `/home`
+and `/root` hidden, minimal environment (no host secrets), network denied
+unless `network:true`, JS heap capped at `memoryMB` (64..2048, default 256),
+wall-clock timeout with SIGTERM-then-SIGKILL teeth. `console.log` is
+captured, and the return value is JSON-serialized back. Without `waitMs` you
+get `201 {invocationId, jobId, status:"pending"}`; with `waitMs`
+(1000..300000) the call blocks until done and returns the full result:
 
 ```json
 { "invocationId": "inv_…", "status": "done", "ok": true,
-  "result": 42, "logs": ["…"], "durationMs": 2311 }
+  "result": 42, "logs": ["…"], "durationMs": 2311,
+  "metrics": { "wallMs": 65, "cpuMs": 41, "peakRssBytes": 47185920,
+               "timedOut": false, "rssKilled": false, "forkBomb": false },
+  "billing": { "billedMs": 65, "memoryMB": 256, "gbSeconds": 0.01625 } }
 ```
 
-Failures are honest: `ok:false` with the function's real error, or
-`status:"failed"` with the job error. `GET /v1/compute/invocations/:id`
-polls any invocation later.
+Billing is metered in GB-seconds (`s × GB`), the serverless unit — no prices
+attached, KILN meters usage and policy prices it.
+
+Failures are honest: `ok:false` with the function's real error (or the
+sandbox's policy error — timeout, memory, fork-bomb), or `status:"failed"`
+with the job error. `retries` (0–2) retries **sandbox-infra failures only**,
+never function errors. `GET /v1/compute/invocations/:id` polls any invocation
+later (pure read — scheduler accounting settles in the daemon tick at actual
+completion, never on poll). `GET /v1/compute/capacity` shows arrival rate
+(EWMA), p50/p95 service time, and the Little's-law concurrency target with
+hysteresis. Admission is atomic per request: a map takes all N of its slots
+or gets a 429 with none taken.
+
+Admission is bounded (`KILN_COMPUTE_MAX_CONCURRENT`, default 8): over the
+line you get `429` with a `Retry-After` header, not a silent queue.
 
 Limits: code ≤ 256KB, `timeoutMs` 100..300000, args must be JSON-serializable,
 results > 1MB are not returned (you get `truncated:true` instead).
@@ -77,13 +99,21 @@ crash with backoff, and streams logs to `app.log`. It survives daemon
 restarts and VM recycles through the normal watchdog path: the daemon
 respawns the worker, the worker re-reads `app.json` and boots the app again.
 
-- `GET /v1/compute/apps` — list
+- `GET /v1/compute/apps` — list (with TCP readiness per app)
+- `GET /v1/compute/apps/:id` — one app: worker liveness + port readiness probe
 - `GET /v1/compute/apps/:id/logs?tail=100` — logs
 - `DELETE /v1/compute/apps/:id` — stop for good (worker SIGTERMed, never respawned)
+
+`status` reflects application readiness, not just process liveness: `ready`
+means the declared port is actually accepting TCP connections; `starting`
+means the worker is alive but the port isn't up yet.
 
 The app command runs with the same jail philosophy as `shell.exec`: no
 shell binaries, no metacharacters. `env` is validated (`[A-Za-z_][A-Za-z0-9_]*`,
 ≤ 32 entries); `app.json` is written `0600` because env can carry secrets.
+The app's environment is an explicit allowlist (`PATH`, `HOME`, `TMPDIR`,
+`PORT` if declared, plus your `env` entries) — it never inherits the
+worker's environment, so daemon secrets can't leak into a deployed app.
 
 ## From another repo
 

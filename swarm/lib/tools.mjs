@@ -5,7 +5,7 @@
  */
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
-import { join, resolve, sep, basename } from "node:path";
+import { join, resolve, sep, basename, dirname } from "node:path";
 import {
   CAP_COMMIT, CAP_RELEASE, CAP_PROPOSE, CAP_DELEGATE, checkGrant, delegateGrant, nowSec, GrantError,
 } from "./grant.mjs";
@@ -13,6 +13,7 @@ import { appendReceipt } from "./receipts.mjs";
 import { appendEvent, newJobId } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
 import { loadApiToken } from "./state.mjs";
+import { runSandboxed } from "./sandbox.mjs";
 
 export class ToolError extends Error {
   constructor(message) {
@@ -59,11 +60,93 @@ export function checkShellArgs(command, args) {
 const MAX_OUTPUT = 64 * 1024;
 
 /** Shared jailed execution for shell.exec and project.release. */
-async function execJailed(workdir, command, cmdArgs, timeoutMs) {
+async function execJailed(workdir, command, cmdArgs, timeoutMs, sandbox) {
   const kind = checkShellArgs(command, cmdArgs);
   let bin = command;
   if (kind === "path-command") bin = jailPath(workdir, command);
+  if (sandbox) return await execSandboxed(workdir, bin, cmdArgs.map(String), timeoutMs, sandbox);
   return await runCmd(bin, cmdArgs.map(String), { cwd: workdir, timeoutMs });
+}
+
+/**
+ * Run a command inside the KILN Linux sandbox (namespaces + heap cap +
+ * RSS supervisor + wall-clock timeout with SIGKILL teeth). The sandbox
+ * always execs a runner file inside the workdir; the outcome is recorded
+ * to sandbox.metricsFile (relative to workdir) for the compute layer.
+ */
+async function execSandboxed(workdir, bin, cmdArgs, timeoutMs, sandbox) {
+  const metricsFile = typeof sandbox.metricsFile === "string" && sandbox.metricsFile
+    ? sandbox.metricsFile
+    : null;
+  let r;
+  try {
+    r = await runSandboxed({
+      workdir,
+      command: bin,
+      args: cmdArgs,
+      timeoutMs,
+      memoryMB: sandbox.memoryMB,
+      network: sandbox.network,
+    });
+  } catch (e) {
+    // Programmer error (bad options): fail the step loudly.
+    return { ok: false, error: `sandbox: ${e.message}` };
+  }
+  if (metricsFile) {
+    try {
+      const p = jailPath(workdir, metricsFile);
+      writeFileSync(p, JSON.stringify({
+        wallMs: r.wallMs,
+        code: r.code,
+        signal: r.signal,
+        timedOut: r.timedOut,
+        rssKilled: r.rssKilled,
+        forkBomb: r.forkBomb,
+        heapOom: r.heapOom,
+        sandbox: { memoryMB: sandbox.memoryMB ?? 256, network: !!sandbox.network },
+      }) + "\n");
+    } catch (e) {
+      return { ok: false, error: `sandbox: cannot write metrics file: ${e.message}` };
+    }
+  }
+  if (r.ok) {
+    return {
+      ok: true,
+      out: r.out,
+      error: null,
+      code: r.code,
+      sandbox: { wallMs: r.wallMs, timedOut: false },
+    };
+  }
+  // The sandbox enforced a policy (timeout / memory / fork-bomb): the
+  // sandbox itself worked, the FUNCTION was killed. That is a completed
+  // invocation with a policy error — not an infrastructure failure.
+  // Synthesize result.json so the invocation reads done/ok:false with the
+  // real reason, and report the step successful.
+  if (r.timedOut || r.rssKilled || r.forkBomb || r.heapOom) {
+    if (metricsFile) {
+      try {
+        const rp = join(dirname(jailPath(workdir, metricsFile)), "result.json");
+        writeFileSync(rp, JSON.stringify({ ok: false, error: r.error, logs: [] }));
+      } catch { /* getInvocation reports the missing result instead */ }
+    }
+    return {
+      ok: true,
+      out: r.out,
+      error: null,
+      code: r.code,
+      signal: r.signal,
+      sandbox: { wallMs: r.wallMs, timedOut: r.timedOut, rssKilled: r.rssKilled, forkBomb: r.forkBomb, heapOom: r.heapOom },
+    };
+  }
+  return {
+    ok: false,
+    out: r.out,
+    error: r.error,
+    code: r.code,
+    signal: r.signal,
+    sandbox: { wallMs: r.wallMs, timedOut: r.timedOut, rssKilled: r.rssKilled, forkBomb: r.forkBomb, heapOom: r.heapOom },
+  };
 }
 
 function execArgs(workdir, args, what, defaultTimeoutMs) {
@@ -73,19 +156,45 @@ function execArgs(workdir, args, what, defaultTimeoutMs) {
   if (!(timeoutMs >= 100 && timeoutMs <= 300000)) {
     throw new ToolError(`${what}: timeoutMs out of range 100..300000`);
   }
-  return execJailed(workdir, command, cmdArgs, timeoutMs);
+  let sandbox = null;
+  if (args.sandbox !== undefined) {
+    if (!args.sandbox || typeof args.sandbox !== "object" || Array.isArray(args.sandbox)) {
+      throw new ToolError(`${what}: sandbox must be an object {memoryMB?, network?, metricsFile?}`);
+    }
+    sandbox = {
+      memoryMB: args.sandbox.memoryMB,
+      network: args.sandbox.network,
+      metricsFile: args.sandbox.metricsFile,
+    };
+  }
+  return execJailed(workdir, command, cmdArgs, timeoutMs, sandbox);
 }
 
-function runCmd(command, args, { cwd, timeoutMs, env }) {
+export function runCmd(command, args, { cwd, timeoutMs, env }) {
   return new Promise((resolveOut) => {
     let stdout = "", stderr = "", truncated = false, done = false;
+    let timedOut = false, killEscalated = false;
     let child;
     try {
-      child = spawn(command, args, { cwd, timeout: timeoutMs, shell: false, env: env || process.env });
+      // Manual timeout (not spawn's `timeout` option): SIGTERM at the
+      // deadline, SIGKILL 5s later. A process that traps SIGTERM cannot
+      // run forever — the timeout has teeth.
+      child = spawn(command, args, { cwd, timeoutMs: undefined, shell: false, env: env || process.env });
     } catch (e) {
       resolveOut({ ok: false, error: `spawn failed: ${e.message}` });
       return;
     }
+    const finish = (r) => { if (!done) { done = true; resolveOut(r); } };
+    const termTimer = setTimeout(() => {
+      if (done) return;
+      timedOut = true;
+      try { child.kill("SIGTERM"); } catch { /* gone */ }
+    }, timeoutMs);
+    const killTimer = setTimeout(() => {
+      if (done) return;
+      timedOut = true; killEscalated = true;
+      try { child.kill("SIGKILL"); } catch { /* gone */ }
+    }, timeoutMs + 5000);
     const onData = (acc) => (chunk) => {
       if (acc.len + chunk.length > MAX_OUTPUT) { truncated = true; return; }
       acc.buf += chunk.toString("utf8"); acc.len += chunk.length;
@@ -94,14 +203,21 @@ function runCmd(command, args, { cwd, timeoutMs, env }) {
     child.stdout.on("data", onData(out));
     child.stderr.on("data", onData(err));
     child.on("error", (e) => {
-      if (!done) { done = true; resolveOut({ ok: false, error: `exec error: ${e.message}` }); }
+      clearTimeout(termTimer); clearTimeout(killTimer);
+      finish({ ok: false, error: `exec error: ${e.message}` });
     });
     child.on("close", (code, signal) => {
-      if (done) return;
-      done = true;
-      const timedOut = signal === "SIGTERM" && child.killed;
-      if (timedOut) return resolveOut({ ok: false, error: `timeout after ${timeoutMs}ms` });
-      resolveOut({
+      clearTimeout(termTimer); clearTimeout(killTimer);
+      // NOTE: do NOT set done=true here — finish() owns the once-guard.
+      // (A prior refactor set done before calling finish, which made every
+      // close-path finish() a no-op and left the promise pending forever.)
+      if (timedOut) {
+        return finish({ ok: false, timedOut: true,
+          error: killEscalated && signal === "SIGKILL"
+            ? `timeout after ${timeoutMs}ms (ignored SIGTERM, SIGKILLed)`
+            : `timeout after ${timeoutMs}ms` });
+      }
+      finish({
         ok: code === 0,
         out: out.buf + (truncated ? `\n[truncated at ${MAX_OUTPUT} bytes]` : ""),
         error: code === 0 ? null : `exit ${code}${signal ? ` signal ${signal}` : ""}: ${err.buf.slice(0, 2000)}`,
@@ -117,7 +233,7 @@ export const TOOL_DEFS = [
   { name: "fs.read", caps: 0, desc: "Read a file inside the work dir", args: { path: "string" } },
   { name: "fs.write", caps: 0, desc: "Write a file inside the work dir (creates parents)", args: { path: "string", content: "string" } },
   { name: "fs.list", caps: 0, desc: "List a directory inside the work dir", args: { path: "string?" } },
-  { name: "shell.exec", caps: 0, desc: "Run a binary with argv, no shell, jailed cwd, timeout", args: { command: "string", args: "string[]?", timeoutMs: "number?" } },
+  { name: "shell.exec", caps: 0, desc: "Run a binary with argv, no shell, jailed cwd, timeout. Optional sandbox: {memoryMB (64..2048, default 256), network (default false), metricsFile} runs a node runner inside Linux namespaces (fresh mount/pid/uts/ipc; net only if network:true), hides /home /root (/etc when offline), caps the JS heap, SIGKILLs past 2x RSS, timeout with SIGTERM-then-SIGKILL teeth.", args: { command: "string", args: "string[]?", timeoutMs: "number?", sandbox: "object?" } },
   { name: "git.status", caps: 0, desc: "git status --porcelain in the work dir", args: {} },
   { name: "git.log", caps: 0, desc: "git log --oneline in the work dir", args: { n: "number?" } },
   { name: "git.commit", caps: CAP_COMMIT, desc: "git add -A && git commit (needs CAP_COMMIT)", args: { message: "string" } },

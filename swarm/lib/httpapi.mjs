@@ -56,7 +56,8 @@ import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import {
   ComputeError, submitInvocation, getInvocation, waitInvocation,
-  submitMap, getMap, deployApp, listApps, appConfig, appLogs, undeployApp,
+  submitMap, getMap, deployApp, listApps, appStatus, appLogs, undeployApp,
+  getCapacity,
 } from "./compute.mjs";
 import {
   withPreview, enablePreview, disablePreview, teardownPreview,
@@ -339,17 +340,25 @@ export function startApiServer(dir, cfg) {
       // ---- compute: serverless functions ----
       if (req.method === "POST" && path === "/v1/compute/invoke") {
         const b = await readBody(req);
-        const { invocationId, jobId } = submitInvocation(dir, {
-          name: b.name, code: b.code, args: b.args, timeoutMs: b.timeoutMs,
-        });
-        if (b.waitMs !== undefined) {
-          const w = Number(b.waitMs);
-          if (!Number.isFinite(w) || w < 1000 || w > 300000) {
-            return send(res, 400, { error: "waitMs must be a number in 1000..300000" });
+        try {
+          const { invocationId, jobId } = submitInvocation(dir, {
+            name: b.name, code: b.code, args: b.args, timeoutMs: b.timeoutMs,
+            memoryMB: b.memoryMB, network: b.network, retries: b.retries,
+          });
+          if (b.waitMs !== undefined) {
+            const w = Number(b.waitMs);
+            if (!Number.isFinite(w) || w < 1000 || w > 300000) {
+              return send(res, 400, { error: "waitMs must be a number in 1000..300000" });
+            }
+            return send(res, 200, await waitInvocation(dir, invocationId, w));
           }
-          return send(res, 200, await waitInvocation(dir, invocationId, w));
+          return send(res, 201, { invocationId, jobId, status: "pending" });
+        } catch (e) {
+          if (e instanceof ComputeError && e.status === 429) {
+            return send(res, 429, { error: e.message }, { "retry-after": "2" });
+          }
+          throw e;
         }
-        return send(res, 201, { invocationId, jobId, status: "pending" });
       }
       {
         const m = path.match(/^\/v1\/compute\/invocations\/([A-Za-z0-9_.-]+)$/);
@@ -361,14 +370,29 @@ export function startApiServer(dir, cfg) {
       // ---- compute: parallel map ----
       if (req.method === "POST" && path === "/v1/compute/map") {
         const b = await readBody(req);
-        const r = submitMap(dir, { name: b.name, code: b.code, items: b.items, timeoutMs: b.timeoutMs });
-        return send(res, 201, { ...r, count: r.invocationIds.length });
+        try {
+          const r = submitMap(dir, {
+            name: b.name, code: b.code, items: b.items, timeoutMs: b.timeoutMs,
+            memoryMB: b.memoryMB, network: b.network, retries: b.retries,
+          });
+          return send(res, 201, { ...r, count: r.invocationIds.length });
+        } catch (e) {
+          if (e instanceof ComputeError && e.status === 429) {
+            return send(res, 429, { error: e.message }, { "retry-after": "2" });
+          }
+          throw e;
+        }
       }
       {
         const m = path.match(/^\/v1\/compute\/map\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "GET" && m) {
           return send(res, 200, getMap(dir, m[1]));
         }
+      }
+
+      // ---- compute: capacity (Little's-law scheduler telemetry) ----
+      if (req.method === "GET" && path === "/v1/compute/capacity") {
+        return send(res, 200, getCapacity());
       }
 
       // ---- compute: app hosting ----
@@ -408,7 +432,7 @@ export function startApiServer(dir, cfg) {
       {
         const m = path.match(/^\/v1\/compute\/apps\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "GET" && m) {
-          return send(res, 200, withPreview(dir, cfg, appConfig(dir, m[1])));
+          return send(res, 200, withPreview(dir, cfg, await appStatus(dir, m[1])));
         }
       }
       {

@@ -40,9 +40,11 @@ export class ComputeClient extends SwarmClient {
    * With waitMs: blocks until done/failed or the wait elapses, then returns
    * the full invocation view {status, ok, result, error, logs, durationMs}.
    */
-  async invoke({ code, args, timeoutMs, name, waitMs } = {}) {
+  async invoke({ code, args, timeoutMs, name, waitMs, memoryMB, network, retries } = {}) {
     if (typeof code !== "string" || !code.trim()) throw new Error("invoke: code is required");
-    return this._req("POST", "/v1/compute/invoke", { code, args, timeoutMs, name, waitMs });
+    return this._req("POST", "/v1/compute/invoke", {
+      code, args, timeoutMs, name, waitMs, memoryMB, network, retries,
+    });
   }
 
   /** Fetch one invocation's current view (status + result when done). */
@@ -82,10 +84,12 @@ export class ComputeClient extends SwarmClient {
    * Fan `code` out over `items` — one job per item, spread across workers.
    * Returns {mapId, invocationIds, count}.
    */
-  async map({ code, items, timeoutMs, name } = {}) {
+  async map({ code, items, timeoutMs, name, memoryMB, network, retries } = {}) {
     if (typeof code !== "string" || !code.trim()) throw new Error("map: code is required");
     if (!Array.isArray(items) || !items.length) throw new Error("map: items[] is required");
-    return this._req("POST", "/v1/compute/map", { code, items, timeoutMs, name });
+    return this._req("POST", "/v1/compute/map", {
+      code, items, timeoutMs, name, memoryMB, network, retries,
+    });
   }
 
   /** Current aggregate view of a map: counts + per-item results. */
@@ -130,6 +134,16 @@ export class ComputeClient extends SwarmClient {
 
   async listApps() {
     return (await this._req("GET", "/v1/compute/apps")).apps;
+  }
+
+  /** One app's status: worker liveness + TCP readiness probe of its port. */
+  async appStatus(appId) {
+    return this._req("GET", `/v1/compute/apps/${appId}`);
+  }
+
+  /** Scheduler telemetry: arrival rate (EWMA), p50/p95 service time, Little's-law target. */
+  async capacity() {
+    return this._req("GET", "/v1/compute/capacity");
   }
 
   async appLogs(appId, { tail = 100 } = {}) {

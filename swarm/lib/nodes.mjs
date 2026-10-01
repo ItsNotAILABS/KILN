@@ -41,6 +41,53 @@ function gitClone(repo, workdir, timeoutMs) {
   });
 }
 
+function gitSync(workdir, args) {
+  const r = spawnSync("git", args, { cwd: workdir, encoding: "utf8", timeout: 30000 });
+  return {
+    ok: r.status === 0,
+    out: String(r.stdout || "").trim(),
+    err: String(r.stderr || "").trim(),
+  };
+}
+
+/**
+ * Ensure the cloned workdir actually has a checked-out tree.
+ *
+ * `git clone` exits 0 even when it checks out nothing — e.g. the remote's
+ * HEAD points at a branch that doesn't exist ("warning: remote HEAD refers
+ * to nonexistent ref, unable to checkout"), leaving a workdir containing
+ * only `.git`. Booting an app into that tree crash-loops with
+ * MODULE_NOT_FOUND (first-deploy ticket, 2026-09-27: auro/launchpad's HEAD
+ * said `main`, the repo only had `master`).
+ *
+ * When HEAD is unborn we check out the remote's default branch explicitly
+ * (origin/HEAD, else origin/master, else origin/main). If nothing resolves,
+ * the deploy fails LOUDLY here instead of producing a crash-looping node.
+ */
+export function ensureCheckout(workdir) {
+  if (gitSync(workdir, ["rev-parse", "--verify", "HEAD"]).ok) return { ok: true };
+  // Empty remote (no refs at all): nothing to check out. Cloning an empty
+  // repo to push the first commit is legitimate — not a broken deploy —
+  // so this is OK, not a failure.
+  const refs = gitSync(workdir, ["for-each-ref", "--format=%(refname)", "refs/remotes/origin/"]);
+  if (refs.ok && !refs.out) return { ok: true, empty: true };
+  const candidates = [];
+  const sym = gitSync(workdir, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
+  if (sym.ok && sym.out.startsWith("refs/remotes/origin/")) {
+    candidates.push(sym.out.slice("refs/remotes/origin/".length));
+  }
+  for (const b of ["master", "main"]) {
+    if (!candidates.includes(b)) candidates.push(b);
+  }
+  for (const b of candidates) {
+    if (gitSync(workdir, ["checkout", "-f", b]).ok &&
+        gitSync(workdir, ["rev-parse", "--verify", "HEAD"]).ok) {
+      return { ok: true, branch: b, repaired: true };
+    }
+  }
+  return { ok: false };
+}
+
 export async function createNode(dir, opts) {
   const {
     name,
@@ -69,6 +116,14 @@ export async function createNode(dir, opts) {
   if (repo) {
     try {
       await gitClone(repo, workdir, cloneTimeoutMs);
+      // A clone can exit 0 with no working tree (remote HEAD -> missing
+      // branch). Gate node creation on a real checkout — a deploy must
+      // fail loudly here, never become a crash-looping app node.
+      const co = ensureCheckout(workdir);
+      if (!co.ok) {
+        throw new Error(
+          `nodes: git clone of ${repo} produced no checkout (remote HEAD points at a missing branch?)`);
+      }
     } catch (e) {
       // Don't leave an orphaned node dir: the tick would spam ENOENT on the
       // missing node.json every 2s (seen in the wild via ticket E2).
