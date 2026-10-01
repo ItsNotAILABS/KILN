@@ -173,6 +173,23 @@ describe("KILN compute (real daemon)", () => {
 
     const un = await kiln.undeployApp(app.appId);
     assert.equal(un.ok, true);
+
+    // Regression: undeploy must remove the app record, or listApps shows a
+    // ghost "ready" app (and its TCP probe can false-positive). Logs and the
+    // node dir are kept on purpose — only the record is gone.
+    assert.ok(
+      !existsSync(join(dir, "nodes", app.appId, "app.json")),
+      "app.json removed on undeploy"
+    );
+    const appsAfter = await kiln.listApps();
+    assert.ok(
+      !appsAfter.some((a) => a.appId === app.appId),
+      "undeployed app absent from listApps"
+    );
+    assert.ok(
+      existsSync(join(dir, "nodes", app.appId, "app.log")),
+      "app.log kept for forensics"
+    );
   });
 
   after(() => {
