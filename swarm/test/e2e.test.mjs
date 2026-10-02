@@ -21,34 +21,7 @@ const WORKER = join(HERE, "..", "lib", "worker.mjs");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/**
- * Stop a spawned worker and await its exit — without the missed-event
- * race that wedged this file in full-suite runs: if the worker exited
- * on its own before we got here, 'exit' has ALREADY fired and a fresh
- * `worker.on("exit")` listener waits forever (the process then idles
- * with no children and an empty JS stack; only an unrelated open
- * handle — the stub model server — keeps it alive, and the suite
- * hangs with zero output). Attach the listener first, honor an exit
- * that already happened, and escalate to SIGKILL if SIGTERM is
- * ignored, so a stuck worker can never hang the suite either.
- */
-async function stopWorker(worker) {
-  if (worker.exitCode !== null || worker.signalCode !== null) return;
-  const exited = new Promise((r) => worker.on("exit", r));
-  try { worker.kill("SIGTERM"); } catch {}
-  const graceful = await Promise.race([exited.then(() => true), sleep(10000).then(() => false)]);
-  if (!graceful) {
-    try { worker.kill("SIGKILL"); } catch {}
-    await exited;
-  }
-}
-
-async function waitFor(dir, jobId, timeoutMs = 240000) {
-  // 240s, not 60s: these are REAL OS-process jobs (clone + worker boot
-  // + tool execution) and under full-suite parallel load everything on
-  // this host runs several times slower — a 60s budget timed out in
-  // suite runs while the same job finished in ~14s standalone. The
-  // budget stays finite: a wedged job still fails the test, loudly.
+async function waitFor(dir, jobId, timeoutMs = 60000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     for (const e of readEvents(dir)) {
@@ -84,33 +57,28 @@ describe("worker end-to-end (real OS process)", () => {
     });
     let stderr = "";
     worker.stderr.on("data", (c) => (stderr += c));
-    try {
-      const done = waitFor(dir, jobId);
-      const event = await done;
+    const done = waitFor(dir, jobId);
+    const event = await done;
 
-      await stopWorker(worker);
+    worker.kill("SIGTERM");
+    await new Promise((r) => worker.on("exit", r));
 
-      assert.equal(event.type, "done", `job failed: ${event.error || ""} stderr: ${stderr.slice(0, 500)}`);
-      assert.match(event.summary, /3\/3 steps ok/);
+    assert.equal(event.type, "done", `job failed: ${event.error || ""} stderr: ${stderr.slice(0, 500)}`);
+    assert.match(event.summary, /3\/3 steps ok/);
 
-      // REAL file on disk with the exact content
-      const report = join(node.workdir, "REPORT.md");
-      assert.ok(existsSync(report), "REPORT.md must exist on disk");
-      assert.equal(readFileSync(report, "utf8"), "# worker report\nbuilt by a real kiln worker\n");
+    // REAL file on disk with the exact content
+    const report = join(node.workdir, "REPORT.md");
+    assert.ok(existsSync(report), "REPORT.md must exist on disk");
+    assert.equal(readFileSync(report, "utf8"), "# worker report\nbuilt by a real kiln worker\n");
 
-      // REAL commit in the clone
-      const log = gitLog(node.workdir, 3);
-      assert.match(log, /e2e: worker report/);
+    // REAL commit in the clone
+    const log = gitLog(node.workdir, 3);
+    assert.match(log, /e2e: worker report/);
 
-      // REAL receipts verify against the node's pubkey
-      const v = verifyReceipts(dir, node.id, keypair);
-      assert.equal(v.ok, true);
-      assert.ok(v.count >= 3, `expected >=3 receipts, got ${v.count}`);
-    } finally {
-      // A live worker pins this test child exactly like test 2's
-      // server does — never leave one behind on a failure path.
-      await stopWorker(worker);
-    }
+    // REAL receipts verify against the node's pubkey
+    const v = verifyReceipts(dir, node.id, keypair);
+    assert.equal(v.ok, true);
+    assert.ok(v.count >= 3, `expected >=3 receipts, got ${v.count}`);
   });
 
   it("runs an http-mind long-task job: real worker, stub model, real tool effects", async () => {
@@ -153,53 +121,41 @@ describe("worker end-to-end (real OS process)", () => {
     await new Promise((r) => server.listen(0, "127.0.0.1", r));
     const port = server.address().port;
 
-    // The stub server MUST be closed on every path — success, failed
-    // assert, or a waitFor throw. A listening server is a referenced
-    // handle: leak it and this test child never exits, the test runner
-    // waits on the child forever, and the WHOLE SUITE wedges with the
-    // tests themselves long finished (observed in suite runs: e2e
-    // children idle for 10+ minutes holding only a LISTEN socket).
-    // Same for the worker: a live worker pins the child the same way.
-    let worker = null;
-    try {
-      const dir = makeStateDir();
-      const { node, keypair } = await makeNode(dir, { name: "e2e-http", caps: 15 });
-      const jobId = "job_e2e_http_1";
-      writeJobFile(dir, node.id, {
-        id: jobId,
-        name: "my-long-task",
-        mind: "http", // per-job mind selection, like SwarmClient.submitJob({ mind: "http" })
-        plan,
-      });
+    const dir = makeStateDir();
+    const { node, keypair } = await makeNode(dir, { name: "e2e-http", caps: 15 });
+    const jobId = "job_e2e_http_1";
+    writeJobFile(dir, node.id, {
+      id: jobId,
+      name: "my-long-task",
+      mind: "http", // per-job mind selection, like SwarmClient.submitJob({ mind: "http" })
+      plan,
+    });
 
-      worker = spawn(process.execPath, [WORKER, node.id], {
-        env: {
-          ...process.env,
-          KILN_SWARM_DIR: dir,
-          KILN_MIND_URL: `http://127.0.0.1:${port}/v1/chat/completions`,
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let stderr = "";
-      worker.stderr.on("data", (c) => (stderr += c));
-      const event = await waitFor(dir, jobId);
-      await stopWorker(worker);
+    const worker = spawn(process.execPath, [WORKER, node.id], {
+      env: {
+        ...process.env,
+        KILN_SWARM_DIR: dir,
+        KILN_MIND_URL: `http://127.0.0.1:${port}/v1/chat/completions`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    worker.stderr.on("data", (c) => (stderr += c));
+    const event = await waitFor(dir, jobId);
+    worker.kill("SIGTERM");
+    await new Promise((r) => worker.on("exit", r));
+    server.close();
 
-      assert.equal(event.type, "done", `job failed: ${event.error || ""} stderr: ${stderr.slice(0, 500)}`);
-      assert.match(event.summary, /long task complete/);
-      assert.equal(calls, 2, "model should have been consulted twice (tool call, then final)");
+    assert.equal(event.type, "done", `job failed: ${event.error || ""} stderr: ${stderr.slice(0, 500)}`);
+    assert.match(event.summary, /long task complete/);
+    assert.equal(calls, 2, "model should have been consulted twice (tool call, then final)");
 
-      // REAL file on disk — the tool call the model issued actually ran
-      assert.equal(readFileSync(join(node.workdir, "LONGTASK.md"), "utf8"), "long task done\n");
+    // REAL file on disk — the tool call the model issued actually ran
+    assert.equal(readFileSync(join(node.workdir, "LONGTASK.md"), "utf8"), "long task done\n");
 
-      // REAL receipts verify against the node's pubkey
-      const v = verifyReceipts(dir, node.id, keypair);
-      assert.equal(v.ok, true);
-      assert.ok(v.count >= 1, `expected >=1 receipt, got ${v.count}`);
-    } finally {
-      if (worker) await stopWorker(worker);
-      try { server.closeAllConnections?.(); } catch {}
-      server.close();
-    }
+    // REAL receipts verify against the node's pubkey
+    const v = verifyReceipts(dir, node.id, keypair);
+    assert.equal(v.ok, true);
+    assert.ok(v.count >= 1, `expected >=1 receipt, got ${v.count}`);
   });
 });

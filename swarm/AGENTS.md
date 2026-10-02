@@ -23,31 +23,6 @@ If it throws, the daemon is down. Do NOT fake the work — either start it
 (`swarm.mjs daemon start` via shell, if you have that right) or report that
 compute is unavailable.
 
-## 1b. Sit before you write
-
-Memory is already on this repo (`refs/kiln/memory`). It does nothing for
-you until you read it. Before a job, a deposit, or a commit:
-
-```sh
-node swarm.mjs memory sit --repo <owner>/<repo>
-```
-
-Print that text. Do not dump the event chain. The core block labeled
-`working` is the one current task. Set it when the task changes:
-
-```sh
-node swarm.mjs memory core --repo <owner>/<repo> --label working --value "the one task"
-```
-
-After a decision, remember the episode, then assert a fact that cites it.
-A fact with no source episode is refused. From code: `agentAwareness()`
-in `lib/memory.mjs`, or `client.memorySit(owner, repo)`. The same brief
-is `GET /git/:owner/:repo/memory/sit`.
-
-If you only have the GitHub checkout and the swarm is down, read
-`MEMORY.md` at the repo root. That file is the committed awareness.
-The git ref is the live record.
-
 ## 2. The agent loop
 
 ```js
@@ -111,15 +86,9 @@ const r = await swarm.createRepo({ owner: "auro", repo: "scratch" });
 // r.cloneUrl → "http://127.0.0.1:18787/git/auro/scratch"
 ```
 
-Clone/fetch need a forge credential too (architect's rule, 2026-10-28:
-only our accounts see the forge — anonymous reads get 401). Use the
-daemon's `api.token` as an `Authorization: Bearer <token>` header (git
-http.extraHeader), or a Basic userinfo URL (`http://oauth2:<token>@host/…`)
-— git retries with the credentials after the 401 challenge. Account
-sessions and agent tokens may read only their own owner namespace.
-**Push needs the operator bearer token** (account/agent tokens cannot
-push). Reads and pushes without credentials are refused — verified, not
-assumed.
+Clone/fetch are public. **Push needs the bearer token**: the daemon's
+`api.token` as an `Authorization: Bearer <token>` header (git http.extraHeader).
+Pushes without it are refused — verified, not assumed.
 
 ## 5. Persistent pieces of yourself
 
@@ -183,31 +152,7 @@ Function results are real: `ok:true` + JSON `result`, or `ok:false` + the
 function's real error. A module without `main()` fails loudly. Limits:
 code ≤ 256KB, `timeoutMs` 100..300000ms, results > 1MB are not returned.
 
-## 7. Workspaces, project details, MCP — organization for any agent
-
-Repos group into **workspaces** (member repos + linked sites, nestable via
-`parentId` / `setParent`), and every hosted repo has live **project details**
-(description, topics, commit count, languages, README, CI). Both are open to
-any agent — no per-vendor account, just the forge bearer token. Discover the
-surface with `GET /v1/capabilities`, then `GET /v1/openapi.json` (both
-bearer-gated), use the REST routes, or spawn the zero-dependency MCP server
-at `swarm/mcp-server.mjs` (tools `kiln_workspace_*` + `kiln_repo_details`;
-generic client config in the docs). Full guide: `docs/WORKSPACES.md#ai-access`.
-
-The forge also has **accounts**: a person signs up (`POST /v1/accounts`),
-logs in (session bearer `kiln_sess_…`), and mints scoped tokens for their
-own agents (`kiln_agt_…`). Account/agent principals are owner-scoped —
-they act only under their account's namespace, on workspaces + project
-details + their own account routes; the operator token remains root.
-Repos also carry a **forge surface** (`/v1/repos/<owner>/<repo>/…`):
-branches, file contents (a write is a real git commit by the acting
-principal — the agent write path; git push stays operator-only),
-commits, compare, pull requests (open/comment/review/merge), tags and
-releases, plus a packages store (`/v1/packages`). Sessions act under
-their account; agent tokens need the `forge` scope. Model and
-boundaries: `docs/ACCOUNTS.md`.
-
-## 8. Rules (non-negotiable)
+## 7. Rules (non-negotiable)
 
 1. **Real or loud failure.** Every tool executes for real or the job fails
    with the real error. Never invent output, hashes, receipts, or commits.

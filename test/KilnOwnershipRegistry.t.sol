@@ -2,7 +2,6 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {Vm} from "forge-std/Vm.sol";
 import {KilnOwnershipRegistry} from "../contracts/KilnOwnershipRegistry.sol";
 
 contract KilnOwnershipRegistryTest is Test {
@@ -13,9 +12,7 @@ contract KilnOwnershipRegistryTest is Test {
     bytes32 internal projectId = keccak256("ItsNotAILABS/KILN");
     bytes32 internal licenseId = keccak256("MIT");
 
-    function setUp() public {
-        registry = new KilnOwnershipRegistry();
-    }
+    function setUp() public { registry = new KilnOwnershipRegistry(); }
 
     function register() internal {
         vm.prank(owner);
@@ -131,7 +128,11 @@ contract KilnOwnershipRegistryTest is Test {
         uint64 expiresAt
     );
 
-    function _registerAndAuthorize(address agentAddr, uint256 caps, uint64 expiresAt) internal {
+    function _registerAndAuthorize(
+        address agentAddr,
+        uint256 caps,
+        uint64 expiresAt
+    ) internal {
         vm.prank(owner);
         registry.registerProject(projectId, "ipfs://project", owner, licenseId);
         vm.prank(owner);
@@ -208,7 +209,12 @@ contract KilnOwnershipRegistryTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(KilnOwnershipRegistry.ExceedsParentGrant.selector);
-        registry.delegateGrant(projectId, child, parentCaps | releaseCap, uint64(block.timestamp + 12 hours));
+        registry.delegateGrant(
+            projectId,
+            child,
+            parentCaps | releaseCap,
+            uint64(block.timestamp + 12 hours)
+        );
 
         // Child grant was not created.
         assertEq(registry.getAgentGrant(projectId, child).expiresAt, 0);
@@ -369,137 +375,5 @@ contract KilnOwnershipRegistryTest is Test {
         // No transfer pending, grants untouched, epoch unchanged.
         assertEq(registry.getProject(projectId).authorizationEpoch, 1);
         assertTrue(registry.hasCapability(projectId, agent, commitCap));
-    }
-
-    // ---------- License grants (expiry + revoke) ----------
-
-    event LicenseGranted(
-        bytes32 indexed projectId, address indexed grantee, uint256 permissions, uint64 expiresAt, uint64 timestamp
-    );
-    event LicenseRevoked(bytes32 indexed projectId, address indexed grantee, uint64 timestamp);
-
-    function testLicenseGrantWithExpiryIsEnforcedAcrossBoundary() public {
-        register();
-        uint64 expiry = uint64(block.timestamp + 1 hours);
-        vm.prank(owner);
-        registry.grantLicense(projectId, user, 3, expiry);
-
-        KilnOwnershipRegistry.LicenseGrant memory grant = registry.getLicenseGrant(projectId, user);
-        assertEq(grant.permissions, 3);
-        assertEq(grant.expiresAt, expiry);
-        assertEq(registry.getLicensePermissions(projectId, user), 3);
-
-        // One second before expiry the grant is still in force.
-        vm.warp(expiry - 1);
-        assertEq(registry.getLicensePermissions(projectId, user), 3);
-
-        // At expiry the grant is dead: permissions read as zero.
-        vm.warp(expiry);
-        assertEq(registry.getLicensePermissions(projectId, user), 0);
-
-        vm.warp(expiry + 1 days);
-        assertEq(registry.getLicensePermissions(projectId, user), 0);
-    }
-
-    function testLicenseGrantWithoutExpiryDoesNotExpire() public {
-        register();
-        vm.prank(owner);
-        registry.grantLicense(projectId, user, 5, 0);
-        vm.warp(block.timestamp + 3650 days);
-        assertEq(registry.getLicensePermissions(projectId, user), 5);
-    }
-
-    function testGrantLicenseRejectsPastExpiry() public {
-        register();
-        vm.prank(owner);
-        vm.expectRevert(KilnOwnershipRegistry.GrantExpired.selector);
-        registry.grantLicense(projectId, user, 3, uint64(block.timestamp));
-        assertEq(registry.getLicensePermissions(projectId, user), 0);
-    }
-
-    function testLicenseGrantedEventCarriesExpiry() public {
-        register();
-        uint64 expiry = uint64(block.timestamp + 30 days);
-        vm.prank(owner);
-        vm.expectEmit(true, true, false, true);
-        emit LicenseGranted(projectId, user, 3, expiry, uint64(block.timestamp));
-        registry.grantLicense(projectId, user, 3, expiry);
-    }
-
-    function testRevokeLicenseTakesEffectImmediately() public {
-        register();
-        vm.prank(owner);
-        registry.grantLicense(projectId, user, 3, 0);
-        assertEq(registry.getLicensePermissions(projectId, user), 3);
-
-        vm.prank(owner);
-        vm.expectEmit(true, true, false, true);
-        emit LicenseRevoked(projectId, user, uint64(block.timestamp));
-        registry.revokeLicense(projectId, user);
-
-        // Effective now, not at some future expiry, and the record is cleared.
-        assertEq(registry.getLicensePermissions(projectId, user), 0);
-        assertEq(registry.getLicenseGrant(projectId, user).permissions, 0);
-        assertEq(registry.getLicenseGrant(projectId, user).expiresAt, 0);
-
-        // A fresh grant after revoke works normally.
-        vm.prank(owner);
-        registry.grantLicense(projectId, user, 1, 0);
-        assertEq(registry.getLicensePermissions(projectId, user), 1);
-    }
-
-    function testRevokeLicenseWithoutGrantIsSilentNoOp() public {
-        register();
-        vm.recordLogs();
-        vm.prank(owner);
-        registry.revokeLicense(projectId, user);
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        assertEq(logs.length, 0);
-        assertEq(registry.getLicensePermissions(projectId, user), 0);
-    }
-
-    function testNonOwnerCannotGrantOrRevokeLicense() public {
-        register();
-        vm.prank(user);
-        vm.expectRevert(KilnOwnershipRegistry.NotProjectOwner.selector);
-        registry.grantLicense(projectId, user, 3, 0);
-
-        vm.prank(owner);
-        registry.grantLicense(projectId, user, 3, 0);
-
-        vm.prank(agent);
-        vm.expectRevert(KilnOwnershipRegistry.NotProjectOwner.selector);
-        registry.revokeLicense(projectId, user);
-        assertEq(registry.getLicensePermissions(projectId, user), 3);
-    }
-
-    function testFuzz_LicenseNeverValidatesAfterRevokeOrExpiry(
-        uint256 permissions,
-        uint256 expiryOffset,
-        uint256 warpBy,
-        bool revoke
-    ) public {
-        permissions = bound(permissions, 1, 1e18);
-        expiryOffset = bound(expiryOffset, 1 hours, 365 days);
-        warpBy = bound(warpBy, 0, 730 days);
-        register();
-
-        uint64 expiresAt = uint64(block.timestamp + expiryOffset);
-        vm.prank(owner);
-        registry.grantLicense(projectId, user, permissions, expiresAt);
-        assertEq(registry.getLicensePermissions(projectId, user), permissions);
-
-        if (revoke) {
-            vm.prank(owner);
-            registry.revokeLicense(projectId, user);
-        }
-        vm.warp(block.timestamp + warpBy);
-
-        uint256 effective = registry.getLicensePermissions(projectId, user);
-        if (revoke || warpBy >= expiryOffset) {
-            assertEq(effective, 0);
-        } else {
-            assertEq(effective, permissions);
-        }
     }
 }

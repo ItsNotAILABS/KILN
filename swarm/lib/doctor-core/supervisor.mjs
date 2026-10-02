@@ -22,14 +22,14 @@
  *   run()     the detached poll loop (the `_run` child)
  */
 import { spawn } from "node:child_process";
-import { openSync, closeSync, unlinkSync, readFileSync } from "node:fs";
+import { openSync, closeSync, writeFileSync, unlinkSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   DOCTOR_POLL_MS,
   ensureDoctorDir, dlog, sleep,
-  readDoctorJson, readDoctorState, writeDoctorState, atomicWriteSync,
-  doctorJsonPath, doctorLockPath, heartbeatPath,
+  readDoctorJson, readDoctorState, writeDoctorState,
+  doctorJsonPath, doctorLockPath,
   acquireExclusive, acquireTickLock, releaseTickLock,
   journalSince, readJournal, pidAlive,
 } from "./helpers.mjs";
@@ -40,19 +40,6 @@ import { Detective } from "./detective.mjs";
 import { Medic } from "./medic.mjs";
 
 export const MAX_AGENT_RESTARTS = 5;
-
-/**
- * Default bounded-recovery-retry schedule for a death whose recovery FAILED.
- * Attempt 1 happens immediately (the tick that detected the death); these
- * delays pace attempts 2..N. After the last attempt the doctor raises a LOUD
- * alarm instead of going silent — an exhausted retry budget is a
- * human-intervention event, never a quiet skip. Overridable per plugin via
- * `plugin.recoveryRetry = { maxAttempts, delaysMs }`.
- */
-export const DEFAULT_RECOVERY_RETRY = {
-  maxAttempts: 8,
-  delaysMs: [30_000, 60_000, 120_000, 300_000, 600_000, 600_000, 600_000, 600_000],
-};
 
 const BIN_PATH = fileURLToPath(new URL("../bin/doctor.js", import.meta.url));
 
@@ -176,7 +163,7 @@ export class Supervisor {
     });
     child.unref();
     closeSync(out);
-    atomicWriteSync(doctorJsonPath(this.dir), JSON.stringify({
+    writeFileSync(doctorJsonPath(this.dir), JSON.stringify({
       pid: child.pid,
       startedAt: new Date().toISOString(),
     }) + "\n");
@@ -187,7 +174,7 @@ export class Supervisor {
   stop() {
     const d = readDoctorJson(this.dir);
     if (!d || !d.pid || !this.pidIsDoctor(d.pid)) {
-      return { stopped: false, reason: "not running" };
+      return { stopped: false, reason: "doctor not running" };
     }
     try { process.kill(d.pid, "SIGTERM"); } catch { /* already gone */ }
     try { unlinkSync(doctorLockPath(this.dir)); } catch { /* the loop removes it on exit */ }
@@ -198,84 +185,9 @@ export class Supervisor {
   // ------------------------------------------------------------------ the tick
 
   /**
-   * The doctor's own heart. Written at the end of every tick (loop and
-   * inline `check` alike) so peers (e.g. Wraith) can watch the doctor the
-   * way the doctor watches its subject. Schema mirrors Wraith's heart.py:
-   *   { agent, pid, ts, ts_epoch, status, detail }
-   * status: "ok" (subject healthy) | "degraded" (subject down, doctor working).
-   * "down" is reserved for the schema — a live loop never writes it.
-   * A heartbeat must never break a tick: failures are logged, not thrown.
-   */
-  writeHeartbeat(status, detail = "") {
-    try {
-      ensureDoctorDir(this.dir);
-      const hb = {
-        agent: this.plugin.name || "doctor",
-        pid: process.pid,
-        ts: new Date().toISOString(),
-        ts_epoch: Date.now() / 1000,
-        status,
-        detail: String(detail || ""),
-      };
-      atomicWriteSync(heartbeatPath(this.dir), JSON.stringify(hb));
-    } catch (e) {
-      this.log(`doctor: heartbeat write failed (${(e && e.message) || e})`);
-    }
-  }
-
-  /**
-   * Peer-heart watching — "who watches the watchmen? each other."
-   * plugin.peers: [{ name, heartbeatPath, maxAgeMs? }] (maxAgeMs default 90s).
-   * Missing, stale, or unparseable peer hearts are logged as findings and
-   * returned as problem objects. Pure observation: never acts on a peer.
-   */
-  checkPeers() {
-    const peers = this.plugin.peers;
-    if (!peers || !peers.length) return [];
-    const problems = [];
-    for (const peer of peers) {
-      const maxAgeMs = peer.maxAgeMs ?? 90000;
-      let raw;
-      try {
-        raw = readFileSync(peer.heartbeatPath, "utf8");
-      } catch {
-        problems.push({ name: peer.name, problem: "missing" });
-        this.log(`doctor: peer heart ${peer.name} missing (${peer.heartbeatPath})`);
-        continue;
-      }
-      let hb = null;
-      try {
-        hb = JSON.parse(raw);
-      } catch {
-        problems.push({ name: peer.name, problem: "unparseable" });
-        this.log(`doctor: peer heart ${peer.name} unparseable (${peer.heartbeatPath})`);
-        continue;
-      }
-      let epoch = hb && typeof hb.ts_epoch === "number" ? hb.ts_epoch : NaN;
-      if (!Number.isFinite(epoch) && hb && hb.ts) {
-        const t = Date.parse(hb.ts);
-        epoch = Number.isFinite(t) ? t / 1000 : NaN;
-      }
-      const ageMs = Number.isFinite(epoch) ? Date.now() - epoch * 1000 : NaN;
-      if (!Number.isFinite(ageMs)) {
-        problems.push({ name: peer.name, problem: "unparseable" });
-        this.log(`doctor: peer heart ${peer.name} unparseable (${peer.heartbeatPath})`);
-      } else if (ageMs > maxAgeMs) {
-        problems.push({ name: peer.name, problem: "stale", ageMs });
-        this.log(`doctor: peer heart ${peer.name} STALE ` +
-          `(age ${Math.round(ageMs / 1000)}s > ${Math.round(maxAgeMs / 1000)}s)`);
-      }
-    }
-    return problems;
-  }
-
-  /**
    * One supervision pass: probe health; on a NEW death, forensics BEFORE
-   * recovery, then verify. A death whose recovery FAILED is retried with
-   * backoff (DEFAULT_RECOVERY_RETRY, overridable via plugin.recoveryRetry);
-   * when the budget is exhausted the doctor raises a LOUD alarm rather than
-   * going silent. Returns a result object (or { skipped: true } when another
-   * tick holds the lock).
+   * recovery, then verify. Returns a result object (or { skipped: true }
+   * when another tick holds the lock).
    */
   async tick({ inline = false } = {}) {
     ensureDoctorDir(this.dir);
@@ -283,89 +195,21 @@ export class Supervisor {
       // Another tick (loop or check) is already handling this — skip quietly.
       return { skipped: true };
     }
-    // Heartbeat locals: the doctor's own heart is written in the finally
-    // block, so every completed tick proves the loop is breathing.
-    let hbStatus = "degraded";
-    let hbDetail = "";
     try {
       const st = await this.callAgent("watcher", "probe");
       if (!st) {
         this.log("doctor: tick skipped — watcher agent unavailable");
-        hbDetail = "watcher agent unavailable";
         return { error: true, reason: "watcher unavailable" };
       }
       const dstate = readDoctorState(this.dir);
       if (st.up) {
-        // Healthy again: the outage (and any exhausted retry budget) is over.
-        writeDoctorState(this.dir, {
-          ...dstate,
-          lastHealthyTs: Date.now(),
-          recoveryExhausted: false,
-          recoveryAttempts: 0,
-          nextRecoveryRetryTs: 0,
-        });
-        hbStatus = "ok";
+        writeDoctorState(this.dir, { ...dstate, lastHealthyTs: Date.now() });
         return { healthy: true, pid: st.pid };
       }
       const deathId = `${st.pid ?? "none"}|${st.startedAt ?? "none"}`;
-      const retryCfg = { ...DEFAULT_RECOVERY_RETRY, ...(this.plugin.recoveryRetry || {}) };
-      const maxAttempts = Math.max(1, retryCfg.maxAttempts);
-      const delaysMs = Array.isArray(retryCfg.delaysMs) && retryCfg.delaysMs.length
-        ? retryCfg.delaysMs : DEFAULT_RECOVERY_RETRY.delaysMs;
       if (dstate.lastHandledDeathId === deathId) {
-        // Same dead instance we already handled. A FAILED recovery is NOT
-        // terminal: retry with backoff up to maxAttempts, then raise a LOUD
-        // alarm (never silently stop trying to notice the outage).
-        // A successful recovery changes startedAt → new deathId, so this
-        // branch only ever sees instances whose recovery failed.
-        const attempts = dstate.recoveryAttempts ?? 1;
-        if (dstate.recoveryExhausted) {
-          return { healthy: false, alreadyHandled: true, recoveryExhausted: true, reason: st.reason };
-        }
-        if (attempts >= maxAttempts) {
-          this.log(`doctor: ALARM — recovery exhausted for ${this.subject} death ${deathId} ` +
-            `after ${attempts} attempt(s) — MANUAL INTERVENTION REQUIRED (${this.logHint})`);
-          writeDoctorState(this.dir, { ...dstate, recoveryExhausted: true, recoveryExhaustedTs: Date.now() });
-          hbDetail = "recovery exhausted — MANUAL INTERVENTION REQUIRED";
-          return { healthy: false, alreadyHandled: true, recoveryExhausted: true, reason: st.reason };
-        }
-        const nextTs = dstate.nextRecoveryRetryTs ?? 0;
-        if (Date.now() < nextTs) {
-          hbDetail = `recovery retry pending in ${Math.round((nextTs - Date.now()) / 1000)}s`;
-          return { healthy: false, alreadyHandled: true, retryPending: true, retryInMs: nextTs - Date.now(), reason: st.reason };
-        }
-        // Retry window reached: recover again. Forensics were already
-        // captured on the first attempt — pass null so the coroner is not
-        // re-run (medic.recover(null) is the supported "recovering anyway"
-        // path used when the coroner is unavailable).
-        this.log(`doctor: retrying recovery for ${this.subject} death ${deathId} (attempt ${attempts + 1}/${maxAttempts})`);
-        const rec = await this.callAgent("medic", "recover", null);
-        const ok = !!(rec && rec.ok);
-        const nextAttempts = attempts + 1;
-        const nextDelay = delaysMs[Math.min(nextAttempts - 1, delaysMs.length - 1)];
-        // Merge over a FRESH read: the medic/plugin may have written state
-        // mid-recovery (e.g. the KILN fence stamp) — don't clobber it with
-        // the snapshot taken at tick start.
-        writeDoctorState(this.dir, {
-          ...readDoctorState(this.dir),
-          lastHandledDeathId: deathId,
-          recoveryAttempts: nextAttempts,
-          lastRecoveryAttemptTs: Date.now(),
-          nextRecoveryRetryTs: ok ? 0 : Date.now() + nextDelay,
-          recoveryExhausted: false,
-        });
-        this.log(`recovery: ${ok ? `ok pid=${rec.pid}` : `FAILED (${rec ? rec.reason : "medic unavailable"})`} ` +
-          `attempt=${nextAttempts}/${maxAttempts} crashLoop=${!!(rec && rec.crashLoop)}`);
-        hbDetail = ok ? `recovered pid=${rec ? rec.pid : "?"}` : `recovery FAILED (${rec ? rec.reason : "medic unavailable"})`;
-        return {
-          healthy: ok,
-          retried: true,
-          recovered: ok,
-          recoveryExhausted: false,
-          pid: rec ? rec.pid ?? null : null,
-          reason: ok ? null : (rec ? rec.reason : "medic unavailable"),
-          crashLoop: !!(rec && rec.crashLoop),
-        };
+        // Same dead instance we already handled — don't re-capture or spin.
+        return { healthy: false, alreadyHandled: true, reason: st.reason };
       }
       // NEW death: the coroner captures forensics BEFORE any recovery.
       const death = await this.callAgent("coroner", "capture", st);
@@ -375,19 +219,8 @@ export class Supervisor {
       // The medic recovers (lock courtesy → recover → verify).
       const rec = await this.callAgent("medic", "recover", death);
       const ok = !!(rec && rec.ok);
-      // Merge over a FRESH read: the medic/plugin may have written state
-      // mid-recovery (e.g. the KILN fence stamp) — don't clobber it with
-      // the snapshot taken at tick start.
-      writeDoctorState(this.dir, {
-        ...readDoctorState(this.dir),
-        lastHandledDeathId: deathId,
-        recoveryAttempts: 1,
-        lastRecoveryAttemptTs: Date.now(),
-        nextRecoveryRetryTs: ok ? 0 : Date.now() + delaysMs[0],
-        recoveryExhausted: false,
-      });
+      writeDoctorState(this.dir, { ...dstate, lastHandledDeathId: deathId, lastRecoveryAttemptTs: Date.now() });
       this.log(`recovery: ${ok ? `ok pid=${rec.pid}` : `FAILED (${rec ? rec.reason : "medic unavailable"})`} crashLoop=${!!(rec && rec.crashLoop)}`);
-      hbDetail = ok ? `recovered pid=${rec ? rec.pid : "?"}` : `recovery FAILED (${rec ? rec.reason : "medic unavailable"})`;
       return {
         healthy: ok,
         death: death || null,
@@ -397,15 +230,6 @@ export class Supervisor {
         crashLoop: !!(rec && rec.crashLoop),
       };
     } finally {
-      // The doctor's own heart: every completed tick proves the loop is
-      // breathing, and peers get a staleness-checked view of each other.
-      const peerProblems = this.checkPeers();
-      if (peerProblems.length) {
-        const names = peerProblems.map((p) => `${p.name} (${p.problem})`).join(", ");
-        hbDetail = hbDetail ? `${hbDetail}; peers: ${names}` : `peers: ${names}`;
-        if (hbStatus === "ok") hbStatus = "degraded";
-      }
-      this.writeHeartbeat(hbStatus, hbDetail);
       releaseTickLock(this.dir);
     }
   }
@@ -465,15 +289,6 @@ export class Supervisor {
       exitCode = 1;
     } else if (!st || !st.up) {
       lines.push(`doctor: ${this.subject} still DOWN after recovery attempt (${st ? st.reason : "watcher unavailable"})`);
-      exitCode = 1;
-    }
-    // A recovery budget that ran out is a human-intervention event: keep it
-    // loud on every check until the subject is healthy again (a healthy
-    // tick clears recoveryExhausted via the fresh deathId / healthy path).
-    const dstateNow = readDoctorState(this.dir);
-    if (dstateNow.recoveryExhausted && !lines.some((l) => l.includes("ALARM"))) {
-      lines.push(`doctor: ALARM — recovery exhausted for ${this.subject} (death ${dstateNow.lastHandledDeathId}), ` +
-        `manual intervention required (${this.logHint})`);
       exitCode = 1;
     }
     return { lines, exitCode };

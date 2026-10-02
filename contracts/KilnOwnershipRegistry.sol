@@ -33,15 +33,9 @@ contract KilnOwnershipRegistry {
         address parent;
     }
 
-    struct LicenseGrant {
-        uint256 permissions;
-        /// @notice 0 means the grant does not expire.
-        uint64 expiresAt;
-    }
-
     mapping(bytes32 => Project) private projects;
     mapping(bytes32 => mapping(address => AgentGrant)) private agentGrants;
-    mapping(bytes32 => mapping(address => LicenseGrant)) private licenseGrants;
+    mapping(bytes32 => mapping(address => uint256)) private licensePermissions;
     /// @notice Per (project, parent agent): the child agents it delegated to.
     mapping(bytes32 => mapping(address => address[])) private delegationChildren;
 
@@ -59,45 +53,15 @@ contract KilnOwnershipRegistry {
     error OwnerConsentRequired();
     error TransferToSelf();
 
-    event ProjectRegistered(
-        bytes32 indexed projectId,
-        address indexed owner,
-        string repositoryUri,
-        bytes32 indexed licenseId,
-        uint64 timestamp
-    );
-    event CommitAnchored(
-        bytes32 indexed projectId,
-        address indexed actor,
-        bytes32 indexed gitCommit,
-        bytes32 treeDigest,
-        bytes32 metadataDigest,
-        uint64 timestamp
-    );
-    event LicenseGranted(
-        bytes32 indexed projectId, address indexed grantee, uint256 permissions, uint64 expiresAt, uint64 timestamp
-    );
-    event LicenseRevoked(bytes32 indexed projectId, address indexed grantee, uint64 timestamp);
-    event AgentAuthorized(
-        bytes32 indexed projectId,
-        address indexed agent,
-        uint256 capabilities,
-        uint64 expiresAt,
-        uint64 authorizationEpoch
-    );
-    event AgentDelegated(
-        bytes32 indexed projectId,
-        address indexed parentAgent,
-        address indexed childAgent,
-        uint256 capabilities,
-        uint64 expiresAt
-    );
+    event ProjectRegistered(bytes32 indexed projectId, address indexed owner, string repositoryUri, bytes32 indexed licenseId, uint64 timestamp);
+    event CommitAnchored(bytes32 indexed projectId, address indexed actor, bytes32 indexed gitCommit, bytes32 treeDigest, bytes32 metadataDigest, uint64 timestamp);
+    event LicenseGranted(bytes32 indexed projectId, address indexed grantee, uint256 permissions, uint64 timestamp);
+    event AgentAuthorized(bytes32 indexed projectId, address indexed agent, uint256 capabilities, uint64 expiresAt, uint64 authorizationEpoch);
+    event AgentDelegated(bytes32 indexed projectId, address indexed parentAgent, address indexed childAgent, uint256 capabilities, uint64 expiresAt);
     event AgentAuthorizationRevoked(bytes32 indexed projectId, address indexed agent);
     event TransferProposed(bytes32 indexed projectId, address indexed currentOwner, address indexed recipient);
     event TransferCancelled(bytes32 indexed projectId, address indexed owner, address indexed recipient);
-    event TransferAccepted(
-        bytes32 indexed projectId, address indexed previousOwner, address indexed newOwner, uint64 authorizationEpoch
-    );
+    event TransferAccepted(bytes32 indexed projectId, address indexed previousOwner, address indexed newOwner, uint64 authorizationEpoch);
 
     modifier projectOwner(bytes32 projectId) {
         if (projects[projectId].owner == address(0)) revert ProjectNotFound();
@@ -105,9 +69,7 @@ contract KilnOwnershipRegistry {
         _;
     }
 
-    function registerProject(bytes32 projectId, string calldata repositoryUri, address owner, bytes32 licenseId)
-        external
-    {
+    function registerProject(bytes32 projectId, string calldata repositoryUri, address owner, bytes32 licenseId) external {
         if (projectId == bytes32(0)) revert InvalidProjectId();
         if (owner == address(0)) revert InvalidOwner();
         if (msg.sender != owner) revert OwnerConsentRequired();
@@ -133,9 +95,7 @@ contract KilnOwnershipRegistry {
         Project storage project = projects[projectId];
         if (project.owner == address(0)) revert ProjectNotFound();
         if (gitCommit == bytes32(0) || treeDigest == bytes32(0)) revert InvalidDigest();
-        if (msg.sender != project.owner && !_hasCapability(projectId, msg.sender, CAP_COMMIT)) {
-            revert NotAuthorizedAgent();
-        }
+        if (msg.sender != project.owner && !_hasCapability(projectId, msg.sender, CAP_COMMIT)) revert NotAuthorizedAgent();
 
         project.latestCommit = gitCommit;
         project.latestTree = treeDigest;
@@ -144,37 +104,22 @@ contract KilnOwnershipRegistry {
         emit CommitAnchored(projectId, msg.sender, gitCommit, treeDigest, metadataDigest, uint64(block.timestamp));
     }
 
-    /// @notice Grant (or replace) a license. `expiresAt` of 0 means the grant
-    /// does not expire; a non-zero expiry must be in the future.
-    function grantLicense(bytes32 projectId, address grantee, uint256 permissions, uint64 expiresAt)
-        external
-        projectOwner(projectId)
-    {
+    function grantLicense(bytes32 projectId, address grantee, uint256 permissions) external projectOwner(projectId) {
         if (grantee == address(0)) revert InvalidOwner();
-        if (expiresAt != 0 && expiresAt <= block.timestamp) revert GrantExpired();
-        licenseGrants[projectId][grantee] = LicenseGrant({permissions: permissions, expiresAt: expiresAt});
-        emit LicenseGranted(projectId, grantee, permissions, expiresAt, uint64(block.timestamp));
+        licensePermissions[projectId][grantee] = permissions;
+        emit LicenseGranted(projectId, grantee, permissions, uint64(block.timestamp));
     }
 
-    /// @notice Revoke a license grant immediately. Revoking a grant that does
-    /// not exist (or has already been revoked) is a no-op with no event.
-    function revokeLicense(bytes32 projectId, address grantee) external projectOwner(projectId) {
-        LicenseGrant storage grant = licenseGrants[projectId][grantee];
-        if (grant.permissions == 0 && grant.expiresAt == 0) return; // nothing granted here
-        delete licenseGrants[projectId][grantee];
-        emit LicenseRevoked(projectId, grantee, uint64(block.timestamp));
-    }
-
-    function authorizeAgent(bytes32 projectId, address agent, uint256 capabilities, uint64 expiresAt)
-        external
-        projectOwner(projectId)
-    {
+    function authorizeAgent(bytes32 projectId, address agent, uint256 capabilities, uint64 expiresAt) external projectOwner(projectId) {
         if (agent == address(0)) revert InvalidOwner();
         if (capabilities == 0 || capabilities & ~CAP_ALL != 0) revert InvalidCapabilities();
         if (expiresAt <= block.timestamp) revert GrantExpired();
         uint64 epoch = projects[projectId].authorizationEpoch;
         agentGrants[projectId][agent] = AgentGrant({
-            capabilities: capabilities, expiresAt: expiresAt, authorizationEpoch: epoch, parent: address(0)
+            capabilities: capabilities,
+            expiresAt: expiresAt,
+            authorizationEpoch: epoch,
+            parent: address(0)
         });
         emit AgentAuthorized(projectId, agent, capabilities, expiresAt, epoch);
     }
@@ -184,7 +129,12 @@ contract KilnOwnershipRegistry {
     /// requested capabilities and expiry must not exceed the caller's.
     /// The child inherits the project's current authorization epoch, so an
     /// ownership transfer invalidates delegated grants too.
-    function delegateGrant(bytes32 projectId, address childAgent, uint256 capabilities, uint64 expiresAt) external {
+    function delegateGrant(
+        bytes32 projectId,
+        address childAgent,
+        uint256 capabilities,
+        uint64 expiresAt
+    ) external {
         if (childAgent == address(0)) revert InvalidOwner();
         if (capabilities == 0 || capabilities & ~CAP_ALL != 0) revert InvalidCapabilities();
         if (!_hasCapability(projectId, msg.sender, CAP_DELEGATE)) revert NotAuthorizedAgent();
@@ -196,14 +146,20 @@ contract KilnOwnershipRegistry {
 
         uint64 epoch = projects[projectId].authorizationEpoch;
         agentGrants[projectId][childAgent] = AgentGrant({
-            capabilities: capabilities, expiresAt: expiresAt, authorizationEpoch: epoch, parent: msg.sender
+            capabilities: capabilities,
+            expiresAt: expiresAt,
+            authorizationEpoch: epoch,
+            parent: msg.sender
         });
         delegationChildren[projectId][msg.sender].push(childAgent);
 
         emit AgentDelegated(projectId, msg.sender, childAgent, capabilities, expiresAt);
     }
 
-    function revokeAuthorization(bytes32 projectId, address agent) external projectOwner(projectId) {
+    function revokeAuthorization(bytes32 projectId, address agent)
+        external
+        projectOwner(projectId)
+    {
         _revokeGrantCascade(projectId, agent);
     }
 
@@ -261,7 +217,8 @@ contract KilnOwnershipRegistry {
         Project storage project = projects[projectId];
         if (project.owner == address(0)) return false;
         AgentGrant memory grant = agentGrants[projectId][agent];
-        return grant.authorizationEpoch == project.authorizationEpoch && grant.expiresAt > block.timestamp
+        return grant.authorizationEpoch == project.authorizationEpoch
+            && grant.expiresAt > block.timestamp
             && grant.capabilities & capability != 0;
     }
 
@@ -274,15 +231,7 @@ contract KilnOwnershipRegistry {
         return agentGrants[projectId][agent];
     }
 
-    /// @notice The permissions currently in force: zero once the grant has
-    /// been revoked or has passed its expiry.
     function getLicensePermissions(bytes32 projectId, address grantee) external view returns (uint256) {
-        LicenseGrant memory grant = licenseGrants[projectId][grantee];
-        if (grant.expiresAt != 0 && grant.expiresAt <= block.timestamp) return 0;
-        return grant.permissions;
-    }
-
-    function getLicenseGrant(bytes32 projectId, address grantee) external view returns (LicenseGrant memory) {
-        return licenseGrants[projectId][grantee];
+        return licensePermissions[projectId][grantee];
     }
 }

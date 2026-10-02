@@ -16,62 +16,9 @@
  *   <dir>/nodes/<nodeId>/receipts.jsonl
  */
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
-import {
-  existsSync, mkdirSync, readFileSync, readdirSync, chmodSync, unlinkSync,
-  openSync, closeSync, writeSync, fsyncSync, renameSync,
-} from "node:fs";
+import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, chmodSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-
-/**
- * Atomic file replacement: write the full payload to a temp file in the
- * SAME directory, fsync it, rename over the target, then fsync the
- * directory (best effort) so the rename itself is durable.
- *
- * This is the ONLY way swarm state files may be written. A plain
- * writeFileSync truncates the target in place: a host write fault (or a
- * kill) mid-write leaves a 0-byte / torn file behind — and a torn state
- * file is not a cosmetic problem here. On 2026-10-23 exactly that zeroed
- * nodes/<wing-research>/node.json, the daemon's boot reconcile threw on
- * JSON.parse(""), and node supervision silently never started while the
- * API kept serving. With tmp+rename a faulted write leaves either the
- * old complete file or the new complete file — never a truncated one.
- *
- * opts.mode: applied at tmp creation AND chmod'd after the rename
- * (creation mode is umask-filtered; the chmod makes it exact, matching
- * the writeKeyFile idiom this replaces).
- *
- * TEST-ONLY fault hook: KILN_ATOMIC_WRITE_FAULT=1 writes half the payload
- * to the temp file and then throws, simulating the host write fault
- * mid-save. Never set in production; exists solely so tests can prove
- * the target survives a faulted save byte-intact.
- */
-export function writeFileAtomicSync(path, data, opts = {}) {
-  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  try {
-    const fd = openSync(tmp, "w", opts.mode ?? 0o666);
-    try {
-      if (process.env.KILN_ATOMIC_WRITE_FAULT === "1") {
-        const half = typeof data === "string" ? data.slice(0, Math.ceil(data.length / 2)) : data.subarray(0, Math.ceil(data.length / 2));
-        writeSync(fd, half);
-        throw new Error("simulated host write fault mid-save (KILN_ATOMIC_WRITE_FAULT)");
-      }
-      writeSync(fd, data);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, path);
-    if (opts.mode) { try { chmodSync(path, opts.mode); } catch { /* best effort */ } }
-    try {
-      const dfd = openSync(dirname(path), "r");
-      try { fsyncSync(dfd); } finally { closeSync(dfd); }
-    } catch { /* directory fsync unsupported here — rename still atomic */ }
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* already renamed or never created */ }
-    throw e;
-  }
-}
 
 export function stateDir() {
   return process.env.KILN_SWARM_DIR || join(homedir(), ".kiln-swarm");
@@ -82,7 +29,7 @@ export function ensureStateDir(dir) {
   mkdirSync(join(dir, "nodes"), { recursive: true });
   const cfg = join(dir, "config.json");
   if (!existsSync(cfg)) {
-    writeFileAtomicSync(
+    writeFileSync(
       cfg,
       JSON.stringify(
         {
@@ -109,7 +56,8 @@ export function ensureStateDir(dir) {
   // Local API bearer token (0600). Minimal honest auth: local-only bind + token.
   const tok = join(dir, "api.token");
   if (!existsSync(tok)) {
-    writeFileAtomicSync(tok, randomBytes(32).toString("hex") + "\n", { mode: 0o600 });
+    writeFileSync(tok, randomBytes(32).toString("hex") + "\n", { mode: 0o600 });
+    try { chmodSync(tok, 0o600); } catch { /* best effort */ }
   }
   return dir;
 }
@@ -135,7 +83,7 @@ export function loadNode(dir, id) {
 }
 
 export function saveNode(dir, record) {
-  writeFileAtomicSync(nodeJsonPath(dir, record.id), JSON.stringify(record, null, 2) + "\n");
+  writeFileSync(nodeJsonPath(dir, record.id), JSON.stringify(record, null, 2) + "\n");
 }
 
 export function listNodeIds(dir) {
@@ -163,7 +111,8 @@ export function resolveNode(dir, idOrName) {
 
 export function writeKeyFile(dir, id, stored) {
   const p = join(nodeDir(dir, id), "key.json");
-  writeFileAtomicSync(p, JSON.stringify(stored, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(p, JSON.stringify(stored, null, 2) + "\n", { mode: 0o600 });
+  try { chmodSync(p, 0o600); } catch { /* best effort */ }
 }
 
 export function loadKeyFile(dir, id) {
@@ -171,9 +120,7 @@ export function loadKeyFile(dir, id) {
 }
 
 export function touchHeartbeat(dir, id) {
-  // Atomic even here: a torn heartbeat reads as "stale since forever"
-  // (heartbeatAgeMs → Infinity) and gets a healthy worker respawned.
-  writeFileAtomicSync(join(nodeDir(dir, id), "heartbeat"), String(Date.now()));
+  writeFileSync(join(nodeDir(dir, id), "heartbeat"), String(Date.now()));
 }
 
 export function heartbeatAgeMs(dir, id) {
@@ -204,102 +151,17 @@ export function pidAlive(pid) {
 /// On non-Linux (/proc unavailable) falls back to trusting pidAlive.
 export function pidIsDaemon(pid, dir) {
   if (!pidAlive(pid)) return false;
-  const r = procCmdline(pid);
-  if (r.status === "vanished") return false; // TOCTOU: died between the checks
-  if (r.status === "unreadable") return pidAlive(pid); // non-Linux fallback
-  const cmd = r.cmd;
-  if (!cmd.includes("daemon.mjs")) return false;
-  // Same script could serve another state dir — check the env marker too.
-  try {
-    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
-    if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
-  } catch { /* environ unreadable — cmdline match is enough */ }
-  return true;
-}
-
-/// True if pid is a live process running a swarm WORKER for `dir` — not a
-/// pid-reuse impostor. kill(pid,0) alone is racy: a dead worker's pid can be
-/// recycled by an unrelated process, which reconcile() would then "adopt" as
-/// a live worker instead of respawning the real one (seen 2026-10-02: a
-/// test daemon inherited a dead app worker's pid; both apps went dark while
-/// the daemon insisted their workers were alive). Mirrors pidIsDaemon,
-/// including its TOCTOU semantics via procCmdline. On non-Linux
-/// (/proc unavailable) falls back to trusting pidAlive.
-///
-/// When `nodeId` is given, the check is per-node: the process's argv must
-/// be `worker.mjs <nodeId>` exactly. The any-worker check alone is NOT
-/// enough — a dead worker's pid recycled by ANOTHER node's worker passes
-/// it, and reconcile() then adopts the stranger as this node's live worker
-/// while the real one never respawns (seen 2026-10-22: ShopStream +
-/// Launchpad app nodes wedged in "starting" ~25 min behind a
-/// sibling-worker pid). Callers that know the node id MUST pass it.
-export function pidIsWorker(pid, dir, nodeId) {
-  if (!pidAlive(pid)) return false;
-  const r = procCmdline(pid);
-  if (r.status === "vanished") return false; // TOCTOU: died between the checks
-  if (r.status === "unreadable") return pidAlive(pid); // non-Linux fallback
-  if (!r.cmd.includes("worker.mjs")) return false;
-  if (nodeId) {
-    const tokens = r.cmd.split(/\s+/);
-    const wi = tokens.findIndex((t) => t.endsWith("worker.mjs"));
-    if (wi < 0 || tokens[wi + 1] !== nodeId) return false;
-  }
-  // Same script could serve another state dir — check the env marker too.
-  try {
-    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
-    if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
-  } catch { /* environ unreadable — cmdline match is enough */ }
-  return true;
-}
-
-/**
- * Read /proc/<pid>/cmdline, distinguishing the three outcomes that matter
- * for pid-identity checks. Never throws.
- *
- *   { status: "ok", cmd }         — process is there and cmdline was read
- *   { status: "vanished" }        — /proc/<pid> is gone (ENOENT): the process
- *                                   died between pidAlive() and this read.
- *                                   This is the TOCTOU window that made
- *                                   pidIsDaemon() return TRUE for a dead pid
- *                                   (its old catch-all returned true), which
- *                                   self-aborted the 2026-10-07T05:30:27Z
- *                                   daemon recovery with "lock held by live
- *                                   pid" while no daemon was running.
- *   { status: "unreadable" }      — /proc itself is unavailable (non-Linux)
- *                                   or the read failed another way; callers
- *                                   fall back to pidAlive().
- */
-export function procCmdline(pid) {
   try {
     const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
-    return { status: "ok", cmd };
-  } catch (e) {
-    if (e.code === "ENOENT" && existsSync("/proc")) return { status: "vanished" };
-    return { status: "unreadable" };
-  }
-}
-
-/**
- * Boot-relative process start identity: "<pid>:<starttime ticks>".
- *
- * A recycled pid gets a NEW starttime, so comparing a recorded startId
- * against the live /proc/<pid>/stat fences pid reuse: the lock and
- * daemon.json can no longer be fooled by an unrelated process that
- * inherited a dead daemon's pid. Returns null when the process is gone
- * or /proc is unavailable.
- */
-export function processStartId(pid) {
-  if (!pid) return null;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // Field 22 (1-based) is starttime in clock ticks since boot. comm may
-    // contain spaces/parens, so split from the last ")".
-    const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
-    const starttime = fields[19]; // fields 3..22 → index 19
-    if (!starttime || !/^\d+$/.test(starttime)) return null;
-    return `${pid}:${starttime}`;
+    if (!cmd.includes("daemon.mjs")) return false;
+    // Same script could serve another state dir — check the env marker too.
+    try {
+      const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+      if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
+    } catch { /* environ unreadable — cmdline match is enough */ }
+    return true;
   } catch {
-    return null;
+    return true; // /proc unavailable: fall back to pidAlive behavior
   }
 }
 
@@ -310,7 +172,7 @@ export function readJobFile(dir, id) {
 }
 
 export function writeJobFile(dir, id, job) {
-  writeFileAtomicSync(join(nodeDir(dir, id), "job.json"), JSON.stringify(job, null, 2) + "\n");
+  writeFileSync(join(nodeDir(dir, id), "job.json"), JSON.stringify(job, null, 2) + "\n");
 }
 
 export function clearJobFile(dir, id) {

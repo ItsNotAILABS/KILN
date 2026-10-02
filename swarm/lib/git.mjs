@@ -6,19 +6,12 @@
  * CGI backend — the git protocol itself is NOT reimplemented here.
  *
  * Auth policy (enforced by the caller, lib/httpapi.mjs):
- *   - repo create, receive-pack (push): operator bearer token required
- *   - repo list, info/refs, upload-pack (clone/fetch) + CI reads: a forge
- *     principal is required (operator token, account session, or agent
- *     token); account principals are owner-scoped to their namespace.
- *     (Changed 2026-10-28 on the architect's rule — only our accounts see
- *     the forge. Reads were public before, which the public tunnel turned
- *     into public-internet read access to every hosted repo.)
+ *   - repo create, receive-pack (push): bearer token required
+ *   - repo list, info/refs, upload-pack (clone/fetch): public
  */
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { writeFileAtomicSync } from "./state.mjs";
 
 export const GIT_BACKEND = "/usr/lib/git-core/git-http-backend";
 
@@ -48,43 +41,12 @@ export function repoExists(dir, owner, repo) {
   }
 }
 
-/**
- * Default author of a repo's initial commit when the caller names no
- * other: the operator identity (the same name/email lib/forge.mjs's
- * actorOf stamps for operator writes). The HTTP create route passes the
- * creating principal's actor explicitly; the CLI's local fallback lands
- * here, which is truthful — the CLI is the operator's own tool.
- */
-export const DEFAULT_REPO_AUTHOR = { name: "KILN Operator", email: "operator@kiln.local" };
-export const INITIAL_COMMIT_MESSAGE = "chore: initialize repository";
-
-/**
- * Validate a repo-relative file path for the initial-commit scaffold:
- * a plain relative path with "/" separators — no leading "/", no
- * backslashes, no "." or ".." segments, nothing git would rewrite.
- * Shared by createRepo's own guard (any caller) and lib/templates.mjs.
- */
-export function validRepoPath(path) {
-  if (typeof path !== "string" || !path || path.length > 512) return false;
-  if (path.startsWith("/") || path.includes("\\") || path.includes("\0")) return false;
-  return path.split("/").every((seg) => seg && seg !== "." && seg !== "..");
-}
-
-export function createRepo(dir, owner, repo, opts = {}) {
+export function createRepo(dir, owner, repo) {
   const p = repoPath(dir, owner, repo); // throws on invalid names
   if (existsSync(p)) {
     const e = new Error(`repo exists: ${owner}/${repo}`);
     e.code = "EXISTS";
     throw e;
-  }
-  const files = opts.files || [];
-  for (const f of files) {
-    if (!f || !validRepoPath(f.path) || typeof f.content !== "string") {
-      throw new Error(`invalid scaffold file (needs a clean relative path + string content): ${f && f.path}`);
-    }
-  }
-  if (new Set(files.map((f) => f.path)).size !== files.length) {
-    throw new Error("scaffold files contain a duplicate path");
   }
   mkdirSync(join(gitRoot(dir), owner), { recursive: true });
   execFileSync("git", ["init", "--bare", "--initial-branch=main", p], { stdio: "ignore" });
@@ -92,83 +54,11 @@ export function createRepo(dir, owner, repo, opts = {}) {
   // http.receivepack is true; KILN enforces its own auth before the
   // backend ever runs, so enabling it here is safe.
   execFileSync("git", ["--git-dir", p, "config", "http.receivepack", "true"], { stdio: "ignore" });
-  writeFileAtomicSync(
+  writeFileSync(
     join(p, "kiln.json"),
     JSON.stringify({ schema: "kiln.git-repo.v1", owner, repo, createdAt: new Date().toISOString() }) + "\n"
   );
-  // Born PR-ready: main starts at an initial commit, authored by the
-  // creating principal, so branch → PR → merge works from minute one
-  // with no client-side seeding. Before this, a new repo had an unborn
-  // main and createPull 404'd until the client hand-pushed a seed
-  // commit. Plumbing only — no worktree.
-  // opts.files ([{path, content}]) scaffolds that initial commit with
-  // real content — the repo-creation templates (lib/templates.mjs:
-  // LICENSE / README / .gitignore / a user template's files) land IN
-  // the initial commit, not a follow-up commit.
-  const author = opts.author && opts.author.name && opts.author.email
-    ? opts.author
-    : DEFAULT_REPO_AUTHOR;
-  const env = {
-    ...process.env,
-    GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email,
-    GIT_COMMITTER_NAME: author.name, GIT_COMMITTER_EMAIL: author.email,
-  };
-  let tree;
-  if (files.length) {
-    // Build the tree through a throwaway index: hash each file into
-    // the object store, cacheinfo it into the temp index, write-tree.
-    // update-index/write-tree create intermediate trees for nested
-    // paths on their own.
-    const indexFile = join(tmpdir(), `kiln-index-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`);
-    const indexEnv = { ...env, GIT_INDEX_FILE: indexFile };
-    try {
-      for (const f of files) {
-        const blob = execFileSync(
-          "git", ["--git-dir", p, "hash-object", "-w", "--stdin"],
-          { input: Buffer.from(f.content, "utf8"), encoding: "utf8" }
-        ).trim();
-        execFileSync(
-          "git", ["--git-dir", p, "update-index", "--add", "--cacheinfo", `100644,${blob},${f.path}`],
-          { env: indexEnv, stdio: "ignore" }
-        );
-      }
-      tree = execFileSync("git", ["--git-dir", p, "write-tree"], { env: indexEnv, encoding: "utf8" }).trim();
-    } finally {
-      try { rmSync(indexFile, { force: true }); } catch { /* best effort */ }
-    }
-  } else {
-    tree = execFileSync("git", ["--git-dir", p, "mktree"], { input: "", encoding: "utf8" }).trim();
-  }
-  const initialCommit = execFileSync(
-    "git",
-    ["--git-dir", p, "commit-tree", tree, "-m", opts.message || INITIAL_COMMIT_MESSAGE],
-    { env, encoding: "utf8" }
-  ).trim();
-  execFileSync("git", ["--git-dir", p, "update-ref", "refs/heads/main", initialCommit], { stdio: "ignore" });
-  return { owner, repo, path: p, initialCommit };
-}
-
-/**
- * Delete a repo outright: the bare git dir (which also carries the
- * repo's kiln.json details and its refs/kiln/memory chain) is removed,
- * so the repo vanishes from listRepos and every existence check at
- * once. Registry state that lives OUTSIDE the bare dir is the caller's
- * cleanup: forge records (lib/forge.mjs forgetRepo) and CI results
- * (lib/ci.mjs forgetRepoCiResults). Workspace/site registries keep
- * their member refs by the codebase's own pattern — their status views
- * already render a missing repo as exists:false, and membership is the
- * workspace owner's explicit edit, never a side effect.
- * Throws an Error with .code "NOT_FOUND" when the repo does not exist.
- */
-export function deleteRepo(dir, owner, repo) {
-  const p = repoPath(dir, owner, repo); // throws on invalid names
-  if (!existsSync(p)) {
-    const e = new Error(`no such repo: ${owner}/${repo}`);
-    e.code = "NOT_FOUND";
-    throw e;
-  }
-  rmSync(p, { recursive: true, force: true });
-  return { owner, repo };
+  return { owner, repo, path: p };
 }
 
 export function listRepos(dir) {

@@ -18,20 +18,6 @@
  *                                 // default: "<dir>/<subject>.log"
  *     courtesyWaitMs: 10000,      // lock-courtesy re-probe wait (default)
  *     verifyWaitMs: 4000,         // post-recover settle before verify (default)
- *     recoveryRetry: { maxAttempts: 8, delaysMs: [...] },
- *                               // bounded retry when a recovery FAILS:
- *                               // attempt 1 is immediate, delaysMs paces
- *                               // attempts 2..N; after the last attempt the
- *                               // doctor raises a LOUD alarm (never silent)
- *
- *     // Peer hearts ("who watches the watchmen? each other") -----------------
- *     // Every tick the doctor writes its own heartbeat to
- *     // <dir>/doctor/heartbeat.json — { agent, pid, ts, ts_epoch, status,
- *     // detail } — and checks each peer's heart file for staleness.
- *     // Missing/stale/unparseable peer hearts are logged as findings.
- *     peers: [
- *       { name: "wraith", heartbeatPath: "/home/user/.wraith/heartbeat.json", maxAgeMs: 90000 },
- *     ],
  *
  *     // The honest health probe -------------------------------------------
  *     // Must answer the REAL question: is the subject alive AND itself AND
@@ -116,32 +102,6 @@ export function validatePlugin(p) {
     fail("verifyWaitMs must be a non-negative number");
   }
   if (p.logHint !== undefined && typeof p.logHint !== "string") fail("logHint must be a string");
-  if (p.recoveryRetry !== undefined) {    if (!p.recoveryRetry || typeof p.recoveryRetry !== "object") fail("recoveryRetry must be an object");
-    if (p.recoveryRetry.maxAttempts !== undefined &&
-        !(Number.isInteger(p.recoveryRetry.maxAttempts) && p.recoveryRetry.maxAttempts >= 1)) {
-      fail("recoveryRetry.maxAttempts must be a positive integer");
-    }
-    if (p.recoveryRetry.delaysMs !== undefined &&
-        !(Array.isArray(p.recoveryRetry.delaysMs) && p.recoveryRetry.delaysMs.every((d) => Number.isFinite(d) && d >= 0))) {
-      fail("recoveryRetry.delaysMs must be an array of non-negative numbers");
-    }
-  }
-  if (p.peers !== undefined) {
-    // Peer-heart watching ("who watches the watchmen? each other").
-    // Each peer: { name, heartbeatPath, maxAgeMs? } — a heart file in the
-    // shared { agent, pid, ts, ts_epoch, status, detail } schema.
-    if (!Array.isArray(p.peers)) fail("peers must be an array of { name, heartbeatPath, maxAgeMs }");
-    p.peers.forEach((peer, i) => {
-      if (!peer || typeof peer !== "object") fail(`peers[${i}] must be an object`);
-      if (typeof peer.name !== "string" || !peer.name) fail(`peers[${i}].name must be a non-empty string`);
-      if (typeof peer.heartbeatPath !== "string" || !peer.heartbeatPath) {
-        fail(`peers[${i}].heartbeatPath must be a non-empty string`);
-      }
-      if (peer.maxAgeMs !== undefined && !(Number.isFinite(peer.maxAgeMs) && peer.maxAgeMs > 0)) {
-        fail(`peers[${i}].maxAgeMs must be a positive number`);
-      }
-    });
-  }
   return p;
 }
 
