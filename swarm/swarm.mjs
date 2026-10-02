@@ -4,6 +4,7 @@
  *
  *   swarm.mjs init [--dir PATH]
  *   swarm.mjs daemon start|stop|status|token|watchdog [--dir PATH]
+ *   swarm.mjs doctor start|stop|status|report|check [--dir PATH]
  *   swarm.mjs node spawn --name N --caps CAPS --ttl SEC [--repo PATH] [--mind script|http]
  *                        [--policy never|on-failure|always] [--max-restarts N] [--dir PATH]
  *   swarm.mjs node list [--dir PATH]
@@ -32,6 +33,10 @@ import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
 import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
+import {
+  doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
+  daemonHealth, readJournal, diagnose, doctorDir,
+} from "./lib/doctor.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -192,6 +197,52 @@ async function cmdDaemon(args) {
   } else if (sub === "token") {
     console.log(loadApiToken(dir));
   } else { console.error("usage: daemon start|stop|status|token|watchdog"); process.exit(2); }
+}
+
+// ---------------------------------------------------------------- doctor
+
+async function cmdDoctor(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  if (sub === "_run") { await doctorRun(dir); return; } // detached loop; not for humans
+  if (sub === "start") {
+    const r = doctorStart(dir);
+    console.log(r.already ? `doctor already running pid=${r.pid}` : `doctor starting pid=${r.pid} dir=${dir}`);
+  } else if (sub === "stop") {
+    const r = doctorStop(dir);
+    console.log(r.stopped ? `doctor stop signaled pid=${r.pid}` : `doctor not running (${r.reason})`);
+  } else if (sub === "status") {
+    const alive = doctorAlive(dir);
+    let since = "";
+    try {
+      const d = JSON.parse(readFileSync(join(doctorDir(dir), "doctor.json"), "utf8"));
+      since = d.startedAt ? ` since ${d.startedAt}` : "";
+    } catch { /* no pidfile */ }
+    console.log(alive ? `doctor: running${since}` : "doctor: not running");
+    const st = await daemonHealth(dir);
+    console.log(st.up ? `daemon: running pid=${st.pid} since ${st.startedAt}` : `daemon: DOWN (${st.reason})`);
+    const deaths = readJournal(dir).filter((e) => e.type === "death");
+    const last = deaths.length ? deaths[deaths.length - 1].ts : null;
+    console.log(`deaths recorded: ${deaths.length}${last ? ` (last ${last})` : ""}`);
+    if (!alive) process.exit(1);
+  } else if (sub === "report") {
+    const dg = diagnose(dir);
+    const events = readJournal(dir);
+    const deaths = events.filter((e) => e.type === "death");
+    console.log(`doctor report for ${dir}`);
+    console.log(`journal: ${events.length} events, ${deaths.length} deaths`);
+    for (const e of deaths.slice(-5)) {
+      console.log(`  death ${e.ts} pid=${e.pid ?? "?"} uptime=${e.uptimeSec ?? "?"}s mem=${e.memAvailableMb ?? "?"}MB stale=[${(e.preDeathStaleWorkers || []).join(",")}]`);
+      console.log(`        reason: ${e.reason}`);
+    }
+    console.log(`diagnosis: ${dg.verdict}`);
+    console.log(dg.hypothesis);
+  } else if (sub === "check") {
+    const { lines, exitCode } = await doctorCheck(dir);
+    for (const l of lines) console.log(l);
+    if (exitCode !== 0) process.exit(1);
+  } else { console.error("usage: doctor start|stop|status|report|check"); process.exit(2); }
 }
 
 // ---------------------------------------------------------------- node
@@ -554,13 +605,14 @@ const cmd = args._[0];
 try {
   if (cmd === "init") cmdInit(args);
   else if (cmd === "daemon") await cmdDaemon(args);
+  else if (cmd === "doctor") await cmdDoctor(args);
   else if (cmd === "node") await cmdNode(args);
   else if (cmd === "job") cmdJob(args);
   else if (cmd === "compute") await cmdCompute(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|node|job|compute|receipts|repo");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo");
     process.exit(2);
   }
 } catch (e) {
