@@ -55,6 +55,9 @@ import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import {
+  snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
+} from "./ci.mjs";
+import {
   ComputeError, submitInvocation, getInvocation, waitInvocation,
   submitMap, getMap, deployApp, listApps, appStatus, appLogs, undeployApp,
   getCapacity,
@@ -182,6 +185,21 @@ export function startApiServer(dir, cfg) {
       if (req.method === "GET" && path === "/git") {
         return send(res, 200, { repos: listRepos(dir) });
       }
+      // CI status, GitHub commit-status style — public, like clone/fetch.
+      {
+        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/ci\/(status|latest)(?:\/([0-9a-f]{4,40}))?$/);
+        if (req.method === "GET" && m) {
+          const owner = m[1], repo = m[2], which = m[3], sha = m[4] || null;
+          if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
+            return send(res, 404, { error: "no such repo" });
+          }
+          const doc = which === "status"
+            ? (sha ? readResult(dir, owner, repo, sha) : null)
+            : readLatest(dir, owner, repo, url.searchParams.get("branch") || undefined);
+          if (!doc) return send(res, 404, { error: "no CI result" });
+          return send(res, 200, doc);
+        }
+      }
       // gitReceive is set for receive-pack; served after the auth gate below.
       // NOTE: only paths WITH a trailing smart-http segment are intercepted
       // here; bare /git/:owner/:repo (repo create) falls through to auth.
@@ -216,7 +234,25 @@ export function startApiServer(dir, cfg) {
       // Authenticated push path — the token was verified BEFORE the backend
       // runs, so an unauthenticated push never reaches git at all.
       if (gitReceive) {
+        // CI: snapshot refs before the receive-pack so we can diff after and
+        // enqueue verification for exactly the branches that moved. CI is
+        // strictly best-effort — it must never break or slow the push.
+        let refsBefore = null;
+        try { refsBefore = snapshotRefs(dir, gitReceive.owner, gitReceive.repo); } catch {}
         await serveGitHttp(dir, req, res);
+        try {
+          const refsAfter = snapshotRefs(dir, gitReceive.owner, gitReceive.repo);
+          const cfg = loadRepoConfig(dir);
+          const key = `${gitReceive.owner}/${gitReceive.repo}`;
+          if (refsBefore && cfg[key] && cfg[key].command) {
+            for (const [ref, sha] of Object.entries(refsAfter)) {
+              if (!ref.startsWith("refs/heads/")) continue;
+              if (refsBefore[ref] !== sha) {
+                enqueueCiJob(dir, { owner: gitReceive.owner, repo: gitReceive.repo, ref, sha });
+              }
+            }
+          }
+        } catch (e) { plog(`ci enqueue failed (non-fatal): ${e.message}`); }
         return;
       }
 

@@ -1,0 +1,12 @@
+{
+  "auro/minutely": {
+    "command": "/home/hatch/workspace/venvs/maque/bin/python -m pytest maque/tests -q",
+    "timeoutMs": 180000,
+    "note": "MAQUE ledger/card test suite — 128 tests, <5s"
+  },
+  "auro/capsulabuilder": {
+    "command": "/home/hatch/workspace/venvs/itsnotai/bin/python -m pytest engine/tests -q",
+    "timeoutMs": 600000,
+    "note": "Quant/wallet engine tests — ~80s; test_company_os_commercial currently fails (pre-existing)"
+  }
+}

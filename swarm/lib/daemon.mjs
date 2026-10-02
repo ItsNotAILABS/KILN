@@ -53,6 +53,30 @@ function logTerminalOnce(key, msg) {
   log(msg);
 }
 
+/**
+ * Stale-heartbeat spam control: reconcile() runs every tick (~2s), and each
+ * stale worker used to log a line per tick — ~25k lines/day of noise that
+ * buries real forensics. Log the first sighting per worker per daemon
+ * lifetime, then one summary line at most every 10 minutes while any remain
+ * stale.
+ */
+const staleFirstSeen = new Set();
+let lastStaleSummaryMs = 0;
+const STALE_SUMMARY_MS = 10 * 60 * 1000;
+function logStaleHeartbeat(node) {
+  if (!staleFirstSeen.has(node.id)) {
+    staleFirstSeen.add(node.id);
+    log(`node ${node.name}: worker pid ${node.workerPid} alive but heartbeat stale (further sightings summarized every 10m)`);
+  }
+}
+function logStaleSummary(staleNodes) {
+  const nowMs = Date.now();
+  if (!staleNodes.length) return;
+  if (nowMs - lastStaleSummaryMs < STALE_SUMMARY_MS) return;
+  lastStaleSummaryMs = nowMs;
+  log(`stale heartbeats: ${staleNodes.length} worker(s): ${staleNodes.map((n) => n.name).join(", ")}`);
+}
+
 function lockPath(dir) { return join(dir, "daemon.lock"); }
 function daemonJsonPath(dir) { return join(dir, "daemon.json"); }
 
@@ -110,12 +134,13 @@ function nodeStatus(dir, cfg, node) {
 }
 
 function reconcile(dir, cfg) {
+  const staleNodes = [];
   for (const id of listNodeIds(dir)) {
     const node = loadNode(dir, id);
     if (!node.autostart) continue;
     const st = nodeStatus(dir, cfg, node);
     if (st === "idle" || st === "working" || st === "stale") {
-      if (st === "stale") log(`node ${node.name}: worker pid ${node.workerPid} alive but heartbeat stale`);
+      if (st === "stale") { logStaleHeartbeat(node); staleNodes.push(node); }
       continue; // live worker (or at least a live pid) — adopt it
     }
     // dead worker: respawn per policy
@@ -130,6 +155,7 @@ function reconcile(dir, cfg) {
     saveNode(dir, node);
     spawnWorker(dir, id);
   }
+  logStaleSummary(staleNodes);
 }
 
 function reapExited(dir) {
@@ -351,6 +377,20 @@ async function main() {
   };
   process.on("SIGTERM", onStop);
   process.on("SIGINT", onStop);
+  // Crash forensics: SIGHUP/SIGQUIT/SIGABRT kill silently by default, and a
+  // silent death is indistinguishable from SIGKILL/OOM without a witness.
+  // Trap them loudly with distinct exit codes so the coroner can tell a
+  // signal death from an external vanish. (SIGKILL cannot be trapped: if a
+  // future death still logs nothing, the killer is SIGKILL-class — host
+  // reaper or OOM without a dmesg trace.)
+  for (const sig of ["SIGHUP", "SIGQUIT", "SIGABRT"]) {
+    try {
+      process.on(sig, () => {
+        try { writeSync(2, `[daemon ${new Date().toISOString()}] GOT ${sig} — exiting\n`); } catch {}
+        process.exit(128);
+      });
+    } catch { /* signal unsupported on this platform */ }
+  }
   // Never die silently: an uncaught exception in a tick would otherwise kill
   // the daemon with no explanation in the log (see ticket E2). Log it loudly
   // and keep supervising — the workers are persistent and depend on us.
