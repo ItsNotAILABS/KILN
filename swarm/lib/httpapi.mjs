@@ -38,29 +38,6 @@
  *   GET  /git/:owner/:repo/info/refs?service=...   (public)
  *   POST /git/:owner/:repo/git-upload-pack          (public — clone/fetch)
  *   POST /git/:owner/:repo/git-receive-pack         (auth required — push)
- * Promotion (KILN-native repos -> GitHub, Git Data API rebuild):
- *   POST /v1/promote                {repo:"owner/repo", github?:"owner/repo",
- *                                    branch?, rebase?, force?} -> receipt
- * Per-repo memory (auth required; memory lives on refs/kiln/memory):
- *   POST /git/:owner/:repo/memory/episodes   {content, title?, tags?, …} -> {event}
- *   POST /git/:owner/:repo/memory/facts      {subject, predicate, object, sourceEpisodes[]} -> {fact}
- *   POST /git/:owner/:repo/memory/supersede  {fact, reason?}
- *   POST /git/:owner/:repo/memory/links      {from, to, relation}
- *   POST /git/:owner/:repo/memory/core       {label, value, description?}
- *   GET  /git/:owner/:repo/memory/core|facts|recall|context|stats
- *   POST /git/:owner/:repo/memory/verify     -> {ok, events, commits}
- *   GET  /memory/recall?q=…                  cross-repo recall (phase 6):
- *                                    fused hits with per-repo provenance;
- *                                    unverifiable chains excluded + named
- * Sites (first-class sites: frontend repo + backend repo + artifact + app):
- *   POST /v1/sites                  {name, frontend:"o/r", backend:"o/r",
- *                                    artifact?, computeApp?} -> {ok, site}
- *                                    (also writes linkage core blocks into
- *                                    both repos' KILN Memory on create)
- *   GET  /v1/sites                  -> {sites:[...]} (registry records)
- *   GET  /v1/sites/:id              -> aggregated live status (repo HEADs,
- *                                    compute app status, memory linkage)
- *   DELETE /v1/sites/:id            -> {ok:true, id} (registry entry only)
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -77,15 +54,8 @@ import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
-import { promoteRepo } from "./promote.mjs";
 import {
-  remember, assertFact, supersedeFact, linkMemories, setCore,
-  proposeMemory, resolveProposal,
-  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory, agentAwareness,
-} from "./memory.mjs";
-import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
-import {
-  snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest, readLog,
+  snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
 } from "./ci.mjs";
 import {
   ComputeError, submitInvocation, getInvocation, waitInvocation,
@@ -96,9 +66,6 @@ import {
   withPreview, enablePreview, disablePreview, teardownPreview,
   startPreviewReconciler,
 } from "./preview.mjs";
-import {
-  SitesError, createSite, listSites, deleteSite, siteStatus,
-} from "./sites.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -219,24 +186,12 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, { repos: listRepos(dir) });
       }
       // CI status, GitHub commit-status style — public, like clone/fetch.
-      // ci/log/:sha serves the run's retained FULL log as text/plain
-      // (the status doc's logTail is only the last 120 lines).
       {
-        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/ci\/(status|latest|log)(?:\/([0-9a-f]{4,40}))?$/);
+        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/ci\/(status|latest)(?:\/([0-9a-f]{4,40}))?$/);
         if (req.method === "GET" && m) {
           const owner = m[1], repo = m[2], which = m[3], sha = m[4] || null;
           if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
             return send(res, 404, { error: "no such repo" });
-          }
-          if (which === "log") {
-            const text = sha ? readLog(dir, owner, repo, sha) : null;
-            if (text === null) return send(res, 404, { error: "no CI log" });
-            res.writeHead(200, {
-              "content-type": "text/plain; charset=utf-8",
-              "content-length": Buffer.byteLength(text),
-            });
-            res.end(text);
-            return;
           }
           const doc = which === "status"
             ? (sha ? readResult(dir, owner, repo, sha) : null)
@@ -249,16 +204,10 @@ export function startApiServer(dir, cfg) {
       // NOTE: only paths WITH a trailing smart-http segment are intercepted
       // here; bare /git/:owner/:repo (repo create) falls through to auth.
       let gitReceive = null;
-      let memoryRoute = null;
       {
         const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(\/.*)?$/);
         if (m && m[3]) {
           const owner = m[1], repo = m[2], rest = m[3] || "";
-          // Memory routes live under /git/:owner/:repo/memory/* but are
-          // NOT git protocol — hold them for the auth gate below.
-          if (rest === "/memory" || rest.startsWith("/memory/")) {
-            memoryRoute = { owner, repo, rest };
-          } else {
           const kind =
             req.method === "GET" && rest === "/info/refs" ? "smart"
             : req.method === "POST" && rest === "/git-upload-pack" ? "smart"
@@ -273,7 +222,6 @@ export function startApiServer(dir, cfg) {
           } else {
             await serveGitHttp(dir, req, res);
             return;
-          }
           }
         }
       }
@@ -306,132 +254,6 @@ export function startApiServer(dir, cfg) {
           }
         } catch (e) { plog(`ci enqueue failed (non-fatal): ${e.message}`); }
         return;
-      }
-
-      // ---- cross-repo memory recall (phase 6; authenticated) ----
-      // Read-time fan-out over every repo chain in the state dir;
-      // unverifiable chains are excluded and named in the envelope.
-      if (req.method === "GET" && path === "/memory/recall") {
-        try {
-          const r = recallCrossRepo(dir, url.searchParams.get("q") || "", {
-            limit: parseInt(url.searchParams.get("limit") || "10", 10) || 10,
-            kinds: (url.searchParams.get("kinds") || "").split(",").filter(Boolean),
-            tags: (url.searchParams.get("tags") || "").split(",").filter(Boolean),
-            asOf: url.searchParams.get("asOf") || undefined,
-            since: url.searchParams.get("since") || undefined,
-            until: url.searchParams.get("until") || undefined,
-            includeSuperseded: url.searchParams.get("includeSuperseded") === "1",
-          });
-          return send(res, 200, r);
-        } catch (e) {
-          return send(res, 400, { error: e.message });
-        }
-      }
-
-      // ---- per-repo memory (authenticated; held from the git block above) ----
-      if (memoryRoute) {
-        const { owner, repo, rest } = memoryRoute;
-        if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
-          return send(res, 404, { error: "no such repo" });
-        }
-        try {
-          if (req.method === "POST" && rest === "/memory/episodes") {
-            const b = await readBody(req);
-            const r = remember(dir, owner, repo, b);
-            return send(res, 201, { ok: true, event: r.event, commit: r.commit });
-          }
-          if (req.method === "POST" && rest === "/memory/facts") {
-            const b = await readBody(req);
-            const r = assertFact(dir, owner, repo, b);
-            return send(res, 201, { ok: true, event: r.event, fact: r.event, commit: r.commit });
-          }
-          if (req.method === "POST" && rest === "/memory/supersede") {
-            const b = await readBody(req);
-            const r = supersedeFact(dir, owner, repo, b);
-            return send(res, 201, { ok: true, event: r.event, commit: r.commit });
-          }
-          if (req.method === "POST" && rest === "/memory/links") {
-            const b = await readBody(req);
-            const r = linkMemories(dir, owner, repo, b);
-            return send(res, 201, { ok: true, event: r.event, commit: r.commit });
-          }
-          if (req.method === "POST" && rest === "/memory/core") {
-            const b = await readBody(req);
-            const r = setCore(dir, owner, repo, b);
-            return send(res, 201, { ok: true, event: r.event, commit: r.commit });
-          }
-          if (req.method === "GET" && rest === "/memory/core") {
-            return send(res, 200, { core: loadMemory(dir, owner, repo).core });
-          }
-          if (req.method === "GET" && rest === "/memory/facts") {
-            const st = loadMemory(dir, owner, repo);
-            const asOf = url.searchParams.get("asOf")
-              ? Math.floor(Date.parse(url.searchParams.get("asOf")) / 1000)
-              : Math.floor(Date.now() / 1000);
-            const facts = factsAt(st, asOf, url.searchParams.get("includeSuperseded") === "1");
-            return send(res, 200, { facts });
-          }
-          if (req.method === "GET" && rest === "/memory/recall") {
-            const q = url.searchParams.get("q") || "";
-            const r = recall(dir, owner, repo, q, {
-              limit: parseInt(url.searchParams.get("limit") || "10", 10) || 10,
-              kinds: (url.searchParams.get("kinds") || "").split(",").filter(Boolean),
-              tags: (url.searchParams.get("tags") || "").split(",").filter(Boolean),
-              asOf: url.searchParams.get("asOf") || undefined,
-              includeSuperseded: url.searchParams.get("includeSuperseded") === "1",
-            });
-            return send(res, 200, r);
-          }
-          if (req.method === "GET" && rest === "/memory/context") {
-            const pack = buildContext(dir, owner, repo, {
-              query: url.searchParams.get("q") || undefined,
-              budgetTokens: parseInt(url.searchParams.get("budget") || "4000", 10) || 4000,
-              asOf: url.searchParams.get("asOf") || undefined,
-            });
-            return send(res, 200, pack);
-          }
-          if (req.method === "GET" && rest === "/memory/sit") {
-            const brief = agentAwareness(dir, owner, repo, {
-              query: url.searchParams.get("q") || undefined,
-              budgetTokens: parseInt(url.searchParams.get("budget") || "1200", 10) || 1200,
-              asOf: url.searchParams.get("asOf") || undefined,
-            });
-            return send(res, 200, brief);
-          }
-          if (req.method === "POST" && rest === "/memory/propose") {
-            const b = await readBody(req);
-            const r = proposeMemory(dir, owner, repo, b);
-            return send(res, 201, { ok: true, event: r.event, proposal: r.event, commit: r.commit });
-          }
-          if (req.method === "GET" && rest === "/memory/proposals") {
-            const st = loadMemory(dir, owner, repo);
-            const want = url.searchParams.get("status");
-            const proposals = want ? st.proposals.filter((x) => x.status === want) : st.proposals;
-            return send(res, 200, { proposals });
-          }
-          if (req.method === "POST" && rest === "/memory/proposals/resolve") {
-            const b = await readBody(req);
-            const r = resolveProposal(dir, owner, repo, b);
-            return send(res, 200, { ok: true, proposal: r.proposal, decision: r.decision, materialized: r.materialized, statusEvent: r.statusEvent, commit: r.commit });
-          }
-          if (req.method === "GET" && rest === "/memory/stats") {
-            return send(res, 200, memoryStats(dir, owner, repo));
-          }
-          if (req.method === "POST" && rest === "/memory/verify") {
-            return send(res, 200, verifyMemory(dir, owner, repo));
-          }
-          if (req.method === "GET" && rest === "/memory/pubkey") {
-            // Phase 2 discovery: the state dir's memory signing key
-            // (public half) + this repo's signature posture. Creates
-            // the key on first use, like a first write would.
-            const pub = memorySigningPubkey(dir, { create: true });
-            const st = loadMemory(dir, owner, repo);
-            return send(res, 200, { ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) });
-          }
-          return send(res, 404, { error: "not found" });
-        } catch (e) {
-          return send(res, 400, { error: e.message });
-        }
       }
 
       // ---- git repo create ----
@@ -551,40 +373,6 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, { results, allOk: results.every((r) => r.ok) });
       }
 
-      // ---- promote: KILN repo -> GitHub (receipt semantics, never throws) ----
-      if (req.method === "POST" && path === "/v1/promote") {
-        const b = await readBody(req);
-        const splitTarget = (s) => {
-          if (typeof s !== "string") return null;
-          const i = s.indexOf("/");
-          if (i <= 0 || i === s.length - 1) return null;
-          return [s.slice(0, i), s.slice(i + 1)];
-        };
-        const repoParts = splitTarget(b.repo);
-        if (!repoParts) return send(res, 400, { error: "repo must be 'owner/repo'" });
-        let githubOwner, githubRepo;
-        if (b.github !== undefined) {
-          const ghParts = splitTarget(b.github);
-          if (!ghParts) return send(res, 400, { error: "github must be 'owner/repo'" });
-          [githubOwner, githubRepo] = ghParts;
-        }
-        const receipt = await promoteRepo(dir, repoParts[0], repoParts[1], {
-          githubOwner,
-          githubRepo,
-          branch: b.branch ? String(b.branch) : undefined,
-          rebase: !!b.rebase,
-          force: !!b.force,
-        });
-        const status = receipt.ok ? 200
-          : receipt.error.stage === "repo_not_found" || receipt.error.stage === "github_repo_not_found" ? 404
-          : receipt.error.stage === "no_target" || receipt.error.stage === "bad_target" ? 400
-          : receipt.error.stage === "not_fast_forward" || receipt.error.stage === "rebase_needs_root" ? 409
-          : receipt.error.stage === "no_github_credential" ? 412
-          : receipt.error.stage.startsWith("github_") ? 502
-          : 500;
-        return send(res, status, receipt);
-      }
-
       // ---- compute: serverless functions ----
       if (req.method === "POST" && path === "/v1/compute/invoke") {
         const b = await readBody(req);
@@ -648,7 +436,7 @@ export function startApiServer(dir, cfg) {
         const b = await readBody(req);
         const r = await deployApp(dir, {
           name: b.name, repo: b.repo, command: b.command,
-          args: b.args, env: b.env, port: b.port, memoryMB: b.memoryMB,
+          args: b.args, env: b.env, port: b.port,
         });
         if (b.public) {
           // Caffeine-style: public:true auto-enables preview on deploy.
@@ -695,43 +483,6 @@ export function startApiServer(dir, cfg) {
         if (req.method === "DELETE" && m) {
           await teardownPreview(dir, cfg, m[1], plog);
           return send(res, 200, undeployApp(dir, m[1]));
-        }
-      }
-
-      // ---- sites: frontend repo + backend repo + artifact + compute app ----
-      if (req.method === "POST" && path === "/v1/sites") {
-        const b = await readBody(req);
-        try {
-          const site = createSite(dir, {
-            name: b.name, frontend: b.frontend, backend: b.backend,
-            artifact: b.artifact, computeApp: b.computeApp, actor: "api",
-          });
-          return send(res, 201, { ok: true, site });
-        } catch (e) {
-          if (e instanceof SitesError) return send(res, e.status, { error: e.message });
-          throw e;
-        }
-      }
-      if (req.method === "GET" && path === "/v1/sites") {
-        return send(res, 200, { sites: listSites(dir) });
-      }
-      {
-        const m = path.match(/^\/v1\/sites\/([A-Za-z0-9_.-]+)$/);
-        if (req.method === "GET" && m) {
-          try {
-            return send(res, 200, await siteStatus(dir, m[1]));
-          } catch (e) {
-            if (e instanceof SitesError) return send(res, e.status, { error: e.message });
-            throw e;
-          }
-        }
-        if (req.method === "DELETE" && m) {
-          try {
-            return send(res, 200, deleteSite(dir, m[1]));
-          } catch (e) {
-            if (e instanceof SitesError) return send(res, e.status, { error: e.message });
-            throw e;
-          }
         }
       }
 

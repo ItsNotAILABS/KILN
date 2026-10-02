@@ -61,6 +61,11 @@ export function diagnose(dir) {
   const tickAges = deaths.map((e) => e.lastTickAgeMs).filter((a) => Number.isFinite(a));
   const recentTickAgeMs = tickAges.length ? tickAges[tickAges.length - 1] : null;
   const wedgeConfirmed = Number.isFinite(recentTickAgeMs) && recentTickAgeMs > WEDGE_CONFIRM_MS;
+  // The silent-vanish check: a healthy tick seconds before detection means
+  // the supervised loop did NOT wedge — the process was terminated from
+  // outside with no fatal log line. Distinct from OOM (checked separately).
+  const SILENT_VANISH_MS = 30000;
+  const silentVanish = Number.isFinite(recentTickAgeMs) && recentTickAgeMs < SILENT_VANISH_MS && oomDeaths.length === 0;
 
   const parts = [];
   parts.push(`${deaths.length} deaths recorded; median interval ${fmtDur(medianIntervalMs)}.`);
@@ -79,10 +84,15 @@ export function diagnose(dir) {
   if (Number.isFinite(recentTickAgeMs)) {
     parts.push(`The most recent death's last completed tick was ${fmtDur(recentTickAgeMs)} before the death was detected.`);
   }
+  if (silentVanish) {
+    parts.push(`Silent-vanish signature: healthy tick ${fmtDur(recentTickAgeMs)} before detection, no OOM evidence, no fatal log line — the loop did not wedge, the process was terminated externally.`);
+  }
 
   let lead;
   if (wedgeConfirmed) {
     lead = `Leading hypothesis: the wedge is CONFIRMED — last completed tick was ${fmtDur(recentTickAgeMs)} before death — the supervised loop wedged. Recommend: instrument tick duration and add an internal self-abort when ticks stall.`;
+  } else if (silentVanish) {
+    lead = `Leading hypothesis: external SIGKILL-class termination — the most recent death's last completed tick was ${fmtDur(recentTickAgeMs)} before detection (loop healthy), no OOM evidence, no fatal log line. The daemon now traps SIGHUP/SIGQUIT/SIGABRT loudly: if the next death still logs nothing, the killer is untrappable (SIGKILL) — audit host-level process management / runtime reaping. Recommend: check hosting-layer OOM and process-lifetime policies.`;
   } else if (oomDeaths.length > 0) {
     lead = "Leading hypothesis: the OOM killer is terminating the subject under memory pressure. Recommend: raise host memory or cap worker concurrency, then watch whether deaths stop.";
   } else if (staleFrac >= 2 / 3) {
