@@ -23,13 +23,12 @@
  */
 import { spawn } from "node:child_process";
 import {
-  openSync, closeSync, readFileSync, unlinkSync,
+  openSync, closeSync, readFileSync, writeFileSync, unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  pidAlive, pidIsDaemon, procCmdline, heartbeatAgeMs, listNodeIds, loadNode, loadApiToken,
-  writeFileAtomicSync,
+  pidAlive, pidIsDaemon, heartbeatAgeMs, listNodeIds, loadNode, loadApiToken,
 } from "./state.mjs";
 import { Supervisor } from "./doctor-core/supervisor.mjs";
 import { diagnose } from "./doctor-core/detective.mjs";
@@ -42,7 +41,6 @@ import {
   acquireExclusive,
   readDoctorJson,
   readDoctorState,
-  writeDoctorState,
   deathsDir,
   tailLines,
   memAvailableMb,
@@ -92,11 +90,7 @@ export async function daemonHealth(dir) {
       headers: token ? { authorization: `Bearer ${token}` } : {},
       signal: AbortSignal.timeout(5000),
     });
-    if (res.ok) {
-      const fenced = fenceCheck(dir, d);
-      if (fenced) return { up: false, pid: d.pid, startedAt: d.startedAt, reason: fenced };
-      return { up: true, pid: d.pid, startedAt: d.startedAt, apiUrl };
-    }
+    if (res.ok) return { up: true, pid: d.pid, startedAt: d.startedAt, apiUrl };
     return { up: false, pid: d.pid, startedAt: d.startedAt, reason: `pid ${d.pid} alive but API returned HTTP ${res.status}` };
   } catch {
     return { up: false, pid: d.pid, startedAt: d.startedAt, reason: `pid ${d.pid} alive but API not responding at ${apiUrl}` };
@@ -224,25 +218,7 @@ function kilnPlugin(dir) {
       const lk = lockState(d || dir);
       return { held: lk.held, stale: lk.stale, live: lk.liveDaemon };
     },
-    recover: async (d) => {
-      const t0 = Date.now();
-      const res = await kilnRecover(d || dir);
-      if (res.ok) {
-        // The watchdog has exited; give the fresh daemon a beat to write
-        // daemon.json, then stamp the recovery fence so out-of-band starts
-        // are fenced from now on.
-        const tdir = d || dir;
-        for (let i = 0; i < 20; i++) {
-          const dj = daemonJson(tdir);
-          if (dj && dj.bootId && Date.parse(dj.startedAt || 0) >= t0 - 1000) {
-            stampFence(tdir);
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 250));
-        }
-      }
-      return res;
-    },
+    recover: (d) => kilnRecover(d || dir),
   };
 }
 
@@ -251,50 +227,17 @@ function kilnPlugin(dir) {
 /** True if pid is a live doctor loop for this state dir (pid-reuse safe). */
 export function pidIsDoctor(pid, dir) {
   if (!pidAlive(pid)) return false;
-  const r = procCmdline(pid);
-  if (r.status === "vanished") return false; // TOCTOU: died between the checks
-  if (r.status === "unreadable") return pidAlive(pid); // /proc unavailable: fall back
-  const cmd = r.cmd;
-  if (!cmd.includes("swarm.mjs") || !cmd.includes("doctor")) return false;
   try {
-    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
-    if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
-  } catch { /* environ unreadable — cmdline match is enough */ }
-  return true;
-}
-
-// ---------------------------------------------------------------- single recovery authority + fencing (Grade 0)
-//
-// The doctor supervisor is the ONLY authority that may (re)start the daemon
-// for a state dir: supervision ticks are serialized by the doctor tick lock
-// and the medic is the only code path that restarts the daemon. To fence
-// out-of-band starts (a human or another tool launching daemon.mjs by hand),
-// every doctor-driven recovery stamps the fresh daemon's bootId into doctor
-// state as expectedBootId. daemonHealth() then reports a RUNNING daemon
-// whose bootId does not match as DOWN ("fenced"), so the next tick restarts
-// it through the authority instead of adopting a stranger.
-
-/** Stamp the recovery fence after a doctor-driven recovery. */
-function stampFence(dir) {
-  const d = daemonJson(dir);
-  if (!d || !d.bootId) return;
-  const st = readDoctorState(dir);
-  writeDoctorState(dir, { ...st, expectedBootId: d.bootId, expectedStartId: d.startId ?? null });
-}
-
-/**
- * Fence check for a daemon that otherwise looks alive. Returns a reason
- * string when the daemon was started outside the recovery authority, or
- * null when the fence passes (or is not yet established / not applicable).
- */
-function fenceCheck(dir, d) {
-  const st = readDoctorState(dir);
-  if (!st || !st.expectedBootId) return null; // fence not yet established
-  if (!d.bootId) return null; // daemon.json predates fencing — grandfathered
-  if (d.bootId !== st.expectedBootId) {
-    return `fenced: daemon bootId ${d.bootId} != recovery authority's ${st.expectedBootId} — started outside the doctor`;
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    if (!cmd.includes("swarm.mjs") || !cmd.includes("doctor")) return false;
+    try {
+      const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+      if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
+    } catch { /* environ unreadable — cmdline match is enough */ }
+    return true;
+  } catch {
+    return pidAlive(pid); // /proc unavailable: fall back
   }
-  return null;
 }
 
 class KilnSupervisor extends Supervisor {
@@ -325,7 +268,7 @@ class KilnSupervisor extends Supervisor {
     });
     child.unref();
     closeSync(out);
-    writeFileAtomicSync(doctorJsonPath(this.dir), JSON.stringify({
+    writeFileSync(doctorJsonPath(this.dir), JSON.stringify({
       pid: child.pid,
       startedAt: new Date().toISOString(),
     }) + "\n");
@@ -427,7 +370,7 @@ export function captureDeathBundle(dir, death) {
   const fname = ev.ts.replace(/[:.]/g, "-") + ".json";
   const path = join(deathsDir(dir), fname);
   bundle.death.bundle = path;
-  writeFileAtomicSync(path, JSON.stringify(bundle, null, 2) + "\n");
+  writeFileSync(path, JSON.stringify(bundle, null, 2) + "\n");
   // NOTE: unlike the generic core's coroner, this does NOT journal the death
   // event — the old KILN contract journals in the tick path (doctorTick),
   // and callers (including tests) journal explicitly when they need to.

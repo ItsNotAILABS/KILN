@@ -14,17 +14,15 @@
  *    stop; a restarted daemon re-adopts live pids.
  */
 import { spawn } from "node:child_process";
-import { openSync, closeSync, writeSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { openSync, closeSync, writeFileSync, writeSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir, ensureStateDir, loadConfig, listNodeIds, loadNode, saveNode,
-  pidIsDaemon, pidIsWorker, processStartId, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
-  writeFileAtomicSync,
+  pidAlive, pidIsDaemon, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
 } from "./state.mjs";
 import { appendEvent, pendingJobs } from "./queue.mjs";
-import { createNode, budgetRestoreDue, restoreBudget } from "./nodes.mjs";
-import { reconcileCiQueue } from "./ci.mjs";
+import { createNode } from "./nodes.mjs";
 import { nowSec } from "./grant.mjs";
 import { startApiServer } from "./httpapi.mjs";
 import { settleComputeJobs } from "./compute.mjs";
@@ -55,30 +53,6 @@ function logTerminalOnce(key, msg) {
   log(msg);
 }
 
-/**
- * Stale-heartbeat spam control: reconcile() runs every tick (~2s), and each
- * stale worker used to log a line per tick — ~25k lines/day of noise that
- * buries real forensics. Log the first sighting per worker per daemon
- * lifetime, then one summary line at most every 10 minutes while any remain
- * stale.
- */
-const staleFirstSeen = new Set();
-let lastStaleSummaryMs = 0;
-const STALE_SUMMARY_MS = 10 * 60 * 1000;
-function logStaleHeartbeat(node) {
-  if (!staleFirstSeen.has(node.id)) {
-    staleFirstSeen.add(node.id);
-    log(`node ${node.name}: worker pid ${node.workerPid} alive but heartbeat stale (further sightings summarized every 10m)`);
-  }
-}
-function logStaleSummary(staleNodes) {
-  const nowMs = Date.now();
-  if (!staleNodes.length) return;
-  if (nowMs - lastStaleSummaryMs < STALE_SUMMARY_MS) return;
-  lastStaleSummaryMs = nowMs;
-  log(`stale heartbeats: ${staleNodes.length} worker(s): ${staleNodes.map((n) => n.name).join(", ")}`);
-}
-
 function lockPath(dir) { return join(dir, "daemon.lock"); }
 function daemonJsonPath(dir) { return join(dir, "daemon.json"); }
 
@@ -94,22 +68,10 @@ function acquireLock(dir) {
     // between the check and the claim, making a stale lock look live (seen
     // 2026-09-21: restart refused with "lock held by live pid" while no
     // daemon ran). pidIsDaemon verifies the cmdline actually belongs to
-    // this daemon — and the startId fence below catches the deeper case:
-    // a recycled pid running a DIFFERENT daemon.mjs is still not THIS one.
+    // this daemon.
     try {
       const d = JSON.parse(readFileSync(daemonJsonPath(dir), "utf8"));
-      if (pidIsDaemon(d.pid, dir)) {
-        if (d.startId) {
-          const live = processStartId(d.pid);
-          if (live !== d.startId) {
-            log(`reclaiming stale daemon lock (pid ${d.pid} recycled: start identity ${live ?? "gone"} != recorded ${d.startId})`);
-          } else {
-            return false; // genuinely running: same pid AND same boot-relative start
-          }
-        } else {
-          return false; // genuinely running (old daemon.json without startId)
-        }
-      }
+      if (pidIsDaemon(d.pid, dir)) return false; // genuinely running
     } catch { /* fall through: stale */ }
     unlinkSync(lockPath(dir));
     const fd = openSync(lockPath(dir), "wx");
@@ -132,7 +94,6 @@ function spawnWorker(dir, id) {
   closeSync(out); closeSync(err);
   const node = loadNode(dir, id);
   node.workerPid = child.pid;
-  node.workerSpawnedAt = Date.now();
   saveNode(dir, node);
   touchHeartbeat(dir, id);
   log(`spawned worker for ${node.name} (${id.slice(0, 12)}…) pid=${child.pid}`);
@@ -140,10 +101,7 @@ function spawnWorker(dir, id) {
 }
 
 function nodeStatus(dir, cfg, node) {
-  // pidIsWorker with the node id, not bare pidAlive: a dead worker's pid
-  // can be recycled by an unrelated process — or by ANOTHER node's worker —
-  // and neither must be adopted as this node's live worker.
-  const alive = pidIsWorker(node.workerPid, dir, node.id);
+  const alive = pidAlive(node.workerPid);
   const hbAge = heartbeatAgeMs(dir, node.id);
   const fresh = hbAge < cfg.heartbeatTimeoutMs;
   if (alive && fresh) return readJobFile(dir, node.id) ? "working" : "idle";
@@ -151,93 +109,35 @@ function nodeStatus(dir, cfg, node) {
   return "dead";
 }
 
-/**
- * Quarantine registry (in-memory only): node id -> the error that made
- * its on-disk record unusable. A node lands here when loadNode throws —
- * e.g. a 0-byte node.json left by a host write fault. The record on disk
- * is NEVER overwritten, repaired, or deleted by the daemon: it is the
- * operator's evidence. The node is simply skipped (degraded) while every
- * other node reconciles normally.
- *
- * Why this exists: before isolation, ONE corrupt record threw out of
- * reconcile() inside async main(); the rejection was logged as "staying
- * alive" but the tick interval and stall watchdog — created after the
- * reconcile line — never existed, so three consecutive Doctor boots
- * served API/git/CI with node supervision silently dead (2026-10-23).
- */
-const degradedNodes = new Map();
-function markDegraded(id, where, err) {
-  const msg = err && err.message ? err.message : String(err);
-  if (degradedNodes.get(id) !== msg) {
-    degradedNodes.set(id, msg);
-    log(`FATAL node record unreadable (${where}) — node ${id} DEGRADED (skipped, record on disk left untouched): ${msg}`);
-  }
-}
-function loadNodeGuarded(dir, id, where) {
-  try {
-    const node = loadNode(dir, id);
-    if (degradedNodes.delete(id)) log(`node ${id}: record readable again — leaving degraded state`);
-    return node;
-  } catch (e) {
-    markDegraded(id, where, e);
-    return null;
-  }
-}
-
 function reconcile(dir, cfg) {
-  const staleNodes = [];
   for (const id of listNodeIds(dir)) {
-    // Per-node isolation: any failure for one node (corrupt record,
-    // faulted save, failed spawn) is logged and quarantined — it must
-    // never abort reconcile for the remaining nodes, at boot or on tick.
-    try {
-      reconcileNode(dir, cfg, id, staleNodes);
-    } catch (e) {
-      markDegraded(id, "reconcile", e);
+    const node = loadNode(dir, id);
+    if (!node.autostart) continue;
+    const st = nodeStatus(dir, cfg, node);
+    if (st === "idle" || st === "working" || st === "stale") {
+      if (st === "stale") log(`node ${node.name}: worker pid ${node.workerPid} alive but heartbeat stale`);
+      continue; // live worker (or at least a live pid) — adopt it
     }
-  }
-  logStaleSummary(staleNodes);
-}
-
-function reconcileNode(dir, cfg, id, staleNodes) {
-  const node = loadNodeGuarded(dir, id, "reconcile");
-  if (!node) return; // degraded: record unreadable, skipped
-  if (!node.autostart) return;
-  const st = nodeStatus(dir, cfg, node);
-  if (st === "idle" || st === "working" || st === "stale") {
-    if (st === "stale") { logStaleHeartbeat(node); staleNodes.push(node); }
-    // Earned budget restore: sustained health (alive + fresh heartbeat
-    // for the full window) refills the restart budget, so deaths the
-    // node didn't cause — daemon/host kills — can't permanently retire
-    // a healthy long-lived node. Crash loops never earn this.
-    if (st !== "stale" && budgetRestoreDue(node, Date.now())) {
-      const was = restoreBudget(node);
-      saveNode(dir, node);
-      log(`node ${node.name}: restart budget restored (${was} → 0) after sustained health`);
+    // dead worker: respawn per policy
+    const policy = node.restartPolicy || "on-failure";
+    const should = policy === "always" || (policy === "on-failure" && node.lastExit !== 0);
+    if (!should) { logTerminalOnce(`${node.id}:dead:${policy}`, `node ${node.name}: dead, policy=${policy} — not respawning`); continue; }
+    if (node.restarts >= (node.maxRestarts ?? 3)) {
+      logTerminalOnce(`${node.id}:maxrestarts:${node.restarts}`, `node ${node.name}: max restarts (${node.maxRestarts}) reached — leaving dead`);
+      continue;
     }
-    return; // live worker (or at least a live pid) — adopt it
+    node.restarts += 1;
+    saveNode(dir, node);
+    spawnWorker(dir, id);
   }
-  // dead worker: respawn per policy
-  const policy = node.restartPolicy || "on-failure";
-  const should = policy === "always" || (policy === "on-failure" && node.lastExit !== 0);
-  if (!should) { logTerminalOnce(`${node.id}:dead:${policy}`, `node ${node.name}: dead, policy=${policy} — not respawning`); return; }
-  if (node.restarts >= (node.maxRestarts ?? 3)) {
-    logTerminalOnce(`${node.id}:maxrestarts:${node.restarts}`, `node ${node.name}: max restarts (${node.maxRestarts}) reached — leaving dead`);
-    return;
-  }
-  node.restarts += 1;
-  saveNode(dir, node);
-  spawnWorker(dir, id);
 }
 
 function reapExited(dir) {
-  // Detect workers that died without the daemon noticing: pid gone (or
-  // recycled by a non-worker process) but record still claims it.
-  // reconcile() handles the respawn.
+  // Detect workers that died without the daemon noticing: pid gone but
+  // record still claims it. reconcile() handles the respawn.
   for (const id of listNodeIds(dir)) {
-    const node = loadNodeGuarded(dir, id, "reapExited");
-    if (!node) continue; // degraded: record unreadable, skipped
-    if (node.workerPid && !pidIsWorker(node.workerPid, dir, node.id)) {
+    const node = loadNode(dir, id);
+    if (node.workerPid && !pidAlive(node.workerPid)) {
       if (node.lastExit === null || node.lastExit === undefined) {
         // We don't know the exit code; treat unknown death as failure-ish.
         node.lastExit = 1;
@@ -289,8 +189,7 @@ function tick(dir, cfg) {
 
     const idle = [];
     for (const id of listNodeIds(dir)) {
-      const node = loadNodeGuarded(dir, id, "tick");
-      if (!node) continue; // degraded: record unreadable, skipped
+      const node = loadNode(dir, id);
       let grantLive = false;
       try { grantLive = node.grant && node.grant.expiresAt > nowSec(); } catch { grantLive = false; }
       if (!grantLive) continue;
@@ -346,12 +245,10 @@ function tickLoopWedged(stats) {
  * One tick invocation: times tick(), accumulates stats, and writes
  * <stateDir>/tick.json — the contract the external supervisor reads.
  *
- * Contract shape: {"lastTickStartMs","lastTickEndMs","lastTickMs",
- * "tickCount","avgTickMs","maxTickMs","updatedAt"}. One atomic (tmp+rename) write
- * per tick, so a reader never sees a torn tick.json and a faulted write
- * leaves the previous complete file in place; a write failure can never
- * break the tick — it is logged once per daemon lifetime and then
- * suppressed.
+ * Contract shape: {"lastTickStartMs","lastTickEndMs","tickCount",
+ * "avgTickMs","maxTickMs","updatedAt"}. A single writeFileSync per tick;
+ * a write failure can never break the tick — it is logged once per daemon
+ * lifetime and then suppressed.
  */
 function runTick(dir, cfg, stats) {
   const startMs = Date.now();
@@ -364,13 +261,11 @@ function runTick(dir, cfg, stats) {
     stats.tickCount += 1;
     stats.totalMs += durMs;
     if (durMs > stats.maxTickMs) stats.maxTickMs = durMs;
-    stats.lastTickMs = durMs;
     stats.lastTickEndMs = endMs;
     try {
-      writeFileAtomicSync(tickJsonPath(dir), JSON.stringify({
+      writeFileSync(tickJsonPath(dir), JSON.stringify({
         lastTickStartMs: stats.lastTickStartMs,
         lastTickEndMs: stats.lastTickEndMs,
-        lastTickMs: stats.lastTickMs,
         tickCount: stats.tickCount,
         avgTickMs: stats.totalMs / stats.tickCount,
         maxTickMs: stats.maxTickMs,
@@ -400,8 +295,7 @@ function runTick(dir, cfg, stats) {
 function checkTickStall(stats, bootMs, thresholdMs) {
   const nowMs = Date.now();
   if (!tickStalled({ lastTickEndMs: stats.lastTickEndMs, bootMs, nowMs, thresholdMs })) return;
-  // With no completed tick ever, the honest age is the daemon's uptime.
-  const ageMs = stats.lastTickEndMs == null ? nowMs - bootMs : nowMs - stats.lastTickEndMs;
+  const ageMs = nowMs - stats.lastTickEndMs;
   const avgTickMs = stats.tickCount > 0 ? stats.totalMs / stats.tickCount : 0;
   const lastTickEnd = stats.lastTickEndMs != null ? new Date(stats.lastTickEndMs).toISOString() : "never";
   // Synchronous write: process.exit(1) immediately after can truncate an
@@ -430,17 +324,11 @@ async function main() {
     try { unlinkSync(lockPath(dir)); } catch {}
     process.exit(1);
   }
-  writeFileAtomicSync(daemonJsonPath(dir), JSON.stringify({
+  writeFileSync(daemonJsonPath(dir), JSON.stringify({
     pid: process.pid,
     startedAt: new Date().toISOString(),
     apiPort: api.port,
     apiUrl: api.url,
-    // Process-start identity (Grade 0): pid + boot-relative starttime fences
-    // pid recycling, and bootId uniquely identifies this boot for forensics.
-    // acquireLock() and the doctor use startId to tell a recycled pid from
-    // the daemon that actually held the lock.
-    startId: processStartId(process.pid),
-    bootId: `${Date.now().toString(36)}-${process.pid}-${Math.floor(Math.random() * 0xffffffff).toString(36)}`,
   }) + "\n");
   log(`up pid=${process.pid} dir=${dir}`);
 
@@ -451,43 +339,18 @@ async function main() {
     `config tickStallAbortMs / env KILN_TICK_STALL_MS)`);
 
   let stopping = false;
-  let ciTimer = null;
-  // Timer handles are declared (and null-initialized) BEFORE the stop
-  // handler can ever run. They used to be `const`s created after boot
-  // reconcile: a stop signal arriving during boot hit clearInterval()
-  // on a TDZ binding, the handler itself threw ReferenceError, and the
-  // daemon became SIGTERM-proof exactly when it was wedged (seen
-  // 2026-10-23, daemon.log 12:00:56Z). A stop during early boot must
-  // always work.
-  let timer = null;
-  let stallWatch = null;
   const onStop = () => {
     if (stopping) return;
     stopping = true;
     log("stopping (workers left running — they are persistent)");
-    if (timer) clearInterval(timer);
-    if (stallWatch) clearInterval(stallWatch);
-    if (ciTimer) clearInterval(ciTimer);
+    clearInterval(timer);
+    clearInterval(stallWatch);
     try { api.server.close(); } catch {}
     try { unlinkSync(lockPath(dir)); } catch {}
     process.exit(0);
   };
   process.on("SIGTERM", onStop);
   process.on("SIGINT", onStop);
-  // Crash forensics: SIGHUP/SIGQUIT/SIGABRT kill silently by default, and a
-  // silent death is indistinguishable from SIGKILL/OOM without a witness.
-  // Trap them loudly with distinct exit codes so the coroner can tell a
-  // signal death from an external vanish. (SIGKILL cannot be trapped: if a
-  // future death still logs nothing, the killer is SIGKILL-class — host
-  // reaper or OOM without a dmesg trace.)
-  for (const sig of ["SIGHUP", "SIGQUIT", "SIGABRT"]) {
-    try {
-      process.on(sig, () => {
-        try { writeSync(2, `[daemon ${new Date().toISOString()}] GOT ${sig} — exiting\n`); } catch {}
-        process.exit(128);
-      });
-    } catch { /* signal unsupported on this platform */ }
-  }
   // Never die silently: an uncaught exception in a tick would otherwise kill
   // the daemon with no explanation in the log (see ticket E2). Log it loudly
   // and keep supervising — the workers are persistent and depend on us.
@@ -498,47 +361,14 @@ async function main() {
     try { log(`FATAL unhandledRejection (staying alive): ${reason && reason.stack ? reason.stack : reason}`); } catch {}
   });
 
-  // CI reconciliation: CI draining is push-triggered, so a CI runner that
-  // dies with (or before) the daemon strands queued jobs, and a job it
-  // dequeued mid-run vanishes with no verdict. Nothing in the old boot
-  // path ever looked at the CI queue — a Doctor-recovered daemon served
-  // pushes happily while a queued job sat undrained forever (2026-10-23:
-  // auro/minutely b6f9100, queued 10:57:54Z, never drained). Scan on boot
-  // and every minute: drop already-recorded queue entries, re-queue
-  // branch tips whose verdicts never landed, kick the drainer when a
-  // live one isn't already running. Guarded — CI must never break the
-  // daemon.
-  const ciReconcile = () => {
-    try { reconcileCiQueue(dir); } catch (e) { log("ci reconcile error:", e.message); }
-  };
-  ciReconcile();
-  ciTimer = setInterval(ciReconcile, 60 * 1000);
-  ciTimer.unref();
-
-  // Supervision FIRST, boot reconcile SECOND. The tick interval and the
-  // stall watchdog are created before reconcile runs, so supervision
-  // exists even if boot reconcile hangs or throws — a reconcile failure
-  // can no longer take the tick loop down with it (the 2026-10-23
-  // wedge: reconcile threw on a 0-byte node.json inside async main(),
-  // the timers below it were never created, and the daemon served
-  // API/git/CI for hours with node supervision silently dead).
-  timer = setInterval(() => {
+  reconcile(dir, cfg); // boot reconcile: adopt live, respawn dead per policy
+  const timer = setInterval(() => {
     if (stopping) return;
     if (tickLoopWedged(stats)) return; // test-only wedge hook
     runTick(dir, cfg, stats);
   }, cfg.tickMs || 2000);
   // Independent stall watchdog: must not depend on tick() running.
-  stallWatch = setInterval(() => { if (!stopping) checkTickStall(stats, bootMs, thresholdMs); }, 30000);
-
-  // Boot reconcile: adopt live, respawn dead per policy. Per-node errors
-  // are isolated inside reconcile() itself; this guard is belt-and-braces
-  // so nothing in the boot pass can reject main() — the tick above keeps
-  // supervising either way and retries reconcile every tick.
-  try {
-    reconcile(dir, cfg);
-  } catch (e) {
-    log(`FATAL boot reconcile failed (tick supervision continues): ${e && e.stack ? e.stack : e}`);
-  }
+  const stallWatch = setInterval(() => { if (!stopping) checkTickStall(stats, bootMs, thresholdMs); }, 30000);
 }
 
 main();

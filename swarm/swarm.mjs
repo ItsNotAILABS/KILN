@@ -9,51 +9,31 @@
  *                        [--policy never|on-failure|always] [--max-restarts N] [--dir PATH]
  *   swarm.mjs node list [--dir PATH]
  *   swarm.mjs node stop <id|name> [--dir PATH]
- *   swarm.mjs node revive <id|name> [--dir PATH]
  *   swarm.mjs node logs <id|name> [--tail N] [--dir PATH]
  *   swarm.mjs job submit --plan FILE [--name N] [--mind M] [--node ID] [--dir PATH]
  *   swarm.mjs job list [--dir PATH]
  *   swarm.mjs receipts verify [--node ID] [--dir PATH]
  *   swarm.mjs repo create --owner O --repo R [--dir PATH]
  *   swarm.mjs repo list [--dir PATH]
- *   swarm.mjs promote <owner>/<repo> [--github OWNER/REPO] [--branch B]
- *                        [--rebase] [--force] [--dir PATH]
- *   swarm.mjs sites list [--dir PATH]
- *   swarm.mjs sites show <id|name> [--dir PATH]
- *   swarm.mjs sites add --name N --frontend O/R --backend O/R
- *                        [--artifact SLUG] [--app NAME|APPID] [--dir PATH]
- *   swarm.mjs sites remove <id|name> [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
 import { spawn } from "node:child_process";
-import { readFileSync, appendFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, openSync, closeSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir as defaultStateDir, ensureStateDir, listNodeIds, loadNode, saveNode,
   resolveNode, pidAlive, pidIsDaemon, heartbeatAgeMs, nodeDir, loadApiToken,
-  writeFileAtomicSync,
 } from "./lib/state.mjs";
-import { createNode, reviveNode } from "./lib/nodes.mjs";
+import { createNode } from "./lib/nodes.mjs";
 import { loadKeypair } from "./lib/keys.mjs";
 import { loadKeyFile } from "./lib/state.mjs";
 import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
 import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
-import { promoteRepo } from "./lib/promote.mjs";
-import {
-  createSite, listSites, resolveSite, deleteSite, siteStatus,
-} from "./lib/sites.mjs";
-import {
-  remember, assertFact, supersedeFact, linkMemories, setCore,
-  proposeMemory, resolveProposal,
-  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory, agentAwareness,
-} from "./lib/memory.mjs";
-import { memorySigningPubkey, signatureSummary } from "./lib/memory-signing.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
-import { buildDaemonSpawnEnv } from "./lib/daemon-env.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
   daemonHealth, readJournal, diagnose, doctorDir, doctorAgents,
@@ -105,21 +85,10 @@ function daemonJson(dir) {
 function daemonStart(dir) {
   const d = daemonJson(dir);
   if (d && pidIsDaemon(d.pid, dir)) { console.error(`daemon already running pid=${d.pid}`); process.exit(1); }
-  // Persistent per-state-dir config: <dir>/daemon.env supplies env the
-  // starting process did not specify (see lib/daemon-env.mjs). This is
-  // the single spawn choke point — `daemon start`, `daemon watchdog`
-  // and the Doctor's medic (which invokes the watchdog) all reach the
-  // daemon through here, so the file takes effect on the next boot
-  // through any of them. Malformed lines are warned about and skipped,
-  // never fatal: config trouble must not strand a daemon.
-  const spawnEnv = buildDaemonSpawnEnv(dir);
-  for (const p of spawnEnv.problems) {
-    console.error(`daemon.env: line ${p.line} skipped (${p.reason}): ${p.text.trim()}`);
-  }
   const out = openSync(join(dir, "daemon.log"), "a");
   const child = spawn(process.execPath, [join(HERE, "lib", "daemon.mjs")], {
     detached: true, stdio: ["ignore", out, out],
-    env: spawnEnv.env,
+    env: { ...process.env, KILN_SWARM_DIR: dir },
   });
   child.unref();
   closeSync(out);
@@ -180,7 +149,7 @@ async function daemonWatchdog(dir) {
   const st2 = await daemonStatus(dir);
   if (st2.up) {
     state.restarts.push(Date.now());
-    try { writeFileAtomicSync(statePath, JSON.stringify(state) + "\n"); } catch { /* best effort */ }
+    try { writeFileSync(statePath, JSON.stringify(state) + "\n"); } catch { /* best effort */ }
     watchdogLog(dir, `restarted ok pid=${st2.pid}`);
     console.log(`daemon restarted pid=${st2.pid}`);
   } else {
@@ -344,14 +313,6 @@ async function cmdNode(args) {
       n.workerPid = null; n.lastExit = 0; saveNode(dir, n);
       console.log(`stopped worker for ${n.name}`);
     } else console.log(`${n.name}: no live worker`);
-  } else if (sub === "revive") {
-    if (!args._[2]) { console.error("usage: node revive <id|name>"); process.exit(2); }
-    const { node: n, was } = reviveNode(dir, args._[2]);
-    console.log(`revived node ${n.name}: restart budget reset (${was} → 0), last exit cleared`);
-    const d = daemonJson(dir);
-    console.log(d && pidAlive(d.pid)
-      ? "  daemon will respawn the worker on its next tick (autostart + restart policy permitting)"
-      : "  daemon not running — the worker starts when the daemon does");
   } else if (sub === "logs") {
     if (!args._[2]) { console.error("usage: node logs <id|name>"); process.exit(2); }
     const id = resolveNode(dir, args._[2]);
@@ -535,256 +496,6 @@ async function cmdRepo(args) {
   } else { console.error("usage: repo create|list"); process.exit(2); }
 }
 
-// ---------------------------------------------------------------- promote (KILN -> GitHub)
-
-function splitOwnerRepo(s, what) {
-  const i = typeof s === "string" ? s.indexOf("/") : -1;
-  if (i <= 0 || i === s.length - 1) {
-    console.error(`usage: ${what} must be <owner>/<repo>`);
-    process.exit(2);
-  }
-  return [s.slice(0, i), s.slice(i + 1)];
-}
-
-async function cmdPromote(args) {
-  const dir = dirOf(args);
-  ensureStateDir(dir);
-  const target = args._[1];
-  if (!target) {
-    console.error("usage: promote <owner>/<repo> [--github OWNER/REPO] [--branch B] [--rebase] [--force]");
-    process.exit(2);
-  }
-  const [owner, repo] = splitOwnerRepo(target, "promote target");
-  let githubOwner, githubRepo;
-  if (args.github) [githubOwner, githubRepo] = splitOwnerRepo(String(args.github), "--github");
-  const r = await promoteRepo(dir, owner, repo, {
-    githubOwner,
-    githubRepo,
-    branch: args.branch ? String(args.branch) : undefined,
-    rebase: !!args.rebase,
-    force: !!args.force,
-  });
-  // One-screen receipt (KILN standard shape; token never printed).
-  console.log(`🔥 KILN · ${r.repo} → GitHub ${r.github || "(no destination)"}${r.branch ? "@" + r.branch : ""}`);
-  console.log(`  source ${r.sourceBranch || "?"} @ ${(r.sourceTip || "").slice(0, 7)} · ${r.commitsPlanned} of ${r.commitsTotal} commit(s)${r.rebased ? " · rebased onto GitHub tip" : ""}${r.forced ? " · FORCED" : ""}`);
-  for (const c of r.commits) {
-    console.log(`  built ${c.from.slice(0, 12)} -> ${c.to.slice(0, 12)} (${c.blobs} blobs) ${c.subject}`);
-  }
-  for (const w of r.warnings) console.log(`  ⚠ ${w}`);
-  if (r.ok) {
-    console.log(r.note ? `✅ ${r.note}` : `✅ promoted${r.newTip ? ` → ${r.newTip.slice(0, 12)}` : ""}`);
-    console.log(`  ${r.url}`);
-  } else {
-    console.log(`❌ ${r.error.stage}: ${r.error.message}`);
-    process.exit(1);
-  }
-}
-
-// ---------------------------------------------------------------- memory (per-repo)
-
-function repoArg(args) {
-  const s = need(args, "repo");
-  const i = String(s).indexOf("/");
-  if (i <= 0 || i === String(s).length - 1) { console.error("--repo must be <owner>/<repo>"); process.exit(2); }
-  return [String(s).slice(0, i), String(s).slice(i + 1)];
-}
-function csv(v) {
-  return v === undefined || v === true ? [] : String(v).split(",").map((x) => x.trim()).filter(Boolean);
-}
-
-async function cmdMemory(args) {
-  const sub = args._[1];
-  const dir = dirOf(args);
-  ensureStateDir(dir);
-  // Phase 6 cross-repo recall: `memory recall-all --q <query>` (or
-  // `memory recall --repo '*'`). No --repo: the query fans out over
-  // every repo chain in the state dir; excluded (unverifiable)
-  // chains are reported on stderr, never silently skipped.
-  if (sub === "recall-all" || (sub === "recall" && (args.all === true || args.repo === "*" || args.repo === "*/*"))) {
-    const r = recallCrossRepo(dir, String(need(args, "q")), {
-      limit: args.limit ? Number(args.limit) : 10,
-      kinds: csv(args.kinds),
-      tags: csv(args.tags),
-      asOf: args.asof ? String(args.asof) : undefined,
-      since: args.since ? String(args.since) : undefined,
-      until: args.until ? String(args.until) : undefined,
-      includeSuperseded: !!args.superseded,
-    });
-    if (args.json) {
-      console.log(JSON.stringify(r, null, 2));
-    } else {
-      for (const x of r.results) {
-        console.log(`${x.score.toFixed(3)}  ${x.repo}  ${x.kind.padEnd(7)} seq=${x.seq} via=${x.via} engine=${x.engine}  ${x.title || x.text.slice(0, 80)}`);
-      }
-      if (!r.results.length) console.log("(no recall hits)");
-      for (const s of r.repos) {
-        if (s.status === "empty") console.error(`[memory: ${s.repo} has no memory]`);
-      }
-    }
-    for (const ex of r.excluded) {
-      console.error(`[memory: EXCLUDED ${ex.repo} — chain failed verification: ${ex.error}]`);
-    }
-    return;
-  }
-  const [owner, repo] = repoArg(args);
-  const actor = args.actor ? String(args.actor) : "cli";
-  if (sub === "remember") {
-    const content = args.file ? readFileSync(resolve(String(args.file)), "utf8") : need(args, "content");
-    const r = remember(dir, owner, repo, {
-      title: args.title, kind: args.kind, content: String(content),
-      tags: csv(args.tags), entities: csv(args.entities),
-      eventDate: args.date, actor,
-      source: args.source ? { type: "ref", ref: String(args.source) } : undefined,
-    });
-    console.log(`remembered ${r.event.id} (seq ${r.event.seq}) in ${owner}/${repo} @ ${r.commit.slice(0, 12)}`);
-  } else if (sub === "fact") {
-    const r = assertFact(dir, owner, repo, {
-      subject: need(args, "subject"), predicate: need(args, "predicate"), object: need(args, "object"),
-      sourceEpisodes: csv(need(args, "sources")), supersedes: csv(args.supersedes),
-      validFrom: args.from, actor,
-    });
-    console.log(`fact ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
-  } else if (sub === "supersede") {
-    const r = supersedeFact(dir, owner, repo, { fact: need(args, "fact"), reason: args.reason, actor });
-    console.log(`superseded via ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
-  } else if (sub === "link") {
-    const r = linkMemories(dir, owner, repo, { from: need(args, "from"), to: need(args, "to"), relation: need(args, "relation"), actor });
-    console.log(`linked ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
-  } else if (sub === "core") {
-    const r = setCore(dir, owner, repo, { label: need(args, "label"), value: need(args, "value"), description: args.description, actor });
-    console.log(`core "${r.event.label}" set (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
-  } else if (sub === "core-get") {
-    console.log(JSON.stringify(loadMemory(dir, owner, repo).core, null, 2));
-  } else if (sub === "facts") {
-    const st = loadMemory(dir, owner, repo);
-    const asOf = args.asof ? Math.floor(Date.parse(String(args.asof)) / 1000) : Math.floor(Date.now() / 1000);
-    console.log(JSON.stringify(factsAt(st, asOf, !!args.all), null, 2));
-  } else if (sub === "recall") {
-    const r = recall(dir, owner, repo, String(need(args, "q")), { limit: args.limit ? Number(args.limit) : 10 });
-    for (const x of r.results) {
-      console.log(`${x.score.toFixed(3)}  ${x.kind.padEnd(7)} seq=${x.seq} via=${x.via}  ${x.title || x.text.slice(0, 80)}`);
-    }
-    if (!r.results.length) console.log("(no recall hits)");
-  } else if (sub === "context") {
-    const pack = buildContext(dir, owner, repo, {
-      query: args.q ? String(args.q) : undefined,
-      budgetTokens: args.budget ? Number(args.budget) : 4000,
-    });
-    console.log(pack.text);
-    console.error(`[memory: ${pack.usedTokens}/${pack.budgetTokens} tokens${pack.overBudget ? " OVER BUDGET (core alone exceeds it)" : ""}]`);
-  } else if (sub === "sit") {
-    const brief = agentAwareness(dir, owner, repo, {
-      query: args.q ? String(args.q) : undefined,
-      budgetTokens: args.budget ? Number(args.budget) : 1200,
-    });
-    console.log(brief.text);
-  } else if (sub === "propose-fact") {
-    const r = proposeMemory(dir, owner, repo, {
-      kind: "fact",
-      payload: {
-        subject: need(args, "subject"), predicate: need(args, "predicate"), object: need(args, "object"),
-        sourceEpisodes: csv(need(args, "sources")), supersedes: csv(args.supersedes),
-        validFrom: args.from, confidence: args.confidence ? Number(args.confidence) : undefined,
-      },
-      rationale: args.rationale ? String(args.rationale) : "",
-      actor,
-    });
-    console.log(`proposed fact ${r.event.id} (seq ${r.event.seq}) — pending ratification`);
-  } else if (sub === "propose-link") {
-    const r = proposeMemory(dir, owner, repo, {
-      kind: "link",
-      payload: { from: need(args, "from"), to: need(args, "to"), relation: need(args, "relation") },
-      rationale: args.rationale ? String(args.rationale) : "",
-      actor,
-    });
-    console.log(`proposed link ${r.event.id} (seq ${r.event.seq}) — pending ratification`);
-  } else if (sub === "propose-core") {
-    const r = proposeMemory(dir, owner, repo, {
-      kind: "core",
-      payload: { label: need(args, "label"), value: need(args, "value"), description: args.description },
-      rationale: args.rationale ? String(args.rationale) : "",
-      actor,
-    });
-    console.log(`proposed core ${r.event.id} (seq ${r.event.seq}) — pending ratification`);
-  } else if (sub === "proposals") {
-    const st = loadMemory(dir, owner, repo);
-    const want = args.status ? String(args.status) : null;
-    const list = want ? st.proposals.filter((x) => x.status === want) : st.proposals;
-    for (const p of list) {
-      const what = p.proposalKind === "fact"
-        ? `${p.payload.subject} ${p.payload.predicate} ${p.payload.object}`
-        : p.proposalKind === "link" ? `${p.payload.from} -[${p.payload.relation}]-> ${p.payload.to}` : `core "${p.payload.label}"`;
-      console.log(`${p.id}  ${p.status.padEnd(8)} ${p.proposalKind.padEnd(4)} by ${p.actor}  ${what}${p.rationale ? `  — ${p.rationale}` : ""}`);
-    }
-    if (!list.length) console.log("(no proposals)");
-  } else if (sub === "ratify" || sub === "reject") {
-    const r = resolveProposal(dir, owner, repo, {
-      proposal: need(args, "proposal"),
-      decision: sub === "ratify" ? "ratified" : "rejected",
-      reason: args.reason ? String(args.reason) : "",
-      actor,
-    });
-    console.log(`${r.decision} ${r.proposal.id}${r.materialized ? ` → materialized as ${r.materialized.type} ${r.materialized.id}` : ""} @ ${r.commit.slice(0, 12)}`);
-  } else if (sub === "stats") {
-    console.log(JSON.stringify(memoryStats(dir, owner, repo), null, 2));
-  } else if (sub === "verify") {
-    const v = verifyMemory(dir, owner, repo);
-    console.log(JSON.stringify(v, null, 2));
-    if (!v.ok) process.exit(1);
-  } else if (sub === "pubkey") {
-    // Phase 2 discovery: the state dir's memory signing key (public
-    // half only — the private key never leaves <dir>/memory-signing.key)
-    // plus this repo's signature posture. Creates the key on first use.
-    const pub = memorySigningPubkey(dir, { create: true });
-    const st = loadMemory(dir, owner, repo);
-    console.log(JSON.stringify({ ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) }, null, 2));
-  } else {
-    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|sit|stats|verify|pubkey|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]  ·  memory recall-all --q <query> [--limit N] [--json] (cross-repo, phase 6)");
-    process.exit(2);
-  }
-}
-
-// ---------------------------------------------------------------- sites (frontend + backend + artifact + app)
-
-async function cmdSites(args) {
-  const sub = args._[1];
-  const dir = dirOf(args);
-  ensureStateDir(dir);
-  if (sub === "add") {
-    // Works purely on local state (registry + repo memory + git), like
-    // `memory` — no daemon needed. Memory linkage is written on create.
-    const site = createSite(dir, {
-      name: need(args, "name"),
-      frontend: String(need(args, "frontend")),
-      backend: String(need(args, "backend")),
-      artifact: args.artifact ? String(args.artifact) : undefined,
-      computeApp: args.app ? String(args.app) : undefined,
-      actor: "cli",
-    });
-    console.log(`site ${site.name} (${site.id})`);
-    console.log(`  frontend: ${site.frontend}`);
-    console.log(`  backend:  ${site.backend}`);
-    if (site.artifact) console.log(`  artifact: ${site.artifact}`);
-    if (site.computeApp) console.log(`  app:      ${site.computeApp}`);
-    console.log(`  memory linkage written to both repos (backend_repo/frontend_repo${site.artifact ? "/artifact" : ""}/site core blocks)`);
-  } else if (sub === "list") {
-    const sites = listSites(dir);
-    if (!sites.length) { console.log("(no sites)"); return; }
-    for (const s of sites) {
-      console.log(`${s.id.slice(0, 12)}…  ${s.name.padEnd(16)} ${s.frontend} ⇄ ${s.backend}${s.artifact ? `  artifact=${s.artifact}` : ""}${s.computeApp ? `  app=${s.computeApp}` : ""}`);
-    }
-  } else if (sub === "show") {
-    if (!args._[2]) { console.error("usage: sites show <id|name>"); process.exit(2); }
-    const site = resolveSite(dir, args._[2]);
-    console.log(JSON.stringify(await siteStatus(dir, site.id), null, 2));
-  } else if (sub === "remove") {
-    if (!args._[2]) { console.error("usage: sites remove <id|name>"); process.exit(2); }
-    const site = resolveSite(dir, args._[2]);
-    deleteSite(dir, site.id);
-    console.log(`removed site ${site.name} (${site.id}) — registry entry only; repos, app, and memory untouched`);
-  } else { console.error("usage: sites list|show|add|remove"); process.exit(2); }
-}
-
 // ---------------------------------------------------------------- compute (serverless)
 
 function readCode(args) {
@@ -920,11 +631,8 @@ try {
   else if (cmd === "compute") await cmdCompute(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
-  else if (cmd === "promote") await cmdPromote(args);
-  else if (cmd === "memory") await cmdMemory(args);
-  else if (cmd === "sites") await cmdSites(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory|sites");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo");
     process.exit(2);
   }
 } catch (e) {

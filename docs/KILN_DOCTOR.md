@@ -107,30 +107,8 @@ process itself never chats — deaths are journaled, not announced.
 - Daemon still DOWN after the recovery attempt, or the watchdog reports a
   crash loop (≥5 restarts in an hour) → `check` exits 1 → the cron alerts
   the user immediately, pointing at `~/.kiln-swarm/daemon.log`.
-- Recovery retry budget **exhausted** (default 8 attempts over ~48 min of
-  backoff, 30s→1m→2m→5m→10m×4) → LOUD `ALARM: doctor recovery exhausted …
-  MANUAL INTERVENTION REQUIRED` in `doctor.log` and `check` exit 1. This
-  is the fix for 2026-10-07: the old doctor silently skipped a dead
-  instance forever after one failed recovery.
 - `diagnose()` produces a NEW hypothesis or pattern → surfaced once via
   `check` output (deduped against the last notified hypothesis).
-
-## Single recovery authority + fencing (Grade 0)
-
-The doctor supervisor is the **only authority** that may (re)start the
-daemon for a state dir: supervision ticks are serialized by the doctor tick
-lock and the medic is the only code path that restarts the daemon. After
-each doctor-driven recovery the plugin stamps the fresh daemon's `bootId`
-into doctor state as `expectedBootId`. `daemonHealth()` then reports a
-RUNNING daemon whose `bootId` does not match as DOWN ("fenced") instead of
-adopting an out-of-band start — the next tick restarts it through the
-authority. The fence is skipped when it has not been established yet or when
-the daemon predates fencing (old daemon.json without `bootId`).
-
-What remains open for the Grade 0/1 gate (not done here): fence tokens on
-daemon commands (lease the fence so the daemon refuses commands from
-stale holders), a leader/hot-standby pair with leases, and disk-backed
-replay of in-flight jobs across recovery.
 
 ## Tick instrumentation
 
@@ -232,9 +210,7 @@ doctor.json    {pid, startedAt} — the doctor's own pidfile
 doctor.lock    exclusive-create single-instance lock
 tick.lock      serializes the loop tick vs an inline `check` tick
 doctor.log     the doctor's own log
-state.json     lastHealthyTs, lastHandledDeathId, recoveryAttempts,
-               nextRecoveryRetryTs, recoveryExhausted(+Ts), expectedBootId,
-               expectedStartId, lastCheckTs, lastHypothesisNotified
+state.json     lastHealthyTs, lastHandledDeathId, lastCheckTs, lastHypothesisNotified
 deaths.jsonl   one JSON object per death/recovery event
 deaths/        forensic bundles, one JSON file per death
 ```
@@ -248,15 +224,6 @@ stale vs live lock probing (pid-reuse safe), honest down-reporting, and an
 end-to-end tick that restarts a dead daemon through the real watchdog path
 on an ephemeral port. All tests use scratch dirs and never touch the live
 daemon.
-
-`swarm/test/doctor-recovery-hardening.test.mjs` (9 tests): the 2026-10-07
-outage regression set — procCmdline TOCTOU vanish detection, pidIsDaemon
-rejecting vanished/impostor pids and accepting a genuine daemon-shaped
-process, processStartId for live/dead/null pids, tick() retry-then-success
-(forensics captured exactly once), exhaustion → LOUD ALARM + `check()` exit
-1, retry-budget reset on a new death and on the healthy tick, and the
-recovery-authority fence end-to-end through a real watchdog recovery
-(out-of-band bootId fenced, in-authority bootId healthy).
 
 `swarm/test/daemon-tick.test.mjs` (14 tests): tick.json contract shape and
 sane values from a real daemon, `tickStalled()` predicate units (recent /
