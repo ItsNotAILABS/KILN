@@ -1,0 +1,6 @@
+# Vendored snapshot of the generic doctor core.
+# Source of truth: ItsNotAILABS/doctor (~/workspace/repos/doctor), core/
+# This copy is a snapshot — do not edit here. Re-sync with:
+#   bash swarm/lib/doctor-core/sync-from-doctor.sh
+DOCTOR_REPO_COMMIT=625c395e633b44bf1f9aca21c742a4098e775ec7
+VENDORED_AT=2026-10-02T16:09:04Z

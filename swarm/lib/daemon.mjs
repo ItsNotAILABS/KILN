@@ -14,7 +14,7 @@
  *    stop; a restarted daemon re-adopts live pids.
  */
 import { spawn } from "node:child_process";
-import { openSync, closeSync, writeFileSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { openSync, closeSync, writeFileSync, writeSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -26,6 +26,10 @@ import { createNode } from "./nodes.mjs";
 import { nowSec } from "./grant.mjs";
 import { startApiServer } from "./httpapi.mjs";
 import { settleComputeJobs } from "./compute.mjs";
+import {
+  tickJsonPath, resolveTickStallMs, tickStalled, newTickStats,
+  DEFAULT_TICK_STALL_ABORT_MS,
+} from "./tickwatch.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, "worker.mjs");
@@ -221,6 +225,89 @@ function tick(dir, cfg) {
   }
 }
 
+/**
+ * TEST-ONLY wedge hook (KILN_TICK_WEDGE_TEST=1): after the first tick
+ * completes, every subsequent tick invocation is skipped — the tick loop
+ * is "wedged" (alive process, stale tick.json) while the event loop stays
+ * free, so the independent watchdog must observe the stall and self-abort.
+ * This simulates the wedge the doctor's journal suggests. A fully
+ * thread-blocked loop cannot be caught from inside — that case stays the
+ * external doctor's job (see docs/KILN_DOCTOR.md). Never set in
+ * production; exists solely so the self-abort path is exercised for real
+ * in tests.
+ */
+function tickLoopWedged(stats) {
+  if (process.env.KILN_TICK_WEDGE_TEST !== "1") return false;
+  return stats.tickCount >= 1;
+}
+
+/**
+ * One tick invocation: times tick(), accumulates stats, and writes
+ * <stateDir>/tick.json — the contract the external supervisor reads.
+ *
+ * Contract shape: {"lastTickStartMs","lastTickEndMs","tickCount",
+ * "avgTickMs","maxTickMs","updatedAt"}. A single writeFileSync per tick;
+ * a write failure can never break the tick — it is logged once per daemon
+ * lifetime and then suppressed.
+ */
+function runTick(dir, cfg, stats) {
+  const startMs = Date.now();
+  stats.lastTickStartMs = startMs;
+  try {
+    tick(dir, cfg);
+  } finally {
+    const endMs = Date.now();
+    const durMs = Math.max(0, endMs - startMs);
+    stats.tickCount += 1;
+    stats.totalMs += durMs;
+    if (durMs > stats.maxTickMs) stats.maxTickMs = durMs;
+    stats.lastTickEndMs = endMs;
+    try {
+      writeFileSync(tickJsonPath(dir), JSON.stringify({
+        lastTickStartMs: stats.lastTickStartMs,
+        lastTickEndMs: stats.lastTickEndMs,
+        tickCount: stats.tickCount,
+        avgTickMs: stats.totalMs / stats.tickCount,
+        maxTickMs: stats.maxTickMs,
+        updatedAt: new Date(endMs).toISOString(),
+      }) + "\n");
+    } catch (e) {
+      stats.writeFailures += 1;
+      if (stats.writeFailures === 1) {
+        log(`tick.json write failed (suppressing further warnings): ${e.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * The independent stall watchdog: a 30s timer that does NOT depend on
+ * tick() running — it reads the in-memory stats the tick interval updates.
+ * On stall it logs LOUDLY and exits(1): a loud crash is the point, the
+ * external supervisor (doctor) captures forensics and restarts.
+ *
+ * Honest limitation: a fully blocked event loop (same thread) cannot be
+ * caught from inside — no in-process timer fires while the thread is
+ * wedged. This watchdog catches everything else (tick interval starved,
+ * ticks that start but never complete, slow death). The doctor remains
+ * the external backstop for the fully-blocked case.
+ */
+function checkTickStall(stats, bootMs, thresholdMs) {
+  const nowMs = Date.now();
+  if (!tickStalled({ lastTickEndMs: stats.lastTickEndMs, bootMs, nowMs, thresholdMs })) return;
+  const ageMs = nowMs - stats.lastTickEndMs;
+  const avgTickMs = stats.tickCount > 0 ? stats.totalMs / stats.tickCount : 0;
+  const lastTickEnd = stats.lastTickEndMs != null ? new Date(stats.lastTickEndMs).toISOString() : "never";
+  // Synchronous write: process.exit(1) immediately after can truncate an
+  // async console.log, and this line is the whole point — it must land.
+  try {
+    writeSync(1, `[daemon ${new Date().toISOString()}] TICK STALL — self-aborting: ` +
+      `no completed tick for ${ageMs}ms (threshold ${thresholdMs}ms, lastTickEnd=${lastTickEnd}, ` +
+      `tickCount=${stats.tickCount}, avgTickMs=${avgTickMs.toFixed(1)}, maxTickMs=${stats.maxTickMs})\n`);
+  } catch {}
+  process.exit(1);
+}
+
 async function main() {
   const dir = ensureStateDir(stateDir());
   if (!acquireLock(dir)) {
@@ -245,12 +332,19 @@ async function main() {
   }) + "\n");
   log(`up pid=${process.pid} dir=${dir}`);
 
+  const bootMs = Date.now();
+  const stats = newTickStats();
+  const thresholdMs = resolveTickStallMs(cfg);
+  log(`tick watchdog: stall threshold ${thresholdMs}ms (default ${DEFAULT_TICK_STALL_ABORT_MS}ms; ` +
+    `config tickStallAbortMs / env KILN_TICK_STALL_MS)`);
+
   let stopping = false;
   const onStop = () => {
     if (stopping) return;
     stopping = true;
     log("stopping (workers left running — they are persistent)");
     clearInterval(timer);
+    clearInterval(stallWatch);
     try { api.server.close(); } catch {}
     try { unlinkSync(lockPath(dir)); } catch {}
     process.exit(0);
@@ -268,7 +362,13 @@ async function main() {
   });
 
   reconcile(dir, cfg); // boot reconcile: adopt live, respawn dead per policy
-  const timer = setInterval(() => { if (!stopping) tick(dir, cfg); }, cfg.tickMs || 2000);
+  const timer = setInterval(() => {
+    if (stopping) return;
+    if (tickLoopWedged(stats)) return; // test-only wedge hook
+    runTick(dir, cfg, stats);
+  }, cfg.tickMs || 2000);
+  // Independent stall watchdog: must not depend on tick() running.
+  const stallWatch = setInterval(() => { if (!stopping) checkTickStall(stats, bootMs, thresholdMs); }, 30000);
 }
 
 main();

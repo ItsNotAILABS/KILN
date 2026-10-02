@@ -33,9 +33,10 @@ import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
 import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
+import { tickJsonPath } from "./lib/tickwatch.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
-  daemonHealth, readJournal, diagnose, doctorDir,
+  daemonHealth, readJournal, diagnose, doctorDir, doctorAgents,
 } from "./lib/doctor.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -159,6 +160,23 @@ async function daemonWatchdog(dir) {
   }
 }
 
+/** One-line tick-instrumentation summary for `daemon status`, from tick.json. */
+function tickStatusLine(dir) {
+  try {
+    const p = tickJsonPath(dir);
+    if (!existsSync(p)) return "tick: no tick data yet";
+    const t = JSON.parse(readFileSync(p, "utf8"));
+    if (!t || !Number.isFinite(t.lastTickEndMs)) return "tick: tick data unreadable";
+    const ageS = Math.max(0, Math.round((Date.now() - t.lastTickEndMs) / 1000));
+    const avg = Number.isFinite(t.avgTickMs) ? Math.round(t.avgTickMs) : "?";
+    const max = Number.isFinite(t.maxTickMs) ? Math.round(t.maxTickMs) : "?";
+    const n = Number.isFinite(t.tickCount) ? t.tickCount : "?";
+    return `tick: last completed ${ageS}s ago, avg=${avg}ms max=${max}ms count=${n}`;
+  } catch {
+    return "tick: tick data unreadable";
+  }
+}
+
 async function cmdDaemon(args) {
   const sub = args._[1];
   const dir = dirOf(args);
@@ -175,6 +193,7 @@ async function cmdDaemon(args) {
     if (st.up) {
       console.log(`daemon: running pid=${st.pid} since ${st.startedAt}`);
       console.log(`api: ${st.apiUrl} (127.0.0.1 only, bearer token in ${join(dir, "api.token")})`);
+      console.log(tickStatusLine(dir));
     } else {
       console.log(`daemon: DOWN (${st.reason})`);
       console.log(`fix: start it with: node swarm.mjs daemon start`);
@@ -225,6 +244,7 @@ async function cmdDoctor(args) {
     const deaths = readJournal(dir).filter((e) => e.type === "death");
     const last = deaths.length ? deaths[deaths.length - 1].ts : null;
     console.log(`deaths recorded: ${deaths.length}${last ? ` (last ${last})` : ""}`);
+    console.log(`agents: ${doctorAgents(dir).map((a) => `${a.name}=${a.state}`).join(" ")}`);
     if (!alive) process.exit(1);
   } else if (sub === "report") {
     const dg = diagnose(dir);

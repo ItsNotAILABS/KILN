@@ -40,6 +40,9 @@ export function ensureStateDir(dir) {
           heartbeatTimeoutMs: 30000,
           tickMs: 2000,
           apiPort: 18787, // 0 = ephemeral; override with KILN_SWARM_API_PORT
+          // Stall self-abort: the daemon exits(1) if no tick completes for
+          // this long (ms). Env KILN_TICK_STALL_MS overrides when set.
+          tickStallAbortMs: 600000,
           // Public previews (Caffeine-style URLs for compute apps). Absent =
           // previews unavailable (apps still deploy privately). See
           // docs/KILN_PREVIEW.md for the full shape.
