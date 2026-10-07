@@ -26,6 +26,7 @@ export function doctorLogPath(dir) { return join(doctorDir(dir), "doctor.log"); 
 export function doctorStatePath(dir) { return join(doctorDir(dir), "state.json"); }
 export function deathsDir(dir) { return join(doctorDir(dir), "deaths"); }
 export function journalPath(dir) { return join(doctorDir(dir), "deaths.jsonl"); }
+export function heartbeatPath(dir) { return join(doctorDir(dir), "heartbeat.json"); }
 
 export function ensureDoctorDir(dir) {
   mkdirSync(deathsDir(dir), { recursive: true });

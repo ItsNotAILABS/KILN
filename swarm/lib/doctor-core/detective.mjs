@@ -92,7 +92,7 @@ export function diagnose(dir) {
   if (wedgeConfirmed) {
     lead = `Leading hypothesis: the wedge is CONFIRMED — last completed tick was ${fmtDur(recentTickAgeMs)} before death — the supervised loop wedged. Recommend: instrument tick duration and add an internal self-abort when ticks stall.`;
   } else if (silentVanish) {
-    lead = `Leading hypothesis: external SIGKILL-class termination — the most recent death's last completed tick was ${fmtDur(recentTickAgeMs)} before detection (loop healthy), no OOM evidence, no fatal log line. The daemon now traps SIGHUP/SIGQUIT/SIGABRT loudly: if the next death still logs nothing, the killer is untrappable (SIGKILL) — audit host-level process management / runtime reaping. Recommend: check hosting-layer OOM and process-lifetime policies.`;
+    lead = `Leading hypothesis: external SIGKILL-class termination — the most recent death's last completed tick was ${fmtDur(recentTickAgeMs)} before detection (loop healthy), no OOM evidence, no fatal log line. If the subject traps SIGHUP/SIGQUIT/SIGABRT loudly and the next death still logs nothing, the killer is untrappable (SIGKILL) — audit host-level process management / runtime reaping. Recommend: check hosting-layer OOM and process-lifetime policies.`;
   } else if (oomDeaths.length > 0) {
     lead = "Leading hypothesis: the OOM killer is terminating the subject under memory pressure. Recommend: raise host memory or cap worker concurrency, then watch whether deaths stop.";
   } else if (staleFrac >= 2 / 3) {
