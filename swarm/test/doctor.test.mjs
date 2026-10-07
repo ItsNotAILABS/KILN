@@ -253,7 +253,7 @@ describe("doctorTick end-to-end", () => {
     assert.equal(readJournal(dir).filter((e) => e.type === "death").length, 1, "no duplicate death");
   }, { timeout: 120000 });
 
-  it("does not re-capture a death it already handled", async () => {
+  it("retries a failed recovery for a handled death without re-capturing forensics", async () => {
     const dir = scratchDir();
     deadDaemonJson(dir);
     // Simulate a previous failed recovery for this exact dead instance.
@@ -276,8 +276,10 @@ describe("doctorTick end-to-end", () => {
     writeFileSync(statePath, JSON.stringify({ lastHandledDeathId: "99999999|2026-09-19T00:00:00.000Z" }) + "\n");
     const bundlesBefore = readdirSync(join(doctorDir(dir), "deaths")).length;
     const res = await doctorTick(dir);
-    assert.equal(res.healthy, false);
-    assert.equal(res.alreadyHandled, true);
+    // New contract (2026-10-07): a FAILED recovery is retried with backoff,
+    // not skipped forever — but forensics must NOT be re-captured.
+    assert.equal(res.retried, true, `expected a retry, got: ${JSON.stringify(res)}`);
+    if (res.pid) cleanupPids.push(res.pid);
     assert.equal(readdirSync(join(doctorDir(dir), "deaths")).length, bundlesBefore, "no second bundle");
     assert.equal(readJournal(dir).filter((e) => e.type === "death").length, 1, "no second death event");
   });

@@ -19,7 +19,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir, ensureStateDir, loadConfig, listNodeIds, loadNode, saveNode,
-  pidAlive, pidIsDaemon, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
+  pidAlive, pidIsDaemon, processStartId, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
 } from "./state.mjs";
 import { appendEvent, pendingJobs } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
@@ -92,10 +92,22 @@ function acquireLock(dir) {
     // between the check and the claim, making a stale lock look live (seen
     // 2026-09-21: restart refused with "lock held by live pid" while no
     // daemon ran). pidIsDaemon verifies the cmdline actually belongs to
-    // this daemon.
+    // this daemon — and the startId fence below catches the deeper case:
+    // a recycled pid running a DIFFERENT daemon.mjs is still not THIS one.
     try {
       const d = JSON.parse(readFileSync(daemonJsonPath(dir), "utf8"));
-      if (pidIsDaemon(d.pid, dir)) return false; // genuinely running
+      if (pidIsDaemon(d.pid, dir)) {
+        if (d.startId) {
+          const live = processStartId(d.pid);
+          if (live !== d.startId) {
+            log(`reclaiming stale daemon lock (pid ${d.pid} recycled: start identity ${live ?? "gone"} != recorded ${d.startId})`);
+          } else {
+            return false; // genuinely running: same pid AND same boot-relative start
+          }
+        } else {
+          return false; // genuinely running (old daemon.json without startId)
+        }
+      }
     } catch { /* fall through: stale */ }
     unlinkSync(lockPath(dir));
     const fd = openSync(lockPath(dir), "wx");
@@ -355,6 +367,12 @@ async function main() {
     startedAt: new Date().toISOString(),
     apiPort: api.port,
     apiUrl: api.url,
+    // Process-start identity (Grade 0): pid + boot-relative starttime fences
+    // pid recycling, and bootId uniquely identifies this boot for forensics.
+    // acquireLock() and the doctor use startId to tell a recycled pid from
+    // the daemon that actually held the lock.
+    startId: processStartId(process.pid),
+    bootId: `${Date.now().toString(36)}-${process.pid}-${Math.floor(Math.random() * 0xffffffff).toString(36)}`,
   }) + "\n");
   log(`up pid=${process.pid} dir=${dir}`);
 

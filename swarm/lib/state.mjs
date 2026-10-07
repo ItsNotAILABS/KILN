@@ -151,17 +151,67 @@ export function pidAlive(pid) {
 /// On non-Linux (/proc unavailable) falls back to trusting pidAlive.
 export function pidIsDaemon(pid, dir) {
   if (!pidAlive(pid)) return false;
+  const r = procCmdline(pid);
+  if (r.status === "vanished") return false; // TOCTOU: died between the checks
+  if (r.status === "unreadable") return pidAlive(pid); // non-Linux fallback
+  const cmd = r.cmd;
+  if (!cmd.includes("daemon.mjs")) return false;
+  // Same script could serve another state dir — check the env marker too.
+  try {
+    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+    if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
+  } catch { /* environ unreadable — cmdline match is enough */ }
+  return true;
+}
+
+/**
+ * Read /proc/<pid>/cmdline, distinguishing the three outcomes that matter
+ * for pid-identity checks. Never throws.
+ *
+ *   { status: "ok", cmd }         — process is there and cmdline was read
+ *   { status: "vanished" }        — /proc/<pid> is gone (ENOENT): the process
+ *                                   died between pidAlive() and this read.
+ *                                   This is the TOCTOU window that made
+ *                                   pidIsDaemon() return TRUE for a dead pid
+ *                                   (its old catch-all returned true), which
+ *                                   self-aborted the 2026-10-07T05:30:27Z
+ *                                   daemon recovery with "lock held by live
+ *                                   pid" while no daemon was running.
+ *   { status: "unreadable" }      — /proc itself is unavailable (non-Linux)
+ *                                   or the read failed another way; callers
+ *                                   fall back to pidAlive().
+ */
+export function procCmdline(pid) {
   try {
     const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
-    if (!cmd.includes("daemon.mjs")) return false;
-    // Same script could serve another state dir — check the env marker too.
-    try {
-      const env = readFileSync(`/proc/${pid}/environ`, "utf8");
-      if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
-    } catch { /* environ unreadable — cmdline match is enough */ }
-    return true;
+    return { status: "ok", cmd };
+  } catch (e) {
+    if (e.code === "ENOENT" && existsSync("/proc")) return { status: "vanished" };
+    return { status: "unreadable" };
+  }
+}
+
+/**
+ * Boot-relative process start identity: "<pid>:<starttime ticks>".
+ *
+ * A recycled pid gets a NEW starttime, so comparing a recorded startId
+ * against the live /proc/<pid>/stat fences pid reuse: the lock and
+ * daemon.json can no longer be fooled by an unrelated process that
+ * inherited a dead daemon's pid. Returns null when the process is gone
+ * or /proc is unavailable.
+ */
+export function processStartId(pid) {
+  if (!pid) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 22 (1-based) is starttime in clock ticks since boot. comm may
+    // contain spaces/parens, so split from the last ")".
+    const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+    const starttime = fields[19]; // fields 3..22 → index 19
+    if (!starttime || !/^\d+$/.test(starttime)) return null;
+    return `${pid}:${starttime}`;
   } catch {
-    return true; // /proc unavailable: fall back to pidAlive behavior
+    return null;
   }
 }
 
