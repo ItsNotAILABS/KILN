@@ -19,7 +19,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir, ensureStateDir, loadConfig, listNodeIds, loadNode, saveNode,
-  pidAlive, pidIsDaemon, processStartId, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
+  pidIsDaemon, pidIsWorker, processStartId, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
 } from "./state.mjs";
 import { appendEvent, pendingJobs } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
@@ -137,7 +137,9 @@ function spawnWorker(dir, id) {
 }
 
 function nodeStatus(dir, cfg, node) {
-  const alive = pidAlive(node.workerPid);
+  // pidIsWorker, not bare pidAlive: a dead worker's pid can be recycled by
+  // an unrelated process, which must NOT be adopted as a live worker.
+  const alive = pidIsWorker(node.workerPid, dir);
   const hbAge = heartbeatAgeMs(dir, node.id);
   const fresh = hbAge < cfg.heartbeatTimeoutMs;
   if (alive && fresh) return readJobFile(dir, node.id) ? "working" : "idle";
@@ -171,11 +173,12 @@ function reconcile(dir, cfg) {
 }
 
 function reapExited(dir) {
-  // Detect workers that died without the daemon noticing: pid gone but
-  // record still claims it. reconcile() handles the respawn.
+  // Detect workers that died without the daemon noticing: pid gone (or
+  // recycled by a non-worker process) but record still claims it.
+  // reconcile() handles the respawn.
   for (const id of listNodeIds(dir)) {
     const node = loadNode(dir, id);
-    if (node.workerPid && !pidAlive(node.workerPid)) {
+    if (node.workerPid && !pidIsWorker(node.workerPid, dir)) {
       if (node.lastExit === null || node.lastExit === undefined) {
         // We don't know the exit code; treat unknown death as failure-ish.
         node.lastExit = 1;

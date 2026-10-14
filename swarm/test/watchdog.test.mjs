@@ -189,6 +189,25 @@ describe("stale lock vs pid reuse (2026-09-21 incident)", () => {
     }
   });
 
+  it("pidIsDaemon returns false when the pid dies between pidAlive and the /proc read (2026-10-07 TOCTOU)", async () => {
+    const { pidIsDaemon } = await import("../lib/state.mjs");
+    const dir = makeStateDir();
+    // Simulate the 05:30Z recovery failure: kill(pid,0) succeeds (zombie or
+    // not-yet-reaped) but /proc/<pid>/cmdline then throws ENOENT. The old
+    // code treated that as "genuinely running" and blocked lock reclamation.
+    const FAKE_PID = 99999999;
+    const origKill = process.kill;
+    process.kill = (pid, sig) => {
+      if (pid === FAKE_PID && sig === 0) return true;
+      return origKill.call(process, pid, sig);
+    };
+    try {
+      assert.equal(pidIsDaemon(FAKE_PID, dir), false, "a pid that vanishes after pidAlive must not pass as the daemon");
+    } finally {
+      process.kill = origKill;
+    }
+  });
+
   it("daemon start reclaims the lock when daemon.json points at a reused pid", async () => {
     const dir = makeStateDir();
     // Ephemeral port so the new daemon never collides with the live one.

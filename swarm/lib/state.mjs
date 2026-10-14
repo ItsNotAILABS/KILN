@@ -164,6 +164,28 @@ export function pidIsDaemon(pid, dir) {
   return true;
 }
 
+/// True if pid is a live process running a swarm WORKER for `dir` — not a
+/// pid-reuse impostor. kill(pid,0) alone is racy: a dead worker's pid can be
+/// recycled by an unrelated process, which reconcile() would then "adopt" as
+/// a live worker instead of respawning the real one (seen 2026-10-02: a
+/// test daemon inherited a dead app worker's pid; both apps went dark while
+/// the daemon insisted their workers were alive). Mirrors pidIsDaemon,
+/// including its TOCTOU semantics via procCmdline. On non-Linux
+/// (/proc unavailable) falls back to trusting pidAlive.
+export function pidIsWorker(pid, dir) {
+  if (!pidAlive(pid)) return false;
+  const r = procCmdline(pid);
+  if (r.status === "vanished") return false; // TOCTOU: died between the checks
+  if (r.status === "unreadable") return pidAlive(pid); // non-Linux fallback
+  if (!r.cmd.includes("worker.mjs")) return false;
+  // Same script could serve another state dir — check the env marker too.
+  try {
+    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+    if (!env.includes(`KILN_SWARM_DIR=${dir}\0`)) return false;
+  } catch { /* environ unreadable — cmdline match is enough */ }
+  return true;
+}
+
 /**
  * Read /proc/<pid>/cmdline, distinguishing the three outcomes that matter
  * for pid-identity checks. Never throws.
