@@ -219,35 +219,6 @@ Workers inherit the daemon's environment, so the URL must be set **before**
 `daemon start`. Without a real `KILN_MIND_URL` the http mind **refuses
 loudly** — the plumbing is real, the model is yours to plug in.
 
-## Persistent daemon config — `<stateDir>/daemon.env`
-
-The daemon is restarted by different processes at different times (a shell,
-`daemon watchdog`, the Doctor's medic), each with its own ambient
-environment — so daemon settings that must survive cannot live only in a
-shell export. Put them in `<stateDir>/daemon.env` instead:
-
-```sh
-# ~/.kiln-swarm/daemon.env — selects the real neural memory embedder
-KILN_MEMORY_EMBEDDER=minilm-l6-v2
-```
-
-`daemonStart()` (the one spawn path behind `daemon start`, the watchdog,
-and Doctor recovery) builds the daemon child's env through
-`lib/daemon-env.mjs`: the file supplies any variable the starting process
-did not specify; **an explicit process variable always wins over the
-file** (even when set empty), and `KILN_SWARM_DIR` is always forced to
-the state dir being started. The file applies only to the daemon child
-(and, by inheritance, its workers) — never to the CLI, watchdog, or
-Doctor process that started it.
-
-Format: one `KEY=VALUE` per line; blank lines and `#` comment lines are
-ignored; an optional `export ` prefix and matching surrounding quotes are
-accepted. It is **not** a shell fragment — values are literal (no `$`
-expansion, no command substitution), keys must be valid variable names,
-and malformed lines are warned about and skipped, never fatal to a boot.
-Changing the file does not affect a running daemon; it takes effect on
-the next boot, whenever that naturally happens.
-
 ## Honesty notes
 
 - Tool calls really execute: real file writes, real `git`, real subprocesses.
@@ -330,38 +301,10 @@ budget — storage is unbounded, context is not. Full design:
 ```sh
 node swarm.mjs memory remember --repo auro/auro --title "Decision" \
   --content "We deploy on Tuesdays now." --tags ops
-node swarm.mjs memory core --repo auro/auro --label working \
-  --value "Ship Tuesday deploys"
-node swarm.mjs memory sit --repo auro/auro
 node swarm.mjs memory context --repo auro/auro --q "deploy day" --budget 4000
 node swarm.mjs memory verify  --repo auro/auro
 ```
 
-Also on the HTTP API (`/git/:o/:r/memory/*`, authenticated, including
-`GET /memory/sit`) and the SDK (`client.memoryRemember`, `memoryFact`,
-`memoryRecall`, `memoryContext`, `memorySit`, `memoryVerify`, …).
-Agents read `../MEMORY.md` first, then sit. Tests: `test/memory.test.mjs`.
-
-## Sites — the whole product as one record
-
-A **site** links a frontend repo + a backend repo + the published
-artifact + the compute app that runs the backend, so KILN can connect
-and report on a whole site instead of separate pieces. The registry is
-`<stateDir>/sites.json`; the durable links are KILN Memory core blocks
-written into both repos on create (`backend_repo` / `frontend_repo` /
-`artifact` / `site`), so either repo can walk to the whole site.
-`GET /v1/sites/:id` aggregates live status — both repos' HEADs, the
-app's real readiness, and whether the memory linkage is intact in both
-repos. Full design: `docs/SITES.md` (in `swarm/docs/`).
-
-```sh
-node swarm.mjs sites add --name shopstream \
-  --frontend auro/shopstream-web --backend auro/shopstream-api \
-  --artifact shopstream --app shopstream-api
-node swarm.mjs sites list
-node swarm.mjs sites show shopstream
-```
-
-Also on the HTTP API (`/v1/sites`, authenticated). Deleting a site
-removes only the registry entry — repos, apps, and memory are
-untouched. Tests: `test/sites.test.mjs` (9).
+Also on the HTTP API (`/git/:o/:r/memory/*`, authenticated) and the SDK
+(`client.memoryRemember`, `memoryFact`, `memoryRecall`, `memoryContext`,
+`memoryVerify`, …). Tests: `test/memory.test.mjs` (14).

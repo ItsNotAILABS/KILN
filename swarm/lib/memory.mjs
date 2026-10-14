@@ -42,22 +42,12 @@
  * nothing here invents a hash or a commit.
  *
  * Honest boundaries (v1):
- *   - Replay is O(events) in memory. The ref is always the source of
- *     truth; recall is served by the rebuildable FTS5 sidecar in
- *     lib/memory-index.mjs (phase 1) whenever it is available, with
- *     this replay as the fallback and the auditor.
+ *   - Replay is O(events) in memory. A rebuildable index cache is a
+ *     later phase; the ref is always the source of truth.
  *   - Retrieval is lexical BM25 + recency + salience + 1-hop link
- *     expansion, fused (phase 3, lib/memory-vectors.mjs) with a
- *     persisted vector tier whose default embedder is deterministic
- *     feature hashing — a lexical signal (shared tokens + character
- *     n-grams), NOT semantic search. No fake "AI search": the tier
- *     names its embedder in every fused result.
- *   - Events are hash-chained AND signed (phase 2, lib/memory-signing.mjs):
- *     every append carries an Ed25519 signature by the state dir's
- *     memory key, verified on every read. History written before
- *     phase 2 stays readable as unsigned-legacy; the chain's signing
- *     epoch opens at its first signed event, and from there on an
- *     unsigned or badly-signed event is a loud error.
+ *     expansion. No embeddings yet — no fake semantic search.
+ *   - Events are hash-chained but not yet node-signed; signing with
+ *     the acting node's ed25519 key (receipts-style) is a later phase.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -66,16 +56,6 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { canon, sha256hex, sha256hexOfCanon } from "./canon.mjs";
 import { repoPath, repoExists } from "./git.mjs";
-import { recallIndexed, memoryIndexInfo } from "./memory-index.mjs";
-import { fuseRecallVectors, memoryVectorsInfo } from "./memory-vectors.mjs";
-import { recallCrossRepo } from "./memory-cross.mjs";
-import {
-  loadOrCreateMemoryKey, loadMemoryKey, verifyEventSignatures, signatureSummary,
-} from "./memory-signing.mjs";
-
-// Phase 6 entry point, re-exported so every surface imports memory
-// from this one module (implementation: lib/memory-cross.mjs).
-export { recallCrossRepo };
 
 export const MEMORY_REF = "refs/kiln/memory";
 const INLINE_MAX = 4096;          // content chars kept inline in the event JSON
@@ -83,7 +63,7 @@ const MAX_CONTENT = 1024 * 1024;  // hard cap per episode payload
 const MAX_APPEND_RETRIES = 5;
 const ZERO = "0".repeat(40);      // sha1 object-format "must not exist" marker
 
-const EVENT_TYPES = new Set(["episode", "fact", "supersede", "link", "core", "proposal", "proposal-status"]);
+const EVENT_TYPES = new Set(["episode", "fact", "supersede", "link", "core"]);
 const LABEL_RE = /^[a-z0-9]([a-z0-9-_]{0,62}[a-z0-9])?$/;
 
 // ---------------------------------------------------------------- git plumbing
@@ -178,20 +158,13 @@ export function readEvents(dir, owner, repo) {
   for (const b of blobs) {
     let ev;
     try { ev = JSON.parse(b.raw); } catch { throw new Error(`memory: event ${b.path} is not valid JSON`); }
-    // The hash covers the event body minus `hash` itself and minus
-    // `sig` (the signature signs the hash, so it cannot be inside it).
-    // `signer`/`signerKey` ARE covered — identity is part of the body.
-    const { hash, sig, ... unsigned } = ev;
+    const { hash, ... unsigned } = ev;
     if (ev.prev !== prevHash) throw new Error(`memory: hash chain broken at ${b.path}`);
     if (sha256hexOfCanon(unsigned) !== hash) throw new Error(`memory: event hash mismatch at ${b.path}`);
     prevHash = hash;
     if (ev.type === "episode") ev.content = resolveContent(gd, ev);
     events.push(ev);
   }
-  // Phase 2: signature epoch rules over the whole chain (throws loudly
-  // on a missing post-epoch signature or a bad one). Pre-epoch events
-  // are unsigned-legacy and pass; see lib/memory-signing.mjs.
-  verifyEventSignatures(events);
   return { tip, events };
 }
 
@@ -199,10 +172,6 @@ export function readEvents(dir, owner, repo) {
 
 function appendEvent(dir, owner, repo, build) {
   const gd = requireRepo(dir, owner, repo);
-  // Phase 2: every write is signed by the state dir's memory key
-  // (generated on first use). A write that cannot sign fails here,
-  // loudly — never lands unsigned past the signing epoch.
-  const signKey = loadOrCreateMemoryKey(dir);
   let lastError = null;
   for (let attempt = 0; attempt < MAX_APPEND_RETRIES; attempt++) {
     const { tip, events } = readEvents(dir, owner, repo);
@@ -210,10 +179,6 @@ function appendEvent(dir, owner, repo, build) {
     const prevHash = seq ? events[seq - 1].hash : "GENESIS";
     const ev = build(seq, prevHash);
     if (!EVENT_TYPES.has(ev.type)) throw new Error(`memory: bad event type ${ev.type}`);
-    // Signer identity is part of the hashed body; the signature over
-    // the final hash is attached after the hash settles (below).
-    ev.signer = signKey.signer;
-    ev.signerKey = signKey.pubSpkiB64;
     ev.hash = sha256hexOfCanon(ev);
 
     const tmp = mkdtempSync(join(tmpdir(), "kiln-mem-idx-"));
@@ -229,13 +194,9 @@ function appendEvent(dir, owner, repo, build) {
         ev.contentBlob = { oid, size: ev.content.length, sha256: sha256hex(ev.content) };
         delete ev.content;
         // The hash must cover the final stored shape — recompute.
-        const { hash, sig, ...unsigned } = ev;
+        const { hash, ...unsigned } = ev;
         ev.hash = sha256hexOfCanon(unsigned);
       }
-
-      // Sign the final hash (receipts-style: the signature is over
-      // the hash hex string, verifiable from the event alone).
-      ev.sig = signKey.signText(ev.hash);
 
       const evOid = git(gd, ["hash-object", "-w", "--stdin"], { input: canon(ev) }).trim();
       const name = `events/${String(seq).padStart(8, "0")}-${ev.id}.json`;
@@ -310,30 +271,32 @@ export function remember(dir, owner, repo, opts = {}) {
 }
 
 /**
- * Validate + normalize a fact payload against the current chain.
- * Shared by assertFact (direct write) and proposeMemory (phase 4:
- * the same payload, parked as a proposal until ratified). Provenance
- * is mandatory in both paths: at least one source episode id, and
- * every id must exist. `supersedes` must name real facts.
+ * Assert a fact derived from episodes. Provenance is mandatory: at
+ * least one source episode id, and every id must exist. `supersedes`
+ * invalidates older facts in the same atomic event.
  */
-function validateFactPayload(events, opts) {
+export function assertFact(dir, owner, repo, opts = {}) {
   const subject = reqString(opts.subject, "subject", 2000);
   const predicate = reqString(opts.predicate, "predicate", 2000);
   const object = reqString(opts.object, "object", 2000);
   const sources = optStrings(opts.sourceEpisodes, "sourceEpisodes");
   if (!sources.length) throw new Error("memory: fact requires >= 1 source episode (provenance is mandatory)");
   const supersedes = optStrings(opts.supersedes, "supersedes");
+  const { events } = readEvents(dir, owner, repo);
   const byId = new Map(events.map((e) => [e.id, e]));
   for (const id of sources) {
     const src = byId.get(id);
-    if (!src) throw new Error(`memory: source episode ${id} not found`);
+    if (!src) throw new Error(`memory: source episode ${id} not found in ${owner}/${repo}`);
     if (src.type !== "episode") throw new Error(`memory: source ${id} is a ${src.type}, not an episode`);
   }
   for (const id of supersedes) {
     const t = byId.get(id);
-    if (!t || t.type !== "fact") throw new Error(`memory: supersede target ${id} is not a fact`);
+    if (!t || t.type !== "fact") throw new Error(`memory: supersede target ${id} is not a fact in ${owner}/${repo}`);
   }
-  return {
+  return appendEvent(dir, owner, repo, (seq, prev) => ({
+    v: 1, id: newMemoryId(), seq, prev, type: "fact",
+    ts: Math.floor(Date.now() / 1000),
+    actor: String(opts.actor || "api"),
     subject, predicate, object,
     confidence: Number.isFinite(opts.confidence) ? Math.min(1, Math.max(0, opts.confidence)) : null,
     validFrom: opts.validFrom ? new Date(isoToSec(opts.validFrom, "validFrom") * 1000).toISOString() : null,
@@ -341,23 +304,6 @@ function validateFactPayload(events, opts) {
     supersedes,
     entities: optStrings(opts.entities ?? [subject, object], "entities"),
     salience: Number.isFinite(opts.salience) ? Math.min(5, Math.max(0, opts.salience)) : 1,
-  };
-}
-
-/**
- * Assert a fact derived from episodes. Provenance is mandatory: at
- * least one source episode id, and every id must exist. `supersedes`
- * invalidates older facts in the same atomic event.
- */
-export function assertFact(dir, owner, repo, opts = {}) {
-  const { events } = readEvents(dir, owner, repo);
-  const f = validateFactPayload(events, opts);
-  return appendEvent(dir, owner, repo, (seq, prev) => ({
-    v: 1, id: newMemoryId(), seq, prev, type: "fact",
-    ts: Math.floor(Date.now() / 1000),
-    actor: String(opts.actor || "api"),
-    ...f,
-    ...(opts.viaProposal ? { viaProposal: String(opts.viaProposal) } : {}),
   }));
 }
 
@@ -390,7 +336,6 @@ export function linkMemories(dir, owner, repo, opts = {}) {
     ts: Math.floor(Date.now() / 1000),
     actor: String(opts.actor || "api"),
     from, to, relation,
-    ...(opts.viaProposal ? { viaProposal: String(opts.viaProposal) } : {}),
   }));
 }
 
@@ -405,117 +350,15 @@ export function setCore(dir, owner, repo, opts = {}) {
     actor: String(opts.actor || "api"),
     label, value,
     description: opts.description ? String(opts.description).slice(0, 500) : "",
-    ...(opts.viaProposal ? { viaProposal: String(opts.viaProposal) } : {}),
   }));
-}
-
-// ---------------------------------------------------------------------------
-// Consolidation proposals (phase 4, 2026-10-17).
-//
-// A consolidation pass — an agent reading new episodes, Letta sleep-time
-// style — never writes facts directly. It PROPOSES: a proposal is an
-// event carrying a fully validated would-be fact/link/core payload,
-// invisible to recall (proposals are not docs) until a human or the
-// acting agent ratifies it. Ratification materializes the real event
-// (marked viaProposal) and appends a proposal-status event; rejection
-// appends only the status. Both decisions are events too — the whole
-// lifecycle is in the hash chain, auditable and replayable.
-
-/**
- * Propose a fact/link/core write. The payload is validated exactly as
- * the direct write would be (same validators, same provenance rules) —
- * a proposal that could never land is refused at propose time, not at
- * ratify time. Returns the proposal event.
- */
-export function proposeMemory(dir, owner, repo, opts = {}) {
-  const kind = reqString(opts.kind, "kind", 16);
-  if (!["fact", "link", "core"].includes(kind)) {
-    throw new Error(`memory: proposal kind must be fact|link|core, got "${kind}"`);
-  }
-  const p = opts.payload && typeof opts.payload === "object" ? opts.payload : {};
-  const { events } = readEvents(dir, owner, repo);
-  const byId = new Map(events.map((e) => [e.id, e]));
-  let payload;
-  if (kind === "fact") {
-    payload = validateFactPayload(events, p);
-  } else if (kind === "link") {
-    const from = reqString(p.from, "from", 128);
-    const to = reqString(p.to, "to", 128);
-    if (!byId.has(from)) throw new Error(`memory: link source ${from} not found`);
-    if (!byId.has(to)) throw new Error(`memory: link target ${to} not found`);
-    payload = { from, to, relation: reqString(p.relation, "relation", 64) };
-  } else {
-    const label = reqString(p.label, "label", 64);
-    if (!LABEL_RE.test(label)) throw new Error(`memory: bad core label "${label}"`);
-    payload = {
-      label,
-      value: reqString(p.value, "value", 20000),
-      description: p.description ? String(p.description).slice(0, 500) : "",
-    };
-  }
-  return appendEvent(dir, owner, repo, (seq, prev) => ({
-    v: 1, id: newMemoryId(), seq, prev, type: "proposal",
-    ts: Math.floor(Date.now() / 1000),
-    actor: String(opts.actor || "api"),
-    proposalKind: kind,
-    payload,
-    rationale: opts.rationale ? String(opts.rationale).slice(0, 1000) : "",
-  }));
-}
-
-/**
- * Ratify or reject a pending proposal. Ratify materializes the payload
- * through the normal writers (marked viaProposal) and then records the
- * decision; the materialization is idempotent — if it already exists
- * (crash between the two appends, or a retried call), it is reused,
- * never duplicated. Reject records the decision only.
- */
-export function resolveProposal(dir, owner, repo, opts = {}) {
-  const target = reqString(opts.proposal, "proposal", 128);
-  const decision = reqString(opts.decision, "decision", 16);
-  if (decision !== "ratified" && decision !== "rejected") {
-    throw new Error(`memory: decision must be ratified|rejected, got "${decision}"`);
-  }
-  const actor = String(opts.actor || "api");
-  const state = loadMemory(dir, owner, repo);
-  const prop = state.proposals.find((x) => x.id === target);
-  if (!prop) throw new Error(`memory: proposal ${target} not found in ${owner}/${repo}`);
-  if (prop.status !== "pending") {
-    throw new Error(`memory: proposal ${target} is already ${prop.status}`);
-  }
-  let materialized = null;
-  if (decision === "ratified") {
-    if (prop.materializedId) {
-      materialized = state.events.find((e) => e.id === prop.materializedId) || null;
-    }
-    if (!materialized) {
-      const p = prop.payload;
-      const r = prop.proposalKind === "fact"
-        ? assertFact(dir, owner, repo, { ...p, actor, viaProposal: prop.id })
-        : prop.proposalKind === "link"
-          ? linkMemories(dir, owner, repo, { ...p, actor, viaProposal: prop.id })
-          : setCore(dir, owner, repo, { ...p, actor, viaProposal: prop.id });
-      materialized = r.event;
-    }
-  }
-  const status = appendEvent(dir, owner, repo, (seq, prev) => ({
-    v: 1, id: newMemoryId(), seq, prev, type: "proposal-status",
-    ts: Math.floor(Date.now() / 1000),
-    actor,
-    target,
-    decision,
-    reason: opts.reason ? String(opts.reason).slice(0, 1000) : "",
-    materializedId: materialized ? materialized.id : null,
-  }));
-  return { proposal: prop, decision, materialized, statusEvent: status.event, commit: status.commit };
 }
 
 // ---------------------------------------------------------------- derived state
 
-export function factValidFrom(ev) {
+function factValidFrom(ev) {
   return ev.validFrom ? Math.floor(Date.parse(ev.validFrom) / 1000) : ev.ts;
 }
-export function episodeWhen(ev) {
+function episodeWhen(ev) {
   return ev.eventDate ? Math.floor(Date.parse(ev.eventDate) / 1000) : ev.ts;
 }
 
@@ -525,13 +368,6 @@ export function replayMemory(events) {
   const facts = new Map();
   const links = [];
   const core = new Map();
-  const proposals = new Map();
-  const noteMaterialized = (ev) => {
-    if (ev.viaProposal) {
-      const p = proposals.get(ev.viaProposal);
-      if (p) p.materializedId = ev.id;
-    }
-  };
   for (const ev of events) {
     if (ev.type === "episode") {
       episodes.push(ev);
@@ -544,7 +380,6 @@ export function replayMemory(events) {
           old.invalidatedBy = ev.id;
         }
       }
-      noteMaterialized(ev);
     } else if (ev.type === "supersede") {
       const t = facts.get(ev.target);
       if (t && t.invalidAtTs === null) {
@@ -553,27 +388,11 @@ export function replayMemory(events) {
       }
     } else if (ev.type === "link") {
       links.push(ev);
-      noteMaterialized(ev);
     } else if (ev.type === "core") {
       core.set(ev.label, { label: ev.label, value: ev.value, description: ev.description || "", updatedSeq: ev.seq, updatedTs: ev.ts, eventId: ev.id });
-      noteMaterialized(ev);
-    } else if (ev.type === "proposal") {
-      proposals.set(ev.id, {
-        ...ev, status: "pending", decidedBy: null, decidedTs: null,
-        decisionReason: "", materializedId: null,
-      });
-    } else if (ev.type === "proposal-status") {
-      const p = proposals.get(ev.target);
-      if (p && p.status === "pending") {
-        p.status = ev.decision;
-        p.decidedBy = ev.actor;
-        p.decidedTs = ev.ts;
-        p.decisionReason = ev.reason || "";
-        if (ev.materializedId) p.materializedId = ev.materializedId;
-      }
     }
   }
-  return { episodes, facts: [...facts.values()], links, core: [...core.values()], proposals: [...proposals.values()] };
+  return { episodes, facts: [...facts.values()], links, core: [...core.values()] };
 }
 
 export function loadMemory(dir, owner, repo) {
@@ -612,24 +431,11 @@ export function memoryStats(dir, owner, repo) {
     byType,
     episodes: state.episodes.length,
     facts: { total: state.facts.length, current: current.length, superseded: state.facts.length - current.length },
-    proposals: {
-      pending: state.proposals.filter((x) => x.status === "pending").length,
-      ratified: state.proposals.filter((x) => x.status === "ratified").length,
-      rejected: state.proposals.filter((x) => x.status === "rejected").length,
-    },
     links: state.links.length,
     coreBlocks: state.core.map((c) => c.label),
-    signing: {
-      // The state dir's current write key (null until the first
-      // signed write creates it — reads never create it).
-      currentSigner: (loadMemoryKey(dir) || {}).signer || null,
-      ...signatureSummary(state.events),
-    },
     bytes,
     oldestTs: state.events.length ? state.events[0].ts : null,
     newestTs: state.events.length ? state.events[state.events.length - 1].ts : null,
-    index: memoryIndexInfo(dir, owner, repo),
-    vectors: memoryVectorsInfo(dir, owner, repo),
   };
 }
 
@@ -637,7 +443,7 @@ export function memoryStats(dir, owner, repo) {
 export function verifyMemory(dir, owner, repo) {
   const gd = requireRepo(dir, owner, repo);
   const tip = memoryTip(gd);
-  if (!tip) return { ok: true, events: 0, commits: 0, tip: null, signatures: signatureSummary([]) };
+  if (!tip) return { ok: true, events: 0, commits: 0, tip: null };
   const lines = git(gd, ["rev-list", "--parents", "--reverse", tip]).trim().split("\n").filter(Boolean);
   let prevCommit = null;
   for (const line of lines) {
@@ -660,13 +466,7 @@ export function verifyMemory(dir, owner, repo) {
   for (let i = 0; i < state.events.length; i++) {
     if (state.events[i].seq !== i) return { ok: false, error: `event seq gap at ${i}` };
   }
-  // Signatures were already enforced by loadMemory -> readEvents
-  // (a bad or post-epoch-missing signature threw above and became
-  // ok:false); the summary reports the chain's signing posture.
-  return {
-    ok: true, events: state.events.length, commits: lines.length, tip,
-    signatures: signatureSummary(state.events),
-  };
+  return { ok: true, events: state.events.length, commits: lines.length, tip };
 }
 
 // ---------------------------------------------------------------- retrieval (BM25 + recency + salience + links)
@@ -675,7 +475,7 @@ export function tokenize(text) {
   return String(text || "").toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 2);
 }
 
-export function docText(kind, item) {
+function docText(kind, item) {
   if (kind === "episode") return [item.title, item.kind, item.content, ...(item.tags || []), ...(item.entities || [])].join("\n");
   return [item.subject, item.predicate, item.object, ...(item.entities || [])].join("\n");
 }
@@ -689,51 +489,11 @@ function estimateTokens(text) {
  * salience and recency, expanded one hop across explicit links.
  * Returns ranked [{kind, id, seq, score, via, item}] — `via` is
  * "search" or "link:<relation>:<otherId>" so ranking is explainable.
- *
- * Served by the FTS5 sidecar (lib/memory-index.mjs) whenever it is
- * available; the full-replay scan below is the fallback and auditor.
- * The result names its engine: "index" or "scan". When the phase-3
- * vector tier (lib/memory-vectors.mjs) is enabled it fuses cosine
- * similarity into the ranking and adds a `fusion` provenance block;
- * any tier failure serves the lexical result untouched.
- *
- * With owner "*" this is the phase-6 cross-repo mode: the query fans
- * out over every repo chain in the state dir and returns fused,
- * provenance-tagged results (lib/memory-cross.mjs). Per-repo recall
- * — this function with a real owner — is the default and unchanged.
  */
 export function recall(dir, owner, repo, query, opts = {}) {
-  // Phase 6 cross-repo mode: owner "*" fans out over every repo
-  // chain in the state dir (lib/memory-cross.mjs); `repo` is ignored
-  // ("*" by convention). Opt-in only — single-repo behavior below is
-  // unchanged.
-  if (owner === "*") return recallCrossRepo(dir, query, opts);
-  const asOfSec = opts.asOf ? isoToSec(opts.asOf, "asOf") : Math.floor(Date.now() / 1000);
-  const pre = {
-    asOfSec,
-    sinceSec: opts.since ? isoToSec(opts.since, "since") : null,
-    untilSec: opts.until ? isoToSec(opts.until, "until") : null,
-  };
-  let base = null;
-  try {
-    base = recallIndexed(dir, owner, repo, query, opts, pre);
-  } catch { /* sidecar unavailable or stale — the scan decides (and throws what it must) */ }
-  if (!base) base = recallScan(dir, owner, repo, query, opts, asOfSec);
-  // Phase 3: fuse the vector tier (lib/memory-vectors.mjs) into the
-  // lexical ranking. Any tier failure serves the base result
-  // untouched — including the chain-integrity errors the sync's
-  // verified read raises, which the scan above has already enforced
-  // identically by the time we get here.
-  try {
-    const fused = fuseRecallVectors(dir, owner, repo, query, opts, pre, base);
-    if (fused) return fused;
-  } catch { /* vector tier unavailable — the lexical result stands */ }
-  return base;
-}
-
-function recallScan(dir, owner, repo, query, opts = {}, asOf) {
   const state = loadMemory(dir, owner, repo);
   const limit = Math.min(100, Math.max(1, opts.limit ?? 10));
+  const asOf = opts.asOf ? isoToSec(opts.asOf, "asOf") : Math.floor(Date.now() / 1000);
   const kinds = new Set(opts.kinds && opts.kinds.length ? opts.kinds : ["episode", "fact"]);
   const docs = [];
   if (kinds.has("episode")) {
@@ -749,7 +509,7 @@ function recallScan(dir, owner, repo, query, opts = {}, asOf) {
       docs.push({ kind: "fact", item: f });
     }
   }
-  if (!docs.length) return { repo: `${owner}/${repo}`, query, results: [], engine: "scan" };
+  if (!docs.length) return { repo: `${owner}/${repo}`, query, results: [] };
 
   const qTokens = [...new Set(tokenize(query))];
   const docTokens = docs.map((d) => tokenize(docText(d.kind, d.item)));
@@ -819,7 +579,7 @@ function recallScan(dir, owner, repo, query, opts = {}, asOf) {
       sourceEpisodes: d.kind === "fact" ? d.item.sourceEpisodes : undefined,
       superseded: d.kind === "fact" ? d.item.invalidAtTs !== null : undefined,
     }));
-  return { repo: `${owner}/${repo}`, query, results, engine: "scan" };
+  return { repo: `${owner}/${repo}`, query, results };
 }
 
 /**
@@ -898,46 +658,5 @@ export function buildContext(dir, owner, repo, opts = {}) {
     facts: factsOut,
     episodes: epsOut,
     text,
-  };
-}
-
-/**
- * The brief an agent prints before it writes.
- * The core block labeled "working" is the one current task.
- * Facts and episodes stay short. The event chain is not the brief.
- */
-export function agentAwareness(dir, owner, repo, opts = {}) {
-  const state = loadMemory(dir, owner, repo);
-  const working = state.core.find((block) => block.label === "working") || null;
-  const pack = buildContext(dir, owner, repo, {
-    query: opts.query,
-    budgetTokens: opts.budgetTokens ?? 1200,
-    asOf: opts.asOf,
-  });
-  const facts = pack.facts.slice(0, 6);
-  const episodes = pack.episodes.slice(0, 4);
-  const lines = [
-    `KILN · ${owner}/${repo}`,
-    working ? `Working: ${working.value}` : "Working: none. Set the core block labeled working.",
-  ];
-  if (facts.length) {
-    lines.push("Facts:");
-    for (const fact of facts) lines.push(`- ${fact.subject} ${fact.predicate} ${fact.object}`);
-  }
-  if (episodes.length) {
-    lines.push("Memory:");
-    for (const episode of episodes) lines.push(`- ${episode.kind || "episode"} · ${episode.title || episode.id}`);
-  }
-  lines.push(working ? `Next: ${working.value}` : "Next: set working, then remember the decision that follows.");
-  lines.push("Print this. Do not dump the event chain.");
-  return {
-    ok: true,
-    repo: `${owner}/${repo}`,
-    working: working ? working.value : "",
-    facts: facts.length,
-    episodes: episodes.length,
-    usedTokens: pack.usedTokens,
-    budgetTokens: pack.budgetTokens,
-    text: lines.join("\n"),
   };
 }

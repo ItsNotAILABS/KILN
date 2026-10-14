@@ -15,8 +15,6 @@
  *   swarm.mjs receipts verify [--node ID] [--dir PATH]
  *   swarm.mjs repo create --owner O --repo R [--dir PATH]
  *   swarm.mjs repo list [--dir PATH]
- *   swarm.mjs promote <owner>/<repo> [--github OWNER/REPO] [--branch B]
- *                        [--rebase] [--force] [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -35,7 +33,10 @@ import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
 import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
-import { promoteRepo } from "./lib/promote.mjs";
+import {
+  remember, assertFact, supersedeFact, linkMemories, setCore,
+  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
+} from "./lib/memory.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
@@ -499,48 +500,77 @@ async function cmdRepo(args) {
   } else { console.error("usage: repo create|list"); process.exit(2); }
 }
 
-// ---------------------------------------------------------------- promote (KILN -> GitHub)
+// ---------------------------------------------------------------- memory (per-repo)
 
-function splitOwnerRepo(s, what) {
-  const i = typeof s === "string" ? s.indexOf("/") : -1;
-  if (i <= 0 || i === s.length - 1) {
-    console.error(`usage: ${what} must be <owner>/<repo>`);
-    process.exit(2);
-  }
-  return [s.slice(0, i), s.slice(i + 1)];
+function repoArg(args) {
+  const s = need(args, "repo");
+  const i = String(s).indexOf("/");
+  if (i <= 0 || i === String(s).length - 1) { console.error("--repo must be <owner>/<repo>"); process.exit(2); }
+  return [String(s).slice(0, i), String(s).slice(i + 1)];
+}
+function csv(v) {
+  return v === undefined || v === true ? [] : String(v).split(",").map((x) => x.trim()).filter(Boolean);
 }
 
-async function cmdPromote(args) {
+async function cmdMemory(args) {
+  const sub = args._[1];
   const dir = dirOf(args);
   ensureStateDir(dir);
-  const target = args._[1];
-  if (!target) {
-    console.error("usage: promote <owner>/<repo> [--github OWNER/REPO] [--branch B] [--rebase] [--force]");
-    process.exit(2);
-  }
-  const [owner, repo] = splitOwnerRepo(target, "promote target");
-  let githubOwner, githubRepo;
-  if (args.github) [githubOwner, githubRepo] = splitOwnerRepo(String(args.github), "--github");
-  const r = await promoteRepo(dir, owner, repo, {
-    githubOwner,
-    githubRepo,
-    branch: args.branch ? String(args.branch) : undefined,
-    rebase: !!args.rebase,
-    force: !!args.force,
-  });
-  // One-screen receipt (KILN standard shape; token never printed).
-  console.log(`🔥 KILN · ${r.repo} → GitHub ${r.github || "(no destination)"}${r.branch ? "@" + r.branch : ""}`);
-  console.log(`  source ${r.sourceBranch || "?"} @ ${(r.sourceTip || "").slice(0, 7)} · ${r.commitsPlanned} of ${r.commitsTotal} commit(s)${r.rebased ? " · rebased onto GitHub tip" : ""}${r.forced ? " · FORCED" : ""}`);
-  for (const c of r.commits) {
-    console.log(`  built ${c.from.slice(0, 12)} -> ${c.to.slice(0, 12)} (${c.blobs} blobs) ${c.subject}`);
-  }
-  for (const w of r.warnings) console.log(`  ⚠ ${w}`);
-  if (r.ok) {
-    console.log(r.note ? `✅ ${r.note}` : `✅ promoted${r.newTip ? ` → ${r.newTip.slice(0, 12)}` : ""}`);
-    console.log(`  ${r.url}`);
+  const [owner, repo] = repoArg(args);
+  const actor = args.actor ? String(args.actor) : "cli";
+  if (sub === "remember") {
+    const content = args.file ? readFileSync(resolve(String(args.file)), "utf8") : need(args, "content");
+    const r = remember(dir, owner, repo, {
+      title: args.title, kind: args.kind, content: String(content),
+      tags: csv(args.tags), entities: csv(args.entities),
+      eventDate: args.date, actor,
+      source: args.source ? { type: "ref", ref: String(args.source) } : undefined,
+    });
+    console.log(`remembered ${r.event.id} (seq ${r.event.seq}) in ${owner}/${repo} @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "fact") {
+    const r = assertFact(dir, owner, repo, {
+      subject: need(args, "subject"), predicate: need(args, "predicate"), object: need(args, "object"),
+      sourceEpisodes: csv(need(args, "sources")), supersedes: csv(args.supersedes),
+      validFrom: args.from, actor,
+    });
+    console.log(`fact ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "supersede") {
+    const r = supersedeFact(dir, owner, repo, { fact: need(args, "fact"), reason: args.reason, actor });
+    console.log(`superseded via ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "link") {
+    const r = linkMemories(dir, owner, repo, { from: need(args, "from"), to: need(args, "to"), relation: need(args, "relation"), actor });
+    console.log(`linked ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "core") {
+    const r = setCore(dir, owner, repo, { label: need(args, "label"), value: need(args, "value"), description: args.description, actor });
+    console.log(`core "${r.event.label}" set (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "core-get") {
+    console.log(JSON.stringify(loadMemory(dir, owner, repo).core, null, 2));
+  } else if (sub === "facts") {
+    const st = loadMemory(dir, owner, repo);
+    const asOf = args.asof ? Math.floor(Date.parse(String(args.asof)) / 1000) : Math.floor(Date.now() / 1000);
+    console.log(JSON.stringify(factsAt(st, asOf, !!args.all), null, 2));
+  } else if (sub === "recall") {
+    const r = recall(dir, owner, repo, String(need(args, "q")), { limit: args.limit ? Number(args.limit) : 10 });
+    for (const x of r.results) {
+      console.log(`${x.score.toFixed(3)}  ${x.kind.padEnd(7)} seq=${x.seq} via=${x.via}  ${x.title || x.text.slice(0, 80)}`);
+    }
+    if (!r.results.length) console.log("(no recall hits)");
+  } else if (sub === "context") {
+    const pack = buildContext(dir, owner, repo, {
+      query: args.q ? String(args.q) : undefined,
+      budgetTokens: args.budget ? Number(args.budget) : 4000,
+    });
+    console.log(pack.text);
+    console.error(`[memory: ${pack.usedTokens}/${pack.budgetTokens} tokens${pack.overBudget ? " OVER BUDGET (core alone exceeds it)" : ""}]`);
+  } else if (sub === "stats") {
+    console.log(JSON.stringify(memoryStats(dir, owner, repo), null, 2));
+  } else if (sub === "verify") {
+    const v = verifyMemory(dir, owner, repo);
+    console.log(JSON.stringify(v, null, 2));
+    if (!v.ok) process.exit(1);
   } else {
-    console.log(`❌ ${r.error.stage}: ${r.error.message}`);
-    process.exit(1);
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify --repo <owner>/<repo> [...]");
+    process.exit(2);
   }
 }
 
@@ -679,9 +709,9 @@ try {
   else if (cmd === "compute") await cmdCompute(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
-  else if (cmd === "promote") await cmdPromote(args);
+  else if (cmd === "memory") await cmdMemory(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|memory");
     process.exit(2);
   }
 } catch (e) {

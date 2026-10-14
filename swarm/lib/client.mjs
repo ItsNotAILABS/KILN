@@ -150,24 +150,6 @@ export class SwarmClient {
     if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
     return this._req("GET", `${this._memBase(owner, repo)}/recall?${qs}`);
   }
-  /**
-   * Cross-repo recall (phase 6): fused recall over EVERY repo chain
-   * in the state dir. Returns {crossRepo: true, query, results[],
-   * repos[], excluded[]} — each hit carries its repo, engine and
-   * chain signing posture; chains that fail verification are
-   * excluded and named in `excluded`, never silently skipped.
-   */
-  async memoryRecallAll(q, opts = {}) {
-    const qs = new URLSearchParams({ q: String(q || "") });
-    if (opts.limit) qs.set("limit", String(opts.limit));
-    if (opts.kinds && opts.kinds.length) qs.set("kinds", opts.kinds.join(","));
-    if (opts.tags && opts.tags.length) qs.set("tags", opts.tags.join(","));
-    if (opts.asOf) qs.set("asOf", opts.asOf);
-    if (opts.since) qs.set("since", opts.since);
-    if (opts.until) qs.set("until", opts.until);
-    if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
-    return this._req("GET", `/memory/recall?${qs}`);
-  }
   /** Budgeted context pack: {core, facts, episodes, text, usedTokens, budgetTokens, overBudget}. */
   async memoryContext(owner, repo, { query, budgetTokens, asOf } = {}) {
     const qs = new URLSearchParams();
@@ -177,37 +159,11 @@ export class SwarmClient {
     const s = qs.toString();
     return this._req("GET", `${this._memBase(owner, repo)}/context${s ? "?" + s : ""}`);
   }
-  /** The brief to print before writing. {working, text, facts, episodes}. */
-  async memorySit(owner, repo, { query, budgetTokens, asOf } = {}) {
-    const qs = new URLSearchParams();
-    if (query) qs.set("q", query);
-    if (budgetTokens) qs.set("budget", String(budgetTokens));
-    if (asOf) qs.set("asOf", asOf);
-    const s = qs.toString();
-    return this._req("GET", `${this._memBase(owner, repo)}/sit${s ? "?" + s : ""}`);
-  }
-  /** Propose a fact/link/core write for ratification (phase 4). opts: {kind, payload, rationale?, actor?}. */
-  async memoryPropose(owner, repo, opts) {
-    return this._req("POST", `${this._memBase(owner, repo)}/propose`, opts);
-  }
-  /** List consolidation proposals, optionally filtered by status (pending|ratified|rejected). */
-  async memoryProposals(owner, repo, status) {
-    const s = status ? `?status=${encodeURIComponent(status)}` : "";
-    return (await this._req("GET", `${this._memBase(owner, repo)}/proposals${s}`)).proposals;
-  }
-  /** Ratify or reject a proposal: {proposal, decision: "ratified"|"rejected", reason?, actor?}. */
-  async memoryResolveProposal(owner, repo, opts) {
-    return this._req("POST", `${this._memBase(owner, repo)}/proposals/resolve`, opts);
-  }
   async memoryStats(owner, repo) {
     return this._req("GET", `${this._memBase(owner, repo)}/stats`);
   }
   async memoryVerify(owner, repo) {
     return this._req("POST", `${this._memBase(owner, repo)}/verify`);
-  }
-  /** Phase 2: the state dir's memory signing pubkey + this repo's signature posture. */
-  async memoryPubkey(owner, repo) {
-    return this._req("GET", `${this._memBase(owner, repo)}/pubkey`);
   }
 
   // ---- receipts ----
