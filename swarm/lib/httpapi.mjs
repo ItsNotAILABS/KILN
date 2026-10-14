@@ -38,6 +38,9 @@
  *   GET  /git/:owner/:repo/info/refs?service=...   (public)
  *   POST /git/:owner/:repo/git-upload-pack          (public — clone/fetch)
  *   POST /git/:owner/:repo/git-receive-pack         (auth required — push)
+ * Promotion (KILN-native repos -> GitHub, Git Data API rebuild):
+ *   POST /v1/promote                {repo:"owner/repo", github?:"owner/repo",
+ *                                    branch?, rebase?, force?} -> receipt
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -54,6 +57,7 @@ import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
+import { promoteRepo } from "./promote.mjs";
 import {
   snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
 } from "./ci.mjs";
@@ -371,6 +375,40 @@ export function startApiServer(dir, cfg) {
           return { node: id, name: n.name, ok: v.ok, count: v.count, error: v.error || null };
         });
         return send(res, 200, { results, allOk: results.every((r) => r.ok) });
+      }
+
+      // ---- promote: KILN repo -> GitHub (receipt semantics, never throws) ----
+      if (req.method === "POST" && path === "/v1/promote") {
+        const b = await readBody(req);
+        const splitTarget = (s) => {
+          if (typeof s !== "string") return null;
+          const i = s.indexOf("/");
+          if (i <= 0 || i === s.length - 1) return null;
+          return [s.slice(0, i), s.slice(i + 1)];
+        };
+        const repoParts = splitTarget(b.repo);
+        if (!repoParts) return send(res, 400, { error: "repo must be 'owner/repo'" });
+        let githubOwner, githubRepo;
+        if (b.github !== undefined) {
+          const ghParts = splitTarget(b.github);
+          if (!ghParts) return send(res, 400, { error: "github must be 'owner/repo'" });
+          [githubOwner, githubRepo] = ghParts;
+        }
+        const receipt = await promoteRepo(dir, repoParts[0], repoParts[1], {
+          githubOwner,
+          githubRepo,
+          branch: b.branch ? String(b.branch) : undefined,
+          rebase: !!b.rebase,
+          force: !!b.force,
+        });
+        const status = receipt.ok ? 200
+          : receipt.error.stage === "repo_not_found" || receipt.error.stage === "github_repo_not_found" ? 404
+          : receipt.error.stage === "no_target" || receipt.error.stage === "bad_target" ? 400
+          : receipt.error.stage === "not_fast_forward" || receipt.error.stage === "rebase_needs_root" ? 409
+          : receipt.error.stage === "no_github_credential" ? 412
+          : receipt.error.stage.startsWith("github_") ? 502
+          : 500;
+        return send(res, status, receipt);
       }
 
       // ---- compute: serverless functions ----

@@ -15,6 +15,8 @@
  *   swarm.mjs receipts verify [--node ID] [--dir PATH]
  *   swarm.mjs repo create --owner O --repo R [--dir PATH]
  *   swarm.mjs repo list [--dir PATH]
+ *   swarm.mjs promote <owner>/<repo> [--github OWNER/REPO] [--branch B]
+ *                        [--rebase] [--force] [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -33,6 +35,7 @@ import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
 import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
+import { promoteRepo } from "./lib/promote.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
@@ -496,6 +499,51 @@ async function cmdRepo(args) {
   } else { console.error("usage: repo create|list"); process.exit(2); }
 }
 
+// ---------------------------------------------------------------- promote (KILN -> GitHub)
+
+function splitOwnerRepo(s, what) {
+  const i = typeof s === "string" ? s.indexOf("/") : -1;
+  if (i <= 0 || i === s.length - 1) {
+    console.error(`usage: ${what} must be <owner>/<repo>`);
+    process.exit(2);
+  }
+  return [s.slice(0, i), s.slice(i + 1)];
+}
+
+async function cmdPromote(args) {
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  const target = args._[1];
+  if (!target) {
+    console.error("usage: promote <owner>/<repo> [--github OWNER/REPO] [--branch B] [--rebase] [--force]");
+    process.exit(2);
+  }
+  const [owner, repo] = splitOwnerRepo(target, "promote target");
+  let githubOwner, githubRepo;
+  if (args.github) [githubOwner, githubRepo] = splitOwnerRepo(String(args.github), "--github");
+  const r = await promoteRepo(dir, owner, repo, {
+    githubOwner,
+    githubRepo,
+    branch: args.branch ? String(args.branch) : undefined,
+    rebase: !!args.rebase,
+    force: !!args.force,
+  });
+  // One-screen receipt (KILN standard shape; token never printed).
+  console.log(`🔥 KILN · ${r.repo} → GitHub ${r.github || "(no destination)"}${r.branch ? "@" + r.branch : ""}`);
+  console.log(`  source ${r.sourceBranch || "?"} @ ${(r.sourceTip || "").slice(0, 7)} · ${r.commitsPlanned} of ${r.commitsTotal} commit(s)${r.rebased ? " · rebased onto GitHub tip" : ""}${r.forced ? " · FORCED" : ""}`);
+  for (const c of r.commits) {
+    console.log(`  built ${c.from.slice(0, 12)} -> ${c.to.slice(0, 12)} (${c.blobs} blobs) ${c.subject}`);
+  }
+  for (const w of r.warnings) console.log(`  ⚠ ${w}`);
+  if (r.ok) {
+    console.log(r.note ? `✅ ${r.note}` : `✅ promoted${r.newTip ? ` → ${r.newTip.slice(0, 12)}` : ""}`);
+    console.log(`  ${r.url}`);
+  } else {
+    console.log(`❌ ${r.error.stage}: ${r.error.message}`);
+    process.exit(1);
+  }
+}
+
 // ---------------------------------------------------------------- compute (serverless)
 
 function readCode(args) {
@@ -631,8 +679,9 @@ try {
   else if (cmd === "compute") await cmdCompute(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
+  else if (cmd === "promote") await cmdPromote(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote");
     process.exit(2);
   }
 } catch (e) {
