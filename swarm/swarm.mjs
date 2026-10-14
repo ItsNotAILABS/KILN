@@ -36,6 +36,10 @@ import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
 import { promoteRepo } from "./lib/promote.mjs";
+import {
+  remember, assertFact, supersedeFact, linkMemories, setCore,
+  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
+} from "./lib/memory.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
@@ -544,6 +548,80 @@ async function cmdPromote(args) {
   }
 }
 
+// ---------------------------------------------------------------- memory (per-repo)
+
+function repoArg(args) {
+  const s = need(args, "repo");
+  const i = String(s).indexOf("/");
+  if (i <= 0 || i === String(s).length - 1) { console.error("--repo must be <owner>/<repo>"); process.exit(2); }
+  return [String(s).slice(0, i), String(s).slice(i + 1)];
+}
+function csv(v) {
+  return v === undefined || v === true ? [] : String(v).split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+async function cmdMemory(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  const [owner, repo] = repoArg(args);
+  const actor = args.actor ? String(args.actor) : "cli";
+  if (sub === "remember") {
+    const content = args.file ? readFileSync(resolve(String(args.file)), "utf8") : need(args, "content");
+    const r = remember(dir, owner, repo, {
+      title: args.title, kind: args.kind, content: String(content),
+      tags: csv(args.tags), entities: csv(args.entities),
+      eventDate: args.date, actor,
+      source: args.source ? { type: "ref", ref: String(args.source) } : undefined,
+    });
+    console.log(`remembered ${r.event.id} (seq ${r.event.seq}) in ${owner}/${repo} @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "fact") {
+    const r = assertFact(dir, owner, repo, {
+      subject: need(args, "subject"), predicate: need(args, "predicate"), object: need(args, "object"),
+      sourceEpisodes: csv(need(args, "sources")), supersedes: csv(args.supersedes),
+      validFrom: args.from, actor,
+    });
+    console.log(`fact ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "supersede") {
+    const r = supersedeFact(dir, owner, repo, { fact: need(args, "fact"), reason: args.reason, actor });
+    console.log(`superseded via ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "link") {
+    const r = linkMemories(dir, owner, repo, { from: need(args, "from"), to: need(args, "to"), relation: need(args, "relation"), actor });
+    console.log(`linked ${r.event.id} (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "core") {
+    const r = setCore(dir, owner, repo, { label: need(args, "label"), value: need(args, "value"), description: args.description, actor });
+    console.log(`core "${r.event.label}" set (seq ${r.event.seq}) @ ${r.commit.slice(0, 12)}`);
+  } else if (sub === "core-get") {
+    console.log(JSON.stringify(loadMemory(dir, owner, repo).core, null, 2));
+  } else if (sub === "facts") {
+    const st = loadMemory(dir, owner, repo);
+    const asOf = args.asof ? Math.floor(Date.parse(String(args.asof)) / 1000) : Math.floor(Date.now() / 1000);
+    console.log(JSON.stringify(factsAt(st, asOf, !!args.all), null, 2));
+  } else if (sub === "recall") {
+    const r = recall(dir, owner, repo, String(need(args, "q")), { limit: args.limit ? Number(args.limit) : 10 });
+    for (const x of r.results) {
+      console.log(`${x.score.toFixed(3)}  ${x.kind.padEnd(7)} seq=${x.seq} via=${x.via}  ${x.title || x.text.slice(0, 80)}`);
+    }
+    if (!r.results.length) console.log("(no recall hits)");
+  } else if (sub === "context") {
+    const pack = buildContext(dir, owner, repo, {
+      query: args.q ? String(args.q) : undefined,
+      budgetTokens: args.budget ? Number(args.budget) : 4000,
+    });
+    console.log(pack.text);
+    console.error(`[memory: ${pack.usedTokens}/${pack.budgetTokens} tokens${pack.overBudget ? " OVER BUDGET (core alone exceeds it)" : ""}]`);
+  } else if (sub === "stats") {
+    console.log(JSON.stringify(memoryStats(dir, owner, repo), null, 2));
+  } else if (sub === "verify") {
+    const v = verifyMemory(dir, owner, repo);
+    console.log(JSON.stringify(v, null, 2));
+    if (!v.ok) process.exit(1);
+  } else {
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify --repo <owner>/<repo> [...]");
+    process.exit(2);
+  }
+}
+
 // ---------------------------------------------------------------- compute (serverless)
 
 function readCode(args) {
@@ -680,8 +758,9 @@ try {
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
   else if (cmd === "promote") await cmdPromote(args);
+  else if (cmd === "memory") await cmdMemory(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory");
     process.exit(2);
   }
 } catch (e) {

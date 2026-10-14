@@ -109,6 +109,63 @@ export class SwarmClient {
     return this._req("POST", `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
   }
 
+  // ---- per-repo memory (refs/kiln/memory; see lib/memory.mjs) ----
+  _memBase(owner, repo) {
+    return `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/memory`;
+  }
+  /** Store a raw episode. Returns {event, commit}. */
+  async memoryRemember(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/episodes`, opts);
+  }
+  /** Assert a fact; opts.sourceEpisodes[] is mandatory provenance. Returns {event, fact, commit}. */
+  async memoryFact(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/facts`, opts);
+  }
+  async memorySupersede(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/supersede`, opts);
+  }
+  async memoryLink(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/links`, opts);
+  }
+  async memorySetCore(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/core`, opts);
+  }
+  async memoryCore(owner, repo) {
+    return (await this._req("GET", `${this._memBase(owner, repo)}/core`)).core;
+  }
+  async memoryFacts(owner, repo, { asOf, includeSuperseded } = {}) {
+    const qs = new URLSearchParams();
+    if (asOf) qs.set("asOf", asOf);
+    if (includeSuperseded) qs.set("includeSuperseded", "1");
+    const s = qs.toString();
+    return (await this._req("GET", `${this._memBase(owner, repo)}/facts${s ? "?" + s : ""}`)).facts;
+  }
+  /** Ranked recall: {repo, query, results[]}. */
+  async memoryRecall(owner, repo, q, opts = {}) {
+    const qs = new URLSearchParams({ q: String(q || "") });
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    if (opts.kinds && opts.kinds.length) qs.set("kinds", opts.kinds.join(","));
+    if (opts.tags && opts.tags.length) qs.set("tags", opts.tags.join(","));
+    if (opts.asOf) qs.set("asOf", opts.asOf);
+    if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
+    return this._req("GET", `${this._memBase(owner, repo)}/recall?${qs}`);
+  }
+  /** Budgeted context pack: {core, facts, episodes, text, usedTokens, budgetTokens, overBudget}. */
+  async memoryContext(owner, repo, { query, budgetTokens, asOf } = {}) {
+    const qs = new URLSearchParams();
+    if (query) qs.set("q", query);
+    if (budgetTokens) qs.set("budget", String(budgetTokens));
+    if (asOf) qs.set("asOf", asOf);
+    const s = qs.toString();
+    return this._req("GET", `${this._memBase(owner, repo)}/context${s ? "?" + s : ""}`);
+  }
+  async memoryStats(owner, repo) {
+    return this._req("GET", `${this._memBase(owner, repo)}/stats`);
+  }
+  async memoryVerify(owner, repo) {
+    return this._req("POST", `${this._memBase(owner, repo)}/verify`);
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});

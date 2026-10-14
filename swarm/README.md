@@ -284,3 +284,27 @@ Tests (`test/git.test.mjs`, 11 tests): authenticated create (201), duplicate
 a real clone → push → fresh-clone round trip, a 401 `WWW-Authenticate`
 challenge assertion, a real push via `oauth2:<token>@` URL credentials, and a
 real unauthenticated push that is refused and lands nothing.
+
+## Per-repo memory — infinite memory that lives in the repo
+
+Every KILN-native repo carries its own memory **inside the repo**, on the
+orphan ref `refs/kiln/memory`: an append-only, hash-chained event log.
+Raw **episodes** are stored losslessly and forever; **facts** derived from
+them must cite their source episodes and are *superseded, never deleted*
+when the world changes (ask for facts as of any date); **core blocks**
+hold the small always-in-context essentials; typed **links** connect
+memories into a graph. Recall is BM25 + salience + recency + one-hop
+link expansion, and context packs are assembled under an explicit token
+budget — storage is unbounded, context is not. Full design:
+`docs/KILN_MEMORY.md`.
+
+```sh
+node swarm.mjs memory remember --repo auro/auro --title "Decision" \
+  --content "We deploy on Tuesdays now." --tags ops
+node swarm.mjs memory context --repo auro/auro --q "deploy day" --budget 4000
+node swarm.mjs memory verify  --repo auro/auro
+```
+
+Also on the HTTP API (`/git/:o/:r/memory/*`, authenticated) and the SDK
+(`client.memoryRemember`, `memoryFact`, `memoryRecall`, `memoryContext`,
+`memoryVerify`, …). Tests: `test/memory.test.mjs` (14).
