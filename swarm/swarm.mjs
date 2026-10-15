@@ -17,6 +17,11 @@
  *   swarm.mjs repo list [--dir PATH]
  *   swarm.mjs promote <owner>/<repo> [--github OWNER/REPO] [--branch B]
  *                        [--rebase] [--force] [--dir PATH]
+ *   swarm.mjs sites list [--dir PATH]
+ *   swarm.mjs sites show <id|name> [--dir PATH]
+ *   swarm.mjs sites add --name N --frontend O/R --backend O/R
+ *                        [--artifact SLUG] [--app NAME|APPID] [--dir PATH]
+ *   swarm.mjs sites remove <id|name> [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -36,6 +41,9 @@ import { appendEvent, replay, newJobId } from "./lib/queue.mjs";
 import { verifyReceipts, receiptsPath } from "./lib/receipts.mjs";
 import { createRepo, listRepos } from "./lib/git.mjs";
 import { promoteRepo } from "./lib/promote.mjs";
+import {
+  createSite, listSites, resolveSite, deleteSite, siteStatus,
+} from "./lib/sites.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
@@ -622,6 +630,47 @@ async function cmdMemory(args) {
   }
 }
 
+// ---------------------------------------------------------------- sites (frontend + backend + artifact + app)
+
+async function cmdSites(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  if (sub === "add") {
+    // Works purely on local state (registry + repo memory + git), like
+    // `memory` — no daemon needed. Memory linkage is written on create.
+    const site = createSite(dir, {
+      name: need(args, "name"),
+      frontend: String(need(args, "frontend")),
+      backend: String(need(args, "backend")),
+      artifact: args.artifact ? String(args.artifact) : undefined,
+      computeApp: args.app ? String(args.app) : undefined,
+      actor: "cli",
+    });
+    console.log(`site ${site.name} (${site.id})`);
+    console.log(`  frontend: ${site.frontend}`);
+    console.log(`  backend:  ${site.backend}`);
+    if (site.artifact) console.log(`  artifact: ${site.artifact}`);
+    if (site.computeApp) console.log(`  app:      ${site.computeApp}`);
+    console.log(`  memory linkage written to both repos (backend_repo/frontend_repo${site.artifact ? "/artifact" : ""}/site core blocks)`);
+  } else if (sub === "list") {
+    const sites = listSites(dir);
+    if (!sites.length) { console.log("(no sites)"); return; }
+    for (const s of sites) {
+      console.log(`${s.id.slice(0, 12)}…  ${s.name.padEnd(16)} ${s.frontend} ⇄ ${s.backend}${s.artifact ? `  artifact=${s.artifact}` : ""}${s.computeApp ? `  app=${s.computeApp}` : ""}`);
+    }
+  } else if (sub === "show") {
+    if (!args._[2]) { console.error("usage: sites show <id|name>"); process.exit(2); }
+    const site = resolveSite(dir, args._[2]);
+    console.log(JSON.stringify(await siteStatus(dir, site.id), null, 2));
+  } else if (sub === "remove") {
+    if (!args._[2]) { console.error("usage: sites remove <id|name>"); process.exit(2); }
+    const site = resolveSite(dir, args._[2]);
+    deleteSite(dir, site.id);
+    console.log(`removed site ${site.name} (${site.id}) — registry entry only; repos, app, and memory untouched`);
+  } else { console.error("usage: sites list|show|add|remove"); process.exit(2); }
+}
+
 // ---------------------------------------------------------------- compute (serverless)
 
 function readCode(args) {
@@ -759,8 +808,9 @@ try {
   else if (cmd === "repo") await cmdRepo(args);
   else if (cmd === "promote") await cmdPromote(args);
   else if (cmd === "memory") await cmdMemory(args);
+  else if (cmd === "sites") await cmdSites(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory|sites");
     process.exit(2);
   }
 } catch (e) {

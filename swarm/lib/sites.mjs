@@ -26,8 +26,7 @@
  * Nothing is cached, so status can never go stale and lie.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { writeFileAtomicSync } from "./state.mjs";
+import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { repoPath, repoExists, validRepoName } from "./git.mjs";
@@ -63,9 +62,12 @@ function loadStore(dir) {
   }
 }
 
-/** Atomic store write (tmp + fsync + rename) — same discipline as lib/compute.mjs. */
+/** Atomic store write (tmp + rename) — same discipline as lib/compute.mjs. */
 function saveStore(dir, store) {
-  writeFileAtomicSync(sitesPath(dir), JSON.stringify(store, null, 2) + "\n");
+  const p = sitesPath(dir);
+  const tmp = p + ".tmp";
+  writeFileSync(tmp, JSON.stringify(store, null, 2) + "\n");
+  renameSync(tmp, p);
 }
 
 export { loadStore, saveStore };

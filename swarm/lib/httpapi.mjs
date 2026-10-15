@@ -49,6 +49,15 @@
  *   POST /git/:owner/:repo/memory/core       {label, value, description?}
  *   GET  /git/:owner/:repo/memory/core|facts|recall|context|stats
  *   POST /git/:owner/:repo/memory/verify     -> {ok, events, commits}
+ * Sites (first-class sites: frontend repo + backend repo + artifact + app):
+ *   POST /v1/sites                  {name, frontend:"o/r", backend:"o/r",
+ *                                    artifact?, computeApp?} -> {ok, site}
+ *                                    (also writes linkage core blocks into
+ *                                    both repos' KILN Memory on create)
+ *   GET  /v1/sites                  -> {sites:[...]} (registry records)
+ *   GET  /v1/sites/:id              -> aggregated live status (repo HEADs,
+ *                                    compute app status, memory linkage)
+ *   DELETE /v1/sites/:id            -> {ok:true, id} (registry entry only)
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -82,6 +91,9 @@ import {
   withPreview, enablePreview, disablePreview, teardownPreview,
   startPreviewReconciler,
 } from "./preview.mjs";
+import {
+  SitesError, createSite, listSites, deleteSite, siteStatus,
+} from "./sites.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -614,6 +626,43 @@ export function startApiServer(dir, cfg) {
         if (req.method === "DELETE" && m) {
           await teardownPreview(dir, cfg, m[1], plog);
           return send(res, 200, undeployApp(dir, m[1]));
+        }
+      }
+
+      // ---- sites: frontend repo + backend repo + artifact + compute app ----
+      if (req.method === "POST" && path === "/v1/sites") {
+        const b = await readBody(req);
+        try {
+          const site = createSite(dir, {
+            name: b.name, frontend: b.frontend, backend: b.backend,
+            artifact: b.artifact, computeApp: b.computeApp, actor: "api",
+          });
+          return send(res, 201, { ok: true, site });
+        } catch (e) {
+          if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
+      if (req.method === "GET" && path === "/v1/sites") {
+        return send(res, 200, { sites: listSites(dir) });
+      }
+      {
+        const m = path.match(/^\/v1\/sites\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "GET" && m) {
+          try {
+            return send(res, 200, await siteStatus(dir, m[1]));
+          } catch (e) {
+            if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+        if (req.method === "DELETE" && m) {
+          try {
+            return send(res, 200, deleteSite(dir, m[1]));
+          } catch (e) {
+            if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
         }
       }
 
