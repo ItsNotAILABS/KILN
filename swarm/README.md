@@ -308,3 +308,27 @@ node swarm.mjs memory verify  --repo auro/auro
 Also on the HTTP API (`/git/:o/:r/memory/*`, authenticated) and the SDK
 (`client.memoryRemember`, `memoryFact`, `memoryRecall`, `memoryContext`,
 `memoryVerify`, …). Tests: `test/memory.test.mjs` (14).
+
+## Sites — the whole product as one record
+
+A **site** links a frontend repo + a backend repo + the published
+artifact + the compute app that runs the backend, so KILN can connect
+and report on a whole site instead of separate pieces. The registry is
+`<stateDir>/sites.json`; the durable links are KILN Memory core blocks
+written into both repos on create (`backend_repo` / `frontend_repo` /
+`artifact` / `site`), so either repo can walk to the whole site.
+`GET /v1/sites/:id` aggregates live status — both repos' HEADs, the
+app's real readiness, and whether the memory linkage is intact in both
+repos. Full design: `docs/SITES.md` (in `swarm/docs/`).
+
+```sh
+node swarm.mjs sites add --name shopstream \
+  --frontend auro/shopstream-web --backend auro/shopstream-api \
+  --artifact shopstream --app shopstream-api
+node swarm.mjs sites list
+node swarm.mjs sites show shopstream
+```
+
+Also on the HTTP API (`/v1/sites`, authenticated). Deleting a site
+removes only the registry entry — repos, apps, and memory are
+untouched. Tests: `test/sites.test.mjs` (9).
