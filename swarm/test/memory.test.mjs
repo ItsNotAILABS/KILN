@@ -14,6 +14,7 @@ import { createRepo, repoPath } from "../lib/git.mjs";
 import {
   MEMORY_REF, remember, assertFact, supersedeFact, linkMemories, setCore,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory, readEvents,
+  agentAwareness,
 } from "../lib/memory.mjs";
 import { SwarmClient } from "../lib/client.mjs";
 import { listNodeIds, loadNode, pidAlive } from "../lib/state.mjs";
@@ -183,6 +184,30 @@ describe("memory: recall + context packs", () => {
     assert.ok(pack.usedTokens <= pack.budgetTokens, `used ${pack.usedTokens} <= budget ${pack.budgetTokens}`);
     const tiny = buildContext(dir, ...R, { budgetTokens: 64 });
     assert.equal(tiny.overBudget, true); // reported, never silent
+  });
+
+  it("sit prints the working task and does not dump the chain", () => {
+    const dir = freshRepo();
+    const ep = remember(dir, ...R, {
+      title: "Ledger",
+      content: "Keep the ledger pull-based.",
+      actor: "test",
+    }).event;
+    assertFact(dir, ...R, {
+      subject: "ledger", predicate: "is", object: "pull-based",
+      sourceEpisodes: [ep.id], actor: "test",
+    });
+    setCore(dir, ...R, { label: "working", value: "Keep the ledger pull-based", actor: "test" });
+    const brief = agentAwareness(dir, ...R, { query: "ledger" });
+    assert.match(brief.text, /^KILN · auro\/memtest/);
+    assert.match(brief.text, /Working: Keep the ledger pull-based/);
+    assert.match(brief.text, /ledger is pull-based/);
+    assert.equal(brief.text.includes("GENESIS"), false);
+    const again = setCore(dir, ...R, { label: "working", value: "Ship the sit brief", actor: "test" });
+    assert.equal(again.event.type, "core");
+    const next = agentAwareness(dir, ...R);
+    assert.match(next.text, /Working: Ship the sit brief/);
+    assert.equal(next.text.includes("Keep the ledger pull-based"), false);
   });
 });
 

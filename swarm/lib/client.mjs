@@ -159,6 +159,15 @@ export class SwarmClient {
     const s = qs.toString();
     return this._req("GET", `${this._memBase(owner, repo)}/context${s ? "?" + s : ""}`);
   }
+  /** The brief to print before writing. {working, text, facts, episodes}. */
+  async memorySit(owner, repo, { query, budgetTokens, asOf } = {}) {
+    const qs = new URLSearchParams();
+    if (query) qs.set("q", query);
+    if (budgetTokens) qs.set("budget", String(budgetTokens));
+    if (asOf) qs.set("asOf", asOf);
+    const s = qs.toString();
+    return this._req("GET", `${this._memBase(owner, repo)}/sit${s ? "?" + s : ""}`);
+  }
   async memoryStats(owner, repo) {
     return this._req("GET", `${this._memBase(owner, repo)}/stats`);
   }

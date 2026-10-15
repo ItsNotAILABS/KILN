@@ -38,7 +38,7 @@ import { createRepo, listRepos } from "./lib/git.mjs";
 import { promoteRepo } from "./lib/promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
-  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
+  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory, agentAwareness,
 } from "./lib/memory.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
 import {
@@ -610,6 +610,12 @@ async function cmdMemory(args) {
     });
     console.log(pack.text);
     console.error(`[memory: ${pack.usedTokens}/${pack.budgetTokens} tokens${pack.overBudget ? " OVER BUDGET (core alone exceeds it)" : ""}]`);
+  } else if (sub === "sit") {
+    const brief = agentAwareness(dir, owner, repo, {
+      query: args.q ? String(args.q) : undefined,
+      budgetTokens: args.budget ? Number(args.budget) : 1200,
+    });
+    console.log(brief.text);
   } else if (sub === "stats") {
     console.log(JSON.stringify(memoryStats(dir, owner, repo), null, 2));
   } else if (sub === "verify") {
@@ -617,7 +623,7 @@ async function cmdMemory(args) {
     console.log(JSON.stringify(v, null, 2));
     if (!v.ok) process.exit(1);
   } else {
-    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify --repo <owner>/<repo> [...]");
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|sit|stats|verify --repo <owner>/<repo> [...]");
     process.exit(2);
   }
 }

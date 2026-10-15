@@ -19,6 +19,8 @@ KILN is a destination and control plane. Product source remains in each linked r
 
 See Working in KILN, the project registry, and the MCP tool contract.
 
+Agents opening this repo read [MEMORY.md](MEMORY.md) before they write, then `swarm/swarm.mjs memory sit`.
+
 
 ## L1 ownership foundation
 

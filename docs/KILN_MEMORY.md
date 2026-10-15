@@ -1,9 +1,8 @@
 # KILN Memory — infinite memory per repo
 
-**Status:** v1 built and tested (branch `kiln-repo-memory`, based on the
-consolidated main `50a1bd6`). Library + HTTP API + client SDK + CLI.
-Not yet merged, not yet pushed. The live daemon picks the API routes up
-on its next restart; the library and CLI work today, daemon or not.
+**Status:** on `main` (merged as `ef535bf`). Library, HTTP API, client
+SDK, and CLI. `memory sit` is the brief an agent prints before it
+writes. The live daemon picks new routes up on its next restart.
 
 ## The one-sentence version
 
@@ -143,8 +142,8 @@ with a hand-forged commit appended outside the library).
   memoryFacts / memoryRecall / memoryContext / memoryStats /
   memoryVerify`.
 - **CLI** — `swarm.mjs memory remember|fact|supersede|link|core|
-  core-get|facts|recall|context|stats|verify --repo <owner>/<repo>`.
-  The CLI calls the library directly (same code path as the API), so
+  core-get|facts|recall|context|sit|stats|verify --repo <owner>/<repo>`.
+  `sit` is the brief. The CLI calls the library directly (same code path as the API), so
   memory works with the daemon down.
 
 ## Verification (2026-10-14)

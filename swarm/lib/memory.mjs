@@ -660,3 +660,44 @@ export function buildContext(dir, owner, repo, opts = {}) {
     text,
   };
 }
+
+/**
+ * The brief an agent prints before it writes.
+ * The core block labeled "working" is the one current task.
+ * Facts and episodes stay short. The event chain is not the brief.
+ */
+export function agentAwareness(dir, owner, repo, opts = {}) {
+  const state = loadMemory(dir, owner, repo);
+  const working = state.core.find((block) => block.label === "working") || null;
+  const pack = buildContext(dir, owner, repo, {
+    query: opts.query,
+    budgetTokens: opts.budgetTokens ?? 1200,
+    asOf: opts.asOf,
+  });
+  const facts = pack.facts.slice(0, 6);
+  const episodes = pack.episodes.slice(0, 4);
+  const lines = [
+    `KILN · ${owner}/${repo}`,
+    working ? `Working: ${working.value}` : "Working: none. Set the core block labeled working.",
+  ];
+  if (facts.length) {
+    lines.push("Facts:");
+    for (const fact of facts) lines.push(`- ${fact.subject} ${fact.predicate} ${fact.object}`);
+  }
+  if (episodes.length) {
+    lines.push("Memory:");
+    for (const episode of episodes) lines.push(`- ${episode.kind || "episode"} · ${episode.title || episode.id}`);
+  }
+  lines.push(working ? `Next: ${working.value}` : "Next: set working, then remember the decision that follows.");
+  lines.push("Print this. Do not dump the event chain.");
+  return {
+    ok: true,
+    repo: `${owner}/${repo}`,
+    working: working ? working.value : "",
+    facts: facts.length,
+    episodes: episodes.length,
+    usedTokens: pack.usedTokens,
+    budgetTokens: pack.budgetTokens,
+    text: lines.join("\n"),
+  };
+}

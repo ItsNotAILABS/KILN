@@ -23,6 +23,31 @@ If it throws, the daemon is down. Do NOT fake the work — either start it
 (`swarm.mjs daemon start` via shell, if you have that right) or report that
 compute is unavailable.
 
+## 1b. Sit before you write
+
+Memory is already on this repo (`refs/kiln/memory`). It does nothing for
+you until you read it. Before a job, a deposit, or a commit:
+
+```sh
+node swarm.mjs memory sit --repo <owner>/<repo>
+```
+
+Print that text. Do not dump the event chain. The core block labeled
+`working` is the one current task. Set it when the task changes:
+
+```sh
+node swarm.mjs memory core --repo <owner>/<repo> --label working --value "the one task"
+```
+
+After a decision, remember the episode, then assert a fact that cites it.
+A fact with no source episode is refused. From code: `agentAwareness()`
+in `lib/memory.mjs`, or `client.memorySit(owner, repo)`. The same brief
+is `GET /git/:owner/:repo/memory/sit`.
+
+If you only have the GitHub checkout and the swarm is down, read
+`MEMORY.md` at the repo root. That file is the committed awareness.
+The git ref is the live record.
+
 ## 2. The agent loop
 
 ```js

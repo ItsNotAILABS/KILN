@@ -68,7 +68,7 @@ import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "
 import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
-  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
+  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory, agentAwareness,
 } from "./memory.mjs";
 import {
   snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
@@ -340,6 +340,14 @@ export function startApiServer(dir, cfg) {
               asOf: url.searchParams.get("asOf") || undefined,
             });
             return send(res, 200, pack);
+          }
+          if (req.method === "GET" && rest === "/memory/sit") {
+            const brief = agentAwareness(dir, owner, repo, {
+              query: url.searchParams.get("q") || undefined,
+              budgetTokens: parseInt(url.searchParams.get("budget") || "1200", 10) || 1200,
+              asOf: url.searchParams.get("asOf") || undefined,
+            });
+            return send(res, 200, brief);
           }
           if (req.method === "GET" && rest === "/memory/stats") {
             return send(res, 200, memoryStats(dir, owner, repo));
