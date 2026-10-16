@@ -11,6 +11,13 @@ KILN `main` is the forge: contracts, swarm, and per-repo memory.
 `kiln-workspace` is the live app. Do not open a third Kiln repo.
 Do not push the app into this history.
 
+Muse uses the live app, not the loopback daemon. Delete
+`http://127.0.0.1:8787` from Muse settings. That was the old local
+kiln. The forge is `/api/mcp` on the kiln that answers
+`GET /api/kiln/loop` with `kiln-phone/v1`. The public name
+`kiln.pocketnova.app` is still the Hello World worker until ORIGIN
+is set. See `docs/MUSE.md`.
+
 ## Sit
 
 Before you write, print the brief:
