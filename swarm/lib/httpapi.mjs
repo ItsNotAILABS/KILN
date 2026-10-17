@@ -617,10 +617,11 @@ export function startApiServer(dir, cfg) {
           branch: b.branch ? String(b.branch) : undefined,
           rebase: !!b.rebase,
           force: !!b.force,
+          contextEvidence: b.contextEvidence,
         });
         const status = receipt.ok ? 200
           : receipt.error.stage === "repo_not_found" || receipt.error.stage === "github_repo_not_found" ? 404
-          : receipt.error.stage === "no_target" || receipt.error.stage === "bad_target" ? 400
+          : receipt.error.stage === "no_target" || receipt.error.stage === "bad_target" || receipt.error.stage === "bad_evidence" ? 400
           : receipt.error.stage === "not_fast_forward" || receipt.error.stage === "rebase_needs_root" ? 409
           : receipt.error.stage === "no_github_credential" ? 412
           : receipt.error.stage.startsWith("github_") ? 502
