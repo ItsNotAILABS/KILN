@@ -14,6 +14,8 @@ import { appendEvent, newJobId } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
 import { loadApiToken } from "./state.mjs";
 import { runSandboxed } from "./sandbox.mjs";
+import { buildContextIndex, queryContextIndex } from "./context-index.mjs";
+import { appendContextReceipt } from "./context-receipts.mjs";
 
 export class ToolError extends Error {
   constructor(message) {
@@ -233,6 +235,7 @@ export const TOOL_DEFS = [
   { name: "fs.read", caps: 0, desc: "Read a file inside the work dir", args: { path: "string" } },
   { name: "fs.write", caps: 0, desc: "Write a file inside the work dir (creates parents)", args: { path: "string", content: "string" } },
   { name: "fs.list", caps: 0, desc: "List a directory inside the work dir", args: { path: "string?" } },
+  { name: "context.query", caps: 0, desc: "Retrieve a bounded, provenance-rich context pack from this node worktree", args: { query: "string", maxBytes: "number?", maxChunks: "number?", knownHashes: "object?", expandDependencies: "boolean?" } },
   { name: "shell.exec", caps: 0, desc: "Run a binary with argv, no shell, jailed cwd, timeout. Optional sandbox: {memoryMB (64..2048, default 256), network (default false), metricsFile} runs a node runner inside Linux namespaces (fresh mount/pid/uts/ipc; net only if network:true), hides /home /root (/etc when offline), caps the JS heap, SIGKILLs past 2x RSS, timeout with SIGTERM-then-SIGKILL teeth.", args: { command: "string", args: "string[]?", timeoutMs: "number?", sandbox: "object?" } },
   { name: "git.status", caps: 0, desc: "git status --porcelain in the work dir", args: {} },
   { name: "git.log", caps: 0, desc: "git log --oneline in the work dir", args: { n: "number?" } },
@@ -270,6 +273,32 @@ async function impl(ctx, name, args) {
       const st = statSync(p);
       if (!st.isDirectory()) throw new ToolError(`fs.list: not a directory: ${args.path}`);
       return { ok: true, out: readdirSync(p).join("\n") };
+    }
+    case "context.query": {
+      const query = needStr(args, "query");
+      if (!query.trim()) throw new ToolError("context.query: empty query");
+      const indexDir = join(ctx.dir, "context-indexes");
+      mkdirSync(indexDir, { recursive: true, mode: 0o700 });
+      const index = buildContextIndex(workdir, indexDir);
+      const pack = queryContextIndex(index, query, {
+        maxBytes: args.maxBytes === undefined ? 24000 : needNum(args, "maxBytes"),
+        maxChunks: args.maxChunks === undefined ? 12 : needNum(args, "maxChunks"),
+        knownHashes: args.knownHashes && typeof args.knownHashes === "object" ? args.knownHashes : {},
+        expandDependencies: args.expandDependencies !== false,
+      });
+      const contextReceipt = appendContextReceipt(ctx.dir, {
+        operation: "node-query",
+        node: ctx.nodeId,
+        query,
+        indexDigest: index.digest,
+        packDigest: pack.digest,
+        revision: pack.revision,
+        worktreeDigest: pack.worktreeDigest,
+        emittedBytes: pack.stats.emittedBytes,
+        emittedChunks: pack.stats.emittedChunks,
+        unchangedChunks: pack.stats.unchangedChunks,
+      });
+      return { ok: true, out: JSON.stringify(pack), contextReceipt };
     }
     case "shell.exec": {
       return await execArgs(workdir, args, "shell.exec", 30000);
@@ -376,6 +405,23 @@ export async function runTool(ctx, name, args) {
   } catch (e) {
     result = { ok: false, error: e.code ? `${e.code}: ${e.message}` : e.message };
   }
-  appendReceipt(ctx.dir, ctx.nodeId, ctx.keypair, name, args || {}, result);
+  if (name === "context.query") {
+    const safeArgs = {
+      queryDigest: result?.contextReceipt?.queryDigest || null,
+      maxBytes: args?.maxBytes ?? 24000,
+      maxChunks: args?.maxChunks ?? 12,
+      expandDependencies: args?.expandDependencies !== false,
+    };
+    const safeResult = {
+      ok: !!result?.ok,
+      contextReceiptHash: result?.contextReceipt?.hash || null,
+      packDigest: result?.contextReceipt?.packDigest || null,
+      emittedBytes: result?.contextReceipt?.emittedBytes || 0,
+      emittedChunks: result?.contextReceipt?.emittedChunks || 0,
+    };
+    appendReceipt(ctx.dir, ctx.nodeId, ctx.keypair, name, safeArgs, safeResult);
+  } else {
+    appendReceipt(ctx.dir, ctx.nodeId, ctx.keypair, name, args || {}, result);
+  }
   return result;
 }
