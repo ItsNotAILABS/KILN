@@ -101,6 +101,14 @@ function resolveContextNode(dir, raw) {
   return { id, node };
 }
 
+function contextNodeRepoIdentity(repoRef) {
+  const value = String(repoRef || "");
+  let m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\.git\/?$/);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
+
 function nodeStatus(dir, cfg, node) {
   const alive = pidAlive(node.workerPid);
   const fresh = heartbeatAgeMs(dir, node.id) < (cfg.heartbeatTimeoutMs || 30000);
@@ -398,7 +406,7 @@ export function startApiServer(dir, cfg) {
 
       // ---- Context Fabric: authenticated, node-bound local repository cognition ----
       {
-        const m = path.match(/^\/v1\/context\/nodes\/([A-Za-z0-9_.-]+)\/(index|query|status)$/);
+        const m = path.match(/^\/v1\/context\/nodes\/([A-Za-z0-9_.-]+)\/(index|query|sit|status)$/);
         if (m) {
           let bound;
           try { bound = resolveContextNode(dir, m[1]); }
@@ -469,6 +477,63 @@ export function startApiServer(dir, cfg) {
               unchangedChunks: pack.stats.unchangedChunks,
             });
             return send(res, 200, { node: bound.id, receipt, pack });
+          }
+
+          if (req.method === "POST" && action === "sit") {
+            const b = await readBody(req);
+            const query = String(b.query || "").trim();
+            if (!query || query.length > 4096) {
+              return send(res, 400, { error: "query is required and must be <= 4096 characters" });
+            }
+            let index = loadIndex(idxDir, bound.node.workdir);
+            if (!index || b.refresh !== false) {
+              index = buildContextIndex(bound.node.workdir, idxDir, {
+                chunkLines: b.chunkLines,
+                overlap: b.overlap,
+              });
+            }
+            const code = queryContextIndex(index, query, {
+              maxBytes: b.maxBytes === undefined ? 18000 : b.maxBytes,
+              maxChunks: b.maxChunks === undefined ? 10 : b.maxChunks,
+              mmrLambda: b.mmrLambda,
+              knownHashes: b.knownHashes,
+              expandDependencies: b.expandDependencies !== false,
+              maxDependencyChunks: b.maxDependencyChunks,
+            });
+            let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
+            const identity = contextNodeRepoIdentity(bound.node.repo);
+            if (identity) {
+              try {
+                memory = {
+                  available: true,
+                  owner: identity.owner,
+                  repo: identity.repo,
+                  ...agentAwareness(dir, identity.owner, identity.repo, {
+                    query,
+                    budgetTokens: Math.min(Math.max(Number(b.memoryTokens || 1200), 128), 8000),
+                  }),
+                };
+              } catch (e) {
+                memory = { available: false, owner: identity.owner, repo: identity.repo, reason: e.message };
+              }
+            }
+            const receipt = appendContextReceipt(dir, {
+              operation: "api-sit",
+              node: bound.id,
+              query,
+              indexDigest: index.digest,
+              packDigest: code.digest,
+              revision: code.revision,
+              worktreeDigest: code.worktreeDigest,
+              emittedBytes: code.stats.emittedBytes,
+              emittedChunks: code.stats.emittedChunks,
+              unchangedChunks: code.stats.unchangedChunks,
+            });
+            return send(res, 200, {
+              node: bound.id,
+              receipt,
+              sit: { schema: "kiln.context-sit.v1", code, memory },
+            });
           }
 
           if (req.method === "GET" && action === "status") {
