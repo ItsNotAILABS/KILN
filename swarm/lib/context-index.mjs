@@ -14,7 +14,7 @@
  */
 import { execFileSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync,
+  closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync,
   statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -50,6 +50,48 @@ function atomicJson(path, value) {
   const tmp = path + ".tmp-" + process.pid + "-" + randomUUID();
   writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
   renameSync(tmp, path);
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireIndexLock(indexDir, repoRoot) {
+  const lockRoot = join(indexDir, "locks");
+  mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
+  const path = join(lockRoot, sha256(repoRoot).slice(0, 24) + ".lock");
+  const nonce = randomUUID();
+  const deadline = Date.now() + 30_000;
+  const started = Date.now();
+  for (;;) {
+    try {
+      const fd = openSync(path, "wx", 0o600);
+      writeFileSync(fd, JSON.stringify({ nonce, createdAt: Date.now() }) + "\n");
+      return {
+        waitMs: Date.now() - started,
+        release() {
+          try { closeSync(fd); } catch {}
+          try {
+            const current = JSON.parse(readFileSync(path, "utf8"));
+            if (current.nonce === nonce) unlinkSync(path);
+          } catch {}
+        },
+      };
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try {
+        const ageMs = Date.now() - statSync(path).mtimeMs;
+        if (ageMs > 300_000) {
+          try { unlinkSync(path); } catch {}
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error("context index lock timeout");
+      sleepSync(10);
+    }
+  }
 }
 
 function runGit(root, args) {
@@ -251,6 +293,8 @@ export function loadIndex(indexDir, repoRoot) {
 export function buildContextIndex(repoRoot, indexDir, opts = {}) {
   const base = canonicalRepoRoot(repoRoot);
   mkdirSync(indexDir, { recursive: true, mode: 0o700 });
+  const lock = acquireIndexLock(indexDir, base);
+  try {
   const prior = loadIndex(indexDir, base);
   const chunkLines = Math.max(20, Math.min(240, Number(opts.chunkLines || DEFAULT_CHUNK_LINES)));
   const overlap = Math.max(0, Math.min(chunkLines - 1, Number(opts.overlap || DEFAULT_OVERLAP)));
@@ -339,6 +383,7 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
       casObjectsReused,
       casObjectsRepaired,
       casBytesWritten,
+      indexLockWaitMs: lock.waitMs,
     },
     documentFrequency,
   };
@@ -354,6 +399,9 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
   };
   atomicJson(indexPath(indexDir, base), persisted);
   return index;
+  } finally {
+    lock.release();
+  }
 }
 
 function bm25(index, queryTerms, chunk, { k1 = 1.2, b = 0.75 } = {}) {
