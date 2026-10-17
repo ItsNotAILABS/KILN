@@ -68,6 +68,8 @@ import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "
 import { promoteRepo } from "./promote.mjs";
 import { buildContextIndex, loadIndex, queryContextIndex } from "./context-index.mjs";
 import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.mjs";
+import { boundContextRequest, contextLimits } from "./context-policy.mjs";
+import { recordContextMetric, loadContextMetrics, contextMetricsSummary } from "./context-metrics.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory, agentAwareness,
@@ -427,9 +429,16 @@ export function startApiServer(dir, cfg) {
               revision: index.revision,
               worktreeDigest: index.worktreeDigest,
             });
+            const metric = recordContextMetric(dir, {
+              kind: "index",
+              indexedBytes: index.stats.indexedBytes,
+              reusedFiles: index.stats.reusedFiles,
+              rebuiltFiles: index.stats.rebuiltFiles,
+            });
             return send(res, 200, {
               node: bound.id,
               receipt,
+              metric,
               index: {
                 schema: index.schema,
                 digest: index.digest,
@@ -445,29 +454,22 @@ export function startApiServer(dir, cfg) {
 
           if (req.method === "POST" && action === "query") {
             const b = await readBody(req);
-            const query = String(b.query || "").trim();
-            if (!query || query.length > 4096) {
-              return send(res, 400, { error: "query is required and must be <= 4096 characters" });
-            }
+            let request;
+            try { request = boundContextRequest(b, "query"); }
+            catch (e) { return send(res, 400, { error: e.message }); }
+            const started = Date.now();
             let index = loadIndex(idxDir, bound.node.workdir);
-            if (!index || b.refresh !== false) {
+            if (!index || request.refresh) {
               index = buildContextIndex(bound.node.workdir, idxDir, {
                 chunkLines: b.chunkLines,
                 overlap: b.overlap,
               });
             }
-            const pack = queryContextIndex(index, query, {
-              maxBytes: b.maxBytes,
-              maxChunks: b.maxChunks,
-              mmrLambda: b.mmrLambda,
-              knownHashes: b.knownHashes,
-              expandDependencies: b.expandDependencies !== false,
-              maxDependencyChunks: b.maxDependencyChunks,
-            });
+            const pack = queryContextIndex(index, request.query, request);
             const receipt = appendContextReceipt(dir, {
               operation: "api-query",
               node: bound.id,
-              query,
+              query: request.query,
               indexDigest: index.digest,
               packDigest: pack.digest,
               revision: pack.revision,
@@ -476,30 +478,31 @@ export function startApiServer(dir, cfg) {
               emittedChunks: pack.stats.emittedChunks,
               unchangedChunks: pack.stats.unchangedChunks,
             });
-            return send(res, 200, { node: bound.id, receipt, pack });
+            const metric = recordContextMetric(dir, {
+              kind: "query",
+              packDigest: pack.digest,
+              stats: pack.stats,
+              reusedFiles: index.stats.reusedFiles,
+              rebuiltFiles: index.stats.rebuiltFiles,
+              latencyMs: Date.now() - started,
+            });
+            return send(res, 200, { node: bound.id, receipt, metric, pack });
           }
 
           if (req.method === "POST" && action === "sit") {
             const b = await readBody(req);
-            const query = String(b.query || "").trim();
-            if (!query || query.length > 4096) {
-              return send(res, 400, { error: "query is required and must be <= 4096 characters" });
-            }
+            let request;
+            try { request = boundContextRequest(b, "sit"); }
+            catch (e) { return send(res, 400, { error: e.message }); }
+            const started = Date.now();
             let index = loadIndex(idxDir, bound.node.workdir);
-            if (!index || b.refresh !== false) {
+            if (!index || request.refresh) {
               index = buildContextIndex(bound.node.workdir, idxDir, {
                 chunkLines: b.chunkLines,
                 overlap: b.overlap,
               });
             }
-            const code = queryContextIndex(index, query, {
-              maxBytes: b.maxBytes === undefined ? 18000 : b.maxBytes,
-              maxChunks: b.maxChunks === undefined ? 10 : b.maxChunks,
-              mmrLambda: b.mmrLambda,
-              knownHashes: b.knownHashes,
-              expandDependencies: b.expandDependencies !== false,
-              maxDependencyChunks: b.maxDependencyChunks,
-            });
+            const code = queryContextIndex(index, request.query, request);
             let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
             const identity = contextNodeRepoIdentity(bound.node.repo);
             if (identity) {
@@ -509,8 +512,8 @@ export function startApiServer(dir, cfg) {
                   owner: identity.owner,
                   repo: identity.repo,
                   ...agentAwareness(dir, identity.owner, identity.repo, {
-                    query,
-                    budgetTokens: Math.min(Math.max(Number(b.memoryTokens || 1200), 128), 8000),
+                    query: request.query,
+                    budgetTokens: request.memoryTokens,
                   }),
                 };
               } catch (e) {
@@ -520,7 +523,7 @@ export function startApiServer(dir, cfg) {
             const receipt = appendContextReceipt(dir, {
               operation: "api-sit",
               node: bound.id,
-              query,
+              query: request.query,
               indexDigest: index.digest,
               packDigest: code.digest,
               revision: code.revision,
@@ -529,9 +532,18 @@ export function startApiServer(dir, cfg) {
               emittedChunks: code.stats.emittedChunks,
               unchangedChunks: code.stats.unchangedChunks,
             });
+            const metric = recordContextMetric(dir, {
+              kind: "sit",
+              packDigest: code.digest,
+              stats: code.stats,
+              reusedFiles: index.stats.reusedFiles,
+              rebuiltFiles: index.stats.rebuiltFiles,
+              latencyMs: Date.now() - started,
+            });
             return send(res, 200, {
               node: bound.id,
               receipt,
+              metric,
               sit: { schema: "kiln.context-sit.v1", code, memory },
             });
           }
@@ -559,6 +571,13 @@ export function startApiServer(dir, cfg) {
       if (req.method === "POST" && path === "/v1/context/receipts/verify") {
         const result = verifyContextReceipts(dir);
         return send(res, result.ok ? 200 : 409, result);
+      }
+
+      if (req.method === "GET" && path === "/v1/context/metrics") {
+        return send(res, 200, {
+          metrics: contextMetricsSummary(loadContextMetrics(dir)),
+          limits: contextLimits(),
+        });
       }
 
       // ---- jobs ----
