@@ -71,6 +71,8 @@ try{
   eq(first.worktreeDigest.length,64,"worktree digest length");
   ok(first.stats.indexedFiles>=39,"indexed expected corpus");
   ok(first.stats.chunks>=first.stats.indexedFiles,"chunks populated");
+  ok(first.stats.indexedBytes>0,"indexed byte accounting populated");
+  eq(first.stats.cacheReuseRatio,0,"first build has no cache reuse");
   eq(first.files.some(x=>x.path===".env"),false,"env excluded");
   eq(first.files.some(x=>x.path==="secrets/credential.txt"),false,"secret dir excluded");
   ok(first.skipped.some(x=>x.path===".env"),"env skip recorded");
@@ -94,17 +96,23 @@ try{
   ok(q.items.every(x=>x.bytes>0),"item bytes present");
   ok(q.stats.emittedBytes<=8192,"byte budget obeyed");
   ok(q.stats.tokenEstimate>0,"token estimate populated");
+  ok(q.stats.selectedBytesBeforeDelta>=q.stats.emittedBytes,"selected-byte accounting bounds emitted payload");
+  ok(q.stats.indexedBytes>=q.stats.emittedBytes,"full-index byte accounting bounds emitted payload");
+  ok(q.stats.fullIndexByteReduction>=0 && q.stats.fullIndexByteReduction<=1,"full-index reduction proxy bounded");
 
   const known=Object.fromEntries(q.items.map(x=>[x.path,x.sha256]));
   const delta=queryContextIndex(first,"promotion gate human approval policy",{maxBytes:8192,maxChunks:8,knownHashes:known});
   eq(delta.items.length,0,"known files suppressed");
   ok(delta.unchanged.length>=1,"unchanged references emitted");
   eq(delta.stats.emittedBytes,0,"zero repeated payload for unchanged result");
+  ok(delta.stats.deltaAvoidedBytes>0,"delta avoided-byte accounting populated");
+  ok(delta.stats.estimatedTokensAvoidedByDelta>0,"delta token-avoidance estimate populated");
 
   const second=buildContextIndex(root,state,{chunkLines:20,overlap:4});
   eq(second.digest,first.digest,"no-op refresh stable digest");
   ok(second.stats.reusedFiles>=first.stats.indexedFiles,"unchanged files reused");
   eq(second.stats.rebuiltFiles,0,"no unchanged files rebuilt");
+  ok(second.stats.cacheReuseRatio>0.99,"no-op refresh reports near-total cache reuse");
 
   // 72 targeted retrieval checks across the generated documentation corpus.
   for(let i=0;i<36;i++){
@@ -151,7 +159,7 @@ try{
     ok(!item.path.includes(".."),`normalized path ${item.path}`);
   }
 
-  ok(assertions>=120,`expected >=120 assertions, got ${assertions}`);
+  ok(assertions>=128,`expected >=128 assertions, got ${assertions}`);
   console.log(JSON.stringify({
     schema:"kiln.context-production-gate.v1",
     ok:true,
