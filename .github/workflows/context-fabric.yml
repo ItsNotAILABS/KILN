@@ -1,6 +1,7 @@
 name: Context Fabric
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "swarm/lib/context-*.mjs"
