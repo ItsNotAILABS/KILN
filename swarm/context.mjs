@@ -74,13 +74,16 @@ try {
   } else if(cmd==="metrics"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
     print(await client.contextMetrics());
+  } else if(cmd==="gc"){
+    const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
+    print(await client.contextGc());
   } else if(cmd==="limits"){
     print(contextLimits());
   } else if(cmd==="verify"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
     print(await client.contextReceiptsVerify());
   } else {
-    console.error("usage: context.mjs local-index|local-query|index|query|delta|status|metrics|limits|verify [options]");
+    console.error("usage: context.mjs local-index|local-query|index|query|delta|status|metrics|gc|limits|verify [options]");
     process.exit(2);
   }
 } catch(e) {
