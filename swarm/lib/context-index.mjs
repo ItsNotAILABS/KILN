@@ -197,16 +197,21 @@ function objectPath(indexDir, digest) {
 function storeChunkObject(indexDir, text) {
   const digest = sha256(text);
   const path = objectPath(indexDir, digest);
-  if (existsSync(path)) return { digest, written: false, bytes: 0 };
+  let repaired = false;
+  if (existsSync(path)) {
+    try {
+      const existing = readFileSync(path, "utf8");
+      if (sha256(existing) === digest) return { digest, written: false, repaired: false, bytes: 0 };
+      repaired = true;
+    } catch {
+      repaired = true;
+    }
+  }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = path + ".tmp-" + process.pid + "-" + randomUUID();
   writeFileSync(tmp, text, { mode: 0o600 });
-  if (existsSync(path)) {
-    try { unlinkSync(tmp); } catch {}
-    return { digest, written: false, bytes: 0 };
-  }
   renameSync(tmp, path);
-  return { digest, written: true, bytes: Buffer.byteLength(text, "utf8") };
+  return { digest, written: true, repaired, bytes: Buffer.byteLength(text, "utf8") };
 }
 
 function hydratePersistedChunks(indexDir, data) {
@@ -282,12 +287,16 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
 
   let casObjectsWritten = 0;
   let casObjectsReused = 0;
+  let casObjectsRepaired = 0;
   let casBytesWritten = 0;
   for (const chunk of chunks) {
     const stored = storeChunkObject(indexDir, chunk.text);
     chunk.objectDigest = stored.digest;
-    if (stored.written) { casObjectsWritten++; casBytesWritten += stored.bytes; }
-    else casObjectsReused++;
+    if (stored.written) {
+      casObjectsWritten++;
+      casBytesWritten += stored.bytes;
+      if (stored.repaired) casObjectsRepaired++;
+    } else casObjectsReused++;
   }
 
   const documentFrequency = Object.create(null);
@@ -328,6 +337,7 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
       skippedFiles: skipped.length,
       casObjectsWritten,
       casObjectsReused,
+      casObjectsRepaired,
       casBytesWritten,
     },
     documentFrequency,
