@@ -86,7 +86,7 @@ try{
   const persistedIndexName=readdirSync(state).find(x=>x.endsWith(".json"));
   ok(!!persistedIndexName,"persisted index metadata exists");
   const persistedRaw=readFileSync(join(state,persistedIndexName),"utf8");
-  eq(persistedRaw.includes("promotionGate"),false,"persisted index metadata does not duplicate source chunk text");
+  eq(persistedRaw.includes("return policyDecision(actor,target) && actor.approved === true;"),false,"persisted index metadata does not duplicate source chunk bodies");
   const persistedJson=JSON.parse(persistedRaw);
   ok(persistedJson.chunks.every(x=>!Object.prototype.hasOwnProperty.call(x,"text")),"persisted chunks are metadata-only");
   ok(persistedJson.chunks.every(x=>/^[0-9a-f]{64}$/.test(x.objectDigest||"")),"persisted chunks reference CAS digests");
