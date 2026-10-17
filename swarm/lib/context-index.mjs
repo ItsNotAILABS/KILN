@@ -105,7 +105,11 @@ function safeTextFile(base, rel) {
 }
 
 function terms(text) {
-  const out = String(text).toLowerCase().match(/[a-z_][a-z0-9_.-]{1,63}/g) || [];
+  const normalized = String(text)
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_./-]+/g, " ")
+    .toLowerCase();
+  const out = normalized.match(/[a-z][a-z0-9]{1,63}/g) || [];
   return out.filter((x) => x.length > 1);
 }
 
