@@ -128,6 +128,14 @@ try{
   ok(second.stats.cacheReuseRatio>0.99,"no-op refresh reports near-total cache reuse");
   ok(second.stats.casObjectsReused>=second.stats.chunks,"no-op refresh reuses persisted CAS objects");
 
+  const victimDigest=persistedJson.chunks[0].objectDigest;
+  const victimPath=join(state,"objects",victimDigest.slice(0,2),victimDigest+".txt");
+  writeFileSync(victimPath,"corrupted-context-object\n");
+  eq(loadIndex(state,root),null,"corrupted CAS object invalidates persisted index load");
+  const repaired=buildContextIndex(root,state,{chunkLines:20,overlap:4});
+  ok(repaired.stats.casObjectsRepaired>=1,"reindex repairs corrupted CAS object from Git worktree");
+  ok(!!loadIndex(state,root),"repaired CAS index reloads successfully");
+
   // 72 targeted retrieval checks across the generated documentation corpus.
   for(let i=0;i<36;i++){
     const p=`docs/module-${String(i).padStart(2,"0")}.md`;
@@ -184,7 +192,7 @@ try{
     ok(!item.path.includes(".."),`normalized path ${item.path}`);
   }
 
-  ok(assertions>=140,`expected >=140 assertions, got ${assertions}`);
+  ok(assertions>=143,`expected >=143 assertions, got ${assertions}`);
   console.log(JSON.stringify({
     schema:"kiln.context-production-gate.v1",
     ok:true,
