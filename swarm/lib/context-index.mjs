@@ -254,8 +254,10 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
       indexedFiles: files.length,
       chunks: chunks.length,
       totalTerms,
+      indexedBytes: files.reduce((n, x) => n + x.bytes, 0),
       averageChunkTerms: chunks.length ? totalTerms / chunks.length : 0,
       reusedFiles,
+      cacheReuseRatio: files.length ? reusedFiles / files.length : 0,
       rebuiltFiles,
       skippedFiles: skipped.length,
     },
@@ -377,18 +379,31 @@ export function queryContextIndex(index, query, opts = {}) {
   const items = [];
   const unchanged = [];
   let remaining = maxBytes;
+  let selectedBytesBeforeDelta = 0;
+  let deltaAvoidedBytes = 0;
+  let budgetOmittedBytes = 0;
   for (const x of selected) {
     const fileHash = fileHashes[x.chunk.path];
+    const full = numberedExcerpt(x.chunk);
+    const fullBytes = Buffer.byteLength(full, "utf8");
+    selectedBytesBeforeDelta += fullBytes;
     if (knownHashes[x.chunk.path] === fileHash) {
       unchanged.push({ path: x.chunk.path, sha256: fileHash, chunkId: x.chunk.id });
+      deltaAvoidedBytes += fullBytes;
       continue;
     }
-    const full = numberedExcerpt(x.chunk);
-    if (remaining <= 0) break;
+    if (remaining <= 0) {
+      budgetOmittedBytes += fullBytes;
+      continue;
+    }
     const bytes = Buffer.from(full, "utf8");
     const excerpt = bytes.length <= remaining ? full : bytes.subarray(0, remaining).toString("utf8");
-    if (!excerpt) break;
+    if (!excerpt) {
+      budgetOmittedBytes += fullBytes;
+      continue;
+    }
     const actualBytes = Buffer.byteLength(excerpt, "utf8");
+    budgetOmittedBytes += Math.max(0, fullBytes - actualBytes);
     items.push({
       path: x.chunk.path,
       startLine: x.chunk.startLine,
@@ -428,6 +443,14 @@ export function queryContextIndex(index, query, opts = {}) {
       unchangedChunks: unchanged.length,
       emittedBytes: items.reduce((n, x) => n + x.bytes, 0),
       tokenEstimate: items.reduce((n, x) => n + x.tokenEstimate, 0),
+      indexedBytes: index.stats.indexedBytes || index.files.reduce((n, x) => n + (x.bytes || 0), 0),
+      selectedBytesBeforeDelta,
+      deltaAvoidedBytes,
+      budgetOmittedBytes,
+      estimatedTokensAvoidedByDelta: Math.ceil(deltaAvoidedBytes / 4),
+      fullIndexByteReduction: (index.stats.indexedBytes || 0) > 0
+        ? 1 - items.reduce((n, x) => n + x.bytes, 0) / index.stats.indexedBytes
+        : null,
     },
   };
   pack.digest = sha256(JSON.stringify({
