@@ -5,7 +5,7 @@
  * telemetry, not a security receipt; signed provenance remains in
  * context-receipts.mjs.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 function root(dir){const p=join(dir,"context-metrics");mkdirSync(p,{recursive:true,mode:0o700});return p;}
@@ -39,31 +39,48 @@ export function loadContextMetrics(dir){
   }catch{return empty();}
 }
 function save(dir,value){
-  const p=pathOf(dir),tmp=p+".tmp-"+process.pid;
+  const p=pathOf(dir),tmp=p+".tmp-"+process.pid+"-"+Date.now()+"-"+Math.random().toString(16).slice(2);
   writeFileSync(tmp,JSON.stringify(value,null,2)+"\n",{mode:0o600});
   renameSync(tmp,p);
 }
+function sleep(ms){Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);}
+function withLock(dir,fn){
+  const p=join(root(dir),".metrics.lock");
+  const deadline=Date.now()+3000;
+  let fd=null;
+  while(fd===null){
+    try{fd=openSync(p,"wx",0o600);}
+    catch(e){
+      if(e.code!=="EEXIST")throw e;
+      if(Date.now()>=deadline)throw new Error("context metrics: lock timeout");
+      sleep(5);
+    }
+  }
+  try{return fn();}finally{try{closeSync(fd);}catch{} try{unlinkSync(p);}catch{}}
+}
 export function recordContextMetric(dir,event={}){
-  const m=loadContextMetrics(dir);
-  const kind=String(event.kind||"query");
-  if(kind==="query")m.queries++;
-  else if(kind==="sit")m.sits++;
-  else if(kind==="index")m.indexes++;
-  const s=event.stats||{};
-  m.emittedBytes+=Number(s.emittedBytes||0);
-  m.selectedBytesBeforeDelta+=Number(s.selectedBytesBeforeDelta||0);
-  m.deltaAvoidedBytes+=Number(s.deltaAvoidedBytes||0);
-  m.budgetOmittedBytes+=Number(s.budgetOmittedBytes||0);
-  m.estimatedTokensEmitted+=Number(s.tokenEstimate||0);
-  m.estimatedTokensAvoidedByDelta+=Number(s.estimatedTokensAvoidedByDelta||0);
-  m.indexBytesObserved=Math.max(m.indexBytesObserved,Number(s.indexedBytes||event.indexedBytes||0));
-  m.cacheReusedFiles+=Number(event.reusedFiles||0);
-  m.cacheRebuiltFiles+=Number(event.rebuiltFiles||0);
-  m.totalLatencyMs+=Number(event.latencyMs||0);
-  m.lastUpdatedAt=new Date().toISOString();
-  if(event.packDigest)m.lastPackDigest=String(event.packDigest);
-  save(dir,m);
-  return contextMetricsSummary(m);
+  return withLock(dir,()=>{
+    const m=loadContextMetrics(dir);
+    const kind=String(event.kind||"query");
+    if(kind==="query")m.queries++;
+    else if(kind==="sit")m.sits++;
+    else if(kind==="index")m.indexes++;
+    const s=event.stats||{};
+    m.emittedBytes+=Number(s.emittedBytes||0);
+    m.selectedBytesBeforeDelta+=Number(s.selectedBytesBeforeDelta||0);
+    m.deltaAvoidedBytes+=Number(s.deltaAvoidedBytes||0);
+    m.budgetOmittedBytes+=Number(s.budgetOmittedBytes||0);
+    m.estimatedTokensEmitted+=Number(s.tokenEstimate||0);
+    m.estimatedTokensAvoidedByDelta+=Number(s.estimatedTokensAvoidedByDelta||0);
+    m.indexBytesObserved=Math.max(m.indexBytesObserved,Number(s.indexedBytes||event.indexedBytes||0));
+    m.cacheReusedFiles+=Number(event.reusedFiles||0);
+    m.cacheRebuiltFiles+=Number(event.rebuiltFiles||0);
+    m.totalLatencyMs+=Number(event.latencyMs||0);
+    m.lastUpdatedAt=new Date().toISOString();
+    if(event.packDigest)m.lastPackDigest=String(event.packDigest);
+    save(dir,m);
+    return contextMetricsSummary(m);
+  });
 }
 export function contextMetricsSummary(input){
   const m=typeof input==="string"?loadContextMetrics(input):{...empty(),...(input||{})};
