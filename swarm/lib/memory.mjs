@@ -42,8 +42,10 @@
  * nothing here invents a hash or a commit.
  *
  * Honest boundaries (v1):
- *   - Replay is O(events) in memory. A rebuildable index cache is a
- *     later phase; the ref is always the source of truth.
+ *   - Replay is O(events) in memory. The ref is always the source of
+ *     truth; recall is served by the rebuildable FTS5 sidecar in
+ *     lib/memory-index.mjs (phase 1) whenever it is available, with
+ *     this replay as the fallback and the auditor.
  *   - Retrieval is lexical BM25 + recency + salience + 1-hop link
  *     expansion. No embeddings yet — no fake semantic search.
  *   - Events are hash-chained but not yet node-signed; signing with
@@ -56,6 +58,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { canon, sha256hex, sha256hexOfCanon } from "./canon.mjs";
 import { repoPath, repoExists } from "./git.mjs";
+import { recallIndexed, memoryIndexInfo } from "./memory-index.mjs";
 
 export const MEMORY_REF = "refs/kiln/memory";
 const INLINE_MAX = 4096;          // content chars kept inline in the event JSON
@@ -355,10 +358,10 @@ export function setCore(dir, owner, repo, opts = {}) {
 
 // ---------------------------------------------------------------- derived state
 
-function factValidFrom(ev) {
+export function factValidFrom(ev) {
   return ev.validFrom ? Math.floor(Date.parse(ev.validFrom) / 1000) : ev.ts;
 }
-function episodeWhen(ev) {
+export function episodeWhen(ev) {
   return ev.eventDate ? Math.floor(Date.parse(ev.eventDate) / 1000) : ev.ts;
 }
 
@@ -436,6 +439,7 @@ export function memoryStats(dir, owner, repo) {
     bytes,
     oldestTs: state.events.length ? state.events[0].ts : null,
     newestTs: state.events.length ? state.events[state.events.length - 1].ts : null,
+    index: memoryIndexInfo(dir, owner, repo),
   };
 }
 
@@ -475,7 +479,7 @@ export function tokenize(text) {
   return String(text || "").toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 2);
 }
 
-function docText(kind, item) {
+export function docText(kind, item) {
   if (kind === "episode") return [item.title, item.kind, item.content, ...(item.tags || []), ...(item.entities || [])].join("\n");
   return [item.subject, item.predicate, item.object, ...(item.entities || [])].join("\n");
 }
@@ -489,11 +493,27 @@ function estimateTokens(text) {
  * salience and recency, expanded one hop across explicit links.
  * Returns ranked [{kind, id, seq, score, via, item}] — `via` is
  * "search" or "link:<relation>:<otherId>" so ranking is explainable.
+ *
+ * Served by the FTS5 sidecar (lib/memory-index.mjs) whenever it is
+ * available; the full-replay scan below is the fallback and auditor.
+ * The result names its engine: "index" or "scan".
  */
 export function recall(dir, owner, repo, query, opts = {}) {
+  const asOfSec = opts.asOf ? isoToSec(opts.asOf, "asOf") : Math.floor(Date.now() / 1000);
+  try {
+    const r = recallIndexed(dir, owner, repo, query, opts, {
+      asOfSec,
+      sinceSec: opts.since ? isoToSec(opts.since, "since") : null,
+      untilSec: opts.until ? isoToSec(opts.until, "until") : null,
+    });
+    if (r) return r;
+  } catch { /* sidecar unavailable or stale — the scan decides (and throws what it must) */ }
+  return recallScan(dir, owner, repo, query, opts, asOfSec);
+}
+
+function recallScan(dir, owner, repo, query, opts = {}, asOf) {
   const state = loadMemory(dir, owner, repo);
   const limit = Math.min(100, Math.max(1, opts.limit ?? 10));
-  const asOf = opts.asOf ? isoToSec(opts.asOf, "asOf") : Math.floor(Date.now() / 1000);
   const kinds = new Set(opts.kinds && opts.kinds.length ? opts.kinds : ["episode", "fact"]);
   const docs = [];
   if (kinds.has("episode")) {
@@ -509,7 +529,7 @@ export function recall(dir, owner, repo, query, opts = {}) {
       docs.push({ kind: "fact", item: f });
     }
   }
-  if (!docs.length) return { repo: `${owner}/${repo}`, query, results: [] };
+  if (!docs.length) return { repo: `${owner}/${repo}`, query, results: [], engine: "scan" };
 
   const qTokens = [...new Set(tokenize(query))];
   const docTokens = docs.map((d) => tokenize(docText(d.kind, d.item)));
@@ -579,7 +599,7 @@ export function recall(dir, owner, repo, query, opts = {}) {
       sourceEpisodes: d.kind === "fact" ? d.item.sourceEpisodes : undefined,
       superseded: d.kind === "fact" ? d.item.invalidAtTs !== null : undefined,
     }));
-  return { repo: `${owner}/${repo}`, query, results };
+  return { repo: `${owner}/${repo}`, query, results, engine: "scan" };
 }
 
 /**

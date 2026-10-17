@@ -1,9 +1,8 @@
 # KILN Memory — infinite memory per repo
 
-**Status:** v1 built and tested (branch `kiln-repo-memory`, based on the
-consolidated main `50a1bd6`). Library + HTTP API + client SDK + CLI.
-Not yet merged, not yet pushed. The live daemon picks the API routes up
-on its next restart; the library and CLI work today, daemon or not.
+**Status:** v1 merged to main (`e45c69f`) and live since 2026-10-14 —
+library + HTTP API + client SDK + CLI. Phase 1 (FTS5 index sidecar)
+built 2026-10-17: see "Phases after v1" below.
 
 ## The one-sentence version
 
@@ -186,8 +185,19 @@ with a hand-forged commit appended outside the library).
 
 ## Phases after v1
 
-1. **Index sidecar** — SQLite FTS5 + stats cache, rebuilt from the ref
-   on demand; replay stays the fallback and the auditor.
+1. **Index sidecar** — ✅ BUILT 2026-10-17 (`lib/memory-index.mjs`).
+   SQLite FTS5 per repo at `<state-dir>/memory-index/<owner>__<repo>.sqlite`,
+   synced from the ref on every recall (tip-checked: O(1) when fresh,
+   incremental upserts when behind, full rebuild on divergence) and
+   never written back to the ref. Docs are indexed pre-tokenized with
+   the library's own tokenizer, so the candidate universe matches the
+   v1 scan exactly; ranking is FTS5 BM25 fused with the same
+   salience/recency boosts and 1-hop link expansion. Recall results
+   name their engine (`engine: "index" | "scan"`); any sidecar error —
+   or `KILN_MEMORY_INDEX=off` — falls back to the replay scan, which
+   stays the fallback and the auditor. `memoryStats` reports the
+   sidecar's tip/doc count. Equivalence with the scan (hit sets + top
+   hits) is pinned by `test/memory-index.test.mjs`.
 2. **Signed events** — node-key signatures on writes; `verifyMemory`
    checks signatures for events that carry them.
 3. **Embeddings** — optional persisted vectors per event (local model
