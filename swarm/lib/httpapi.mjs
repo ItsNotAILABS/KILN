@@ -77,6 +77,7 @@ import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "
 import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
+  proposeMemory, resolveProposal,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
 } from "./memory.mjs";
 import {
@@ -353,6 +354,22 @@ export function startApiServer(dir, cfg) {
             });
             return send(res, 200, pack);
           }
+          if (req.method === "POST" && rest === "/memory/propose") {
+            const b = await readBody(req);
+            const r = proposeMemory(dir, owner, repo, b);
+            return send(res, 201, { ok: true, event: r.event, proposal: r.event, commit: r.commit });
+          }
+          if (req.method === "GET" && rest === "/memory/proposals") {
+            const st = loadMemory(dir, owner, repo);
+            const want = url.searchParams.get("status");
+            const proposals = want ? st.proposals.filter((x) => x.status === want) : st.proposals;
+            return send(res, 200, { proposals });
+          }
+          if (req.method === "POST" && rest === "/memory/proposals/resolve") {
+            const b = await readBody(req);
+            const r = resolveProposal(dir, owner, repo, b);
+            return send(res, 200, { ok: true, proposal: r.proposal, decision: r.decision, materialized: r.materialized, statusEvent: r.statusEvent, commit: r.commit });
+          }
           if (req.method === "GET" && rest === "/memory/stats") {
             return send(res, 200, memoryStats(dir, owner, repo));
           }
@@ -579,7 +596,7 @@ export function startApiServer(dir, cfg) {
         const b = await readBody(req);
         const r = await deployApp(dir, {
           name: b.name, repo: b.repo, command: b.command,
-          args: b.args, env: b.env, port: b.port,
+          args: b.args, env: b.env, port: b.port, memoryMB: b.memoryMB,
         });
         if (b.public) {
           // Caffeine-style: public:true auto-enables preview on deploy.

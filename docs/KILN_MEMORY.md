@@ -203,9 +203,22 @@ with a hand-forged commit appended outside the library).
 3. **Embeddings** — optional persisted vectors per event (local model
    first), fused into recall ranking (semantic + BM25 + graph +
    temporal, Mem0-style multi-signal fusion).
-4. **Consolidation proposals** — a Doctor-style background pass that
-   reads new episodes and *proposes* facts/links/core edits; a human
-   or the acting agent ratifies. Proposals are events too.
+4. **Consolidation proposals** — ✅ BUILT 2026-10-17. A consolidation
+   pass reads new episodes and *proposes* facts/links/core edits; a
+   human or the acting agent ratifies. Proposals are events too
+   (`proposal` / `proposal-status` in the same hash chain): the payload
+   is validated exactly like a direct write (provenance mandatory), a
+   pending proposal is invisible to recall, and ratification
+   materializes the real event marked `viaProposal` — idempotently, so
+   a crash or retry never double-writes. Library
+   (`proposeMemory`/`resolveProposal`), HTTP API
+   (`POST /memory/propose`, `GET /memory/proposals`,
+   `POST /memory/proposals/resolve`), SDK, and CLI
+   (`propose-fact|propose-link|propose-core|proposals|ratify|reject`)
+   all shipped; `memoryStats` reports pending/ratified/rejected
+   counts. Pinned by `test/memory-proposals.test.mjs`. The proposer
+   itself is any agent with read access — the daemon has no LLM and
+   invents nothing.
 5. **Fetch/promote refspecs** — daemon serves `refs/kiln/memory` in the
    default fetch refspec and `promote` carries memory to GitHub.
 6. **Cross-repo memory** — explicitly linked memories across repos

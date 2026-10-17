@@ -159,6 +159,19 @@ export class SwarmClient {
     const s = qs.toString();
     return this._req("GET", `${this._memBase(owner, repo)}/context${s ? "?" + s : ""}`);
   }
+  /** Propose a fact/link/core write for ratification (phase 4). opts: {kind, payload, rationale?, actor?}. */
+  async memoryPropose(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/propose`, opts);
+  }
+  /** List consolidation proposals, optionally filtered by status (pending|ratified|rejected). */
+  async memoryProposals(owner, repo, status) {
+    const s = status ? `?status=${encodeURIComponent(status)}` : "";
+    return (await this._req("GET", `${this._memBase(owner, repo)}/proposals${s}`)).proposals;
+  }
+  /** Ratify or reject a proposal: {proposal, decision: "ratified"|"rejected", reason?, actor?}. */
+  async memoryResolveProposal(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/proposals/resolve`, opts);
+  }
   async memoryStats(owner, repo) {
     return this._req("GET", `${this._memBase(owner, repo)}/stats`);
   }

@@ -66,7 +66,7 @@ const MAX_CONTENT = 1024 * 1024;  // hard cap per episode payload
 const MAX_APPEND_RETRIES = 5;
 const ZERO = "0".repeat(40);      // sha1 object-format "must not exist" marker
 
-const EVENT_TYPES = new Set(["episode", "fact", "supersede", "link", "core"]);
+const EVENT_TYPES = new Set(["episode", "fact", "supersede", "link", "core", "proposal", "proposal-status"]);
 const LABEL_RE = /^[a-z0-9]([a-z0-9-_]{0,62}[a-z0-9])?$/;
 
 // ---------------------------------------------------------------- git plumbing
@@ -274,32 +274,30 @@ export function remember(dir, owner, repo, opts = {}) {
 }
 
 /**
- * Assert a fact derived from episodes. Provenance is mandatory: at
- * least one source episode id, and every id must exist. `supersedes`
- * invalidates older facts in the same atomic event.
+ * Validate + normalize a fact payload against the current chain.
+ * Shared by assertFact (direct write) and proposeMemory (phase 4:
+ * the same payload, parked as a proposal until ratified). Provenance
+ * is mandatory in both paths: at least one source episode id, and
+ * every id must exist. `supersedes` must name real facts.
  */
-export function assertFact(dir, owner, repo, opts = {}) {
+function validateFactPayload(events, opts) {
   const subject = reqString(opts.subject, "subject", 2000);
   const predicate = reqString(opts.predicate, "predicate", 2000);
   const object = reqString(opts.object, "object", 2000);
   const sources = optStrings(opts.sourceEpisodes, "sourceEpisodes");
   if (!sources.length) throw new Error("memory: fact requires >= 1 source episode (provenance is mandatory)");
   const supersedes = optStrings(opts.supersedes, "supersedes");
-  const { events } = readEvents(dir, owner, repo);
   const byId = new Map(events.map((e) => [e.id, e]));
   for (const id of sources) {
     const src = byId.get(id);
-    if (!src) throw new Error(`memory: source episode ${id} not found in ${owner}/${repo}`);
+    if (!src) throw new Error(`memory: source episode ${id} not found`);
     if (src.type !== "episode") throw new Error(`memory: source ${id} is a ${src.type}, not an episode`);
   }
   for (const id of supersedes) {
     const t = byId.get(id);
-    if (!t || t.type !== "fact") throw new Error(`memory: supersede target ${id} is not a fact in ${owner}/${repo}`);
+    if (!t || t.type !== "fact") throw new Error(`memory: supersede target ${id} is not a fact`);
   }
-  return appendEvent(dir, owner, repo, (seq, prev) => ({
-    v: 1, id: newMemoryId(), seq, prev, type: "fact",
-    ts: Math.floor(Date.now() / 1000),
-    actor: String(opts.actor || "api"),
+  return {
     subject, predicate, object,
     confidence: Number.isFinite(opts.confidence) ? Math.min(1, Math.max(0, opts.confidence)) : null,
     validFrom: opts.validFrom ? new Date(isoToSec(opts.validFrom, "validFrom") * 1000).toISOString() : null,
@@ -307,6 +305,23 @@ export function assertFact(dir, owner, repo, opts = {}) {
     supersedes,
     entities: optStrings(opts.entities ?? [subject, object], "entities"),
     salience: Number.isFinite(opts.salience) ? Math.min(5, Math.max(0, opts.salience)) : 1,
+  };
+}
+
+/**
+ * Assert a fact derived from episodes. Provenance is mandatory: at
+ * least one source episode id, and every id must exist. `supersedes`
+ * invalidates older facts in the same atomic event.
+ */
+export function assertFact(dir, owner, repo, opts = {}) {
+  const { events } = readEvents(dir, owner, repo);
+  const f = validateFactPayload(events, opts);
+  return appendEvent(dir, owner, repo, (seq, prev) => ({
+    v: 1, id: newMemoryId(), seq, prev, type: "fact",
+    ts: Math.floor(Date.now() / 1000),
+    actor: String(opts.actor || "api"),
+    ...f,
+    ...(opts.viaProposal ? { viaProposal: String(opts.viaProposal) } : {}),
   }));
 }
 
@@ -339,6 +354,7 @@ export function linkMemories(dir, owner, repo, opts = {}) {
     ts: Math.floor(Date.now() / 1000),
     actor: String(opts.actor || "api"),
     from, to, relation,
+    ...(opts.viaProposal ? { viaProposal: String(opts.viaProposal) } : {}),
   }));
 }
 
@@ -353,7 +369,109 @@ export function setCore(dir, owner, repo, opts = {}) {
     actor: String(opts.actor || "api"),
     label, value,
     description: opts.description ? String(opts.description).slice(0, 500) : "",
+    ...(opts.viaProposal ? { viaProposal: String(opts.viaProposal) } : {}),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Consolidation proposals (phase 4, 2026-10-17).
+//
+// A consolidation pass — an agent reading new episodes, Letta sleep-time
+// style — never writes facts directly. It PROPOSES: a proposal is an
+// event carrying a fully validated would-be fact/link/core payload,
+// invisible to recall (proposals are not docs) until a human or the
+// acting agent ratifies it. Ratification materializes the real event
+// (marked viaProposal) and appends a proposal-status event; rejection
+// appends only the status. Both decisions are events too — the whole
+// lifecycle is in the hash chain, auditable and replayable.
+
+/**
+ * Propose a fact/link/core write. The payload is validated exactly as
+ * the direct write would be (same validators, same provenance rules) —
+ * a proposal that could never land is refused at propose time, not at
+ * ratify time. Returns the proposal event.
+ */
+export function proposeMemory(dir, owner, repo, opts = {}) {
+  const kind = reqString(opts.kind, "kind", 16);
+  if (!["fact", "link", "core"].includes(kind)) {
+    throw new Error(`memory: proposal kind must be fact|link|core, got "${kind}"`);
+  }
+  const p = opts.payload && typeof opts.payload === "object" ? opts.payload : {};
+  const { events } = readEvents(dir, owner, repo);
+  const byId = new Map(events.map((e) => [e.id, e]));
+  let payload;
+  if (kind === "fact") {
+    payload = validateFactPayload(events, p);
+  } else if (kind === "link") {
+    const from = reqString(p.from, "from", 128);
+    const to = reqString(p.to, "to", 128);
+    if (!byId.has(from)) throw new Error(`memory: link source ${from} not found`);
+    if (!byId.has(to)) throw new Error(`memory: link target ${to} not found`);
+    payload = { from, to, relation: reqString(p.relation, "relation", 64) };
+  } else {
+    const label = reqString(p.label, "label", 64);
+    if (!LABEL_RE.test(label)) throw new Error(`memory: bad core label "${label}"`);
+    payload = {
+      label,
+      value: reqString(p.value, "value", 20000),
+      description: p.description ? String(p.description).slice(0, 500) : "",
+    };
+  }
+  return appendEvent(dir, owner, repo, (seq, prev) => ({
+    v: 1, id: newMemoryId(), seq, prev, type: "proposal",
+    ts: Math.floor(Date.now() / 1000),
+    actor: String(opts.actor || "api"),
+    proposalKind: kind,
+    payload,
+    rationale: opts.rationale ? String(opts.rationale).slice(0, 1000) : "",
+  }));
+}
+
+/**
+ * Ratify or reject a pending proposal. Ratify materializes the payload
+ * through the normal writers (marked viaProposal) and then records the
+ * decision; the materialization is idempotent — if it already exists
+ * (crash between the two appends, or a retried call), it is reused,
+ * never duplicated. Reject records the decision only.
+ */
+export function resolveProposal(dir, owner, repo, opts = {}) {
+  const target = reqString(opts.proposal, "proposal", 128);
+  const decision = reqString(opts.decision, "decision", 16);
+  if (decision !== "ratified" && decision !== "rejected") {
+    throw new Error(`memory: decision must be ratified|rejected, got "${decision}"`);
+  }
+  const actor = String(opts.actor || "api");
+  const state = loadMemory(dir, owner, repo);
+  const prop = state.proposals.find((x) => x.id === target);
+  if (!prop) throw new Error(`memory: proposal ${target} not found in ${owner}/${repo}`);
+  if (prop.status !== "pending") {
+    throw new Error(`memory: proposal ${target} is already ${prop.status}`);
+  }
+  let materialized = null;
+  if (decision === "ratified") {
+    if (prop.materializedId) {
+      materialized = state.events.find((e) => e.id === prop.materializedId) || null;
+    }
+    if (!materialized) {
+      const p = prop.payload;
+      const r = prop.proposalKind === "fact"
+        ? assertFact(dir, owner, repo, { ...p, actor, viaProposal: prop.id })
+        : prop.proposalKind === "link"
+          ? linkMemories(dir, owner, repo, { ...p, actor, viaProposal: prop.id })
+          : setCore(dir, owner, repo, { ...p, actor, viaProposal: prop.id });
+      materialized = r.event;
+    }
+  }
+  const status = appendEvent(dir, owner, repo, (seq, prev) => ({
+    v: 1, id: newMemoryId(), seq, prev, type: "proposal-status",
+    ts: Math.floor(Date.now() / 1000),
+    actor,
+    target,
+    decision,
+    reason: opts.reason ? String(opts.reason).slice(0, 1000) : "",
+    materializedId: materialized ? materialized.id : null,
+  }));
+  return { proposal: prop, decision, materialized, statusEvent: status.event, commit: status.commit };
 }
 
 // ---------------------------------------------------------------- derived state
@@ -371,6 +489,13 @@ export function replayMemory(events) {
   const facts = new Map();
   const links = [];
   const core = new Map();
+  const proposals = new Map();
+  const noteMaterialized = (ev) => {
+    if (ev.viaProposal) {
+      const p = proposals.get(ev.viaProposal);
+      if (p) p.materializedId = ev.id;
+    }
+  };
   for (const ev of events) {
     if (ev.type === "episode") {
       episodes.push(ev);
@@ -383,6 +508,7 @@ export function replayMemory(events) {
           old.invalidatedBy = ev.id;
         }
       }
+      noteMaterialized(ev);
     } else if (ev.type === "supersede") {
       const t = facts.get(ev.target);
       if (t && t.invalidAtTs === null) {
@@ -391,11 +517,27 @@ export function replayMemory(events) {
       }
     } else if (ev.type === "link") {
       links.push(ev);
+      noteMaterialized(ev);
     } else if (ev.type === "core") {
       core.set(ev.label, { label: ev.label, value: ev.value, description: ev.description || "", updatedSeq: ev.seq, updatedTs: ev.ts, eventId: ev.id });
+      noteMaterialized(ev);
+    } else if (ev.type === "proposal") {
+      proposals.set(ev.id, {
+        ...ev, status: "pending", decidedBy: null, decidedTs: null,
+        decisionReason: "", materializedId: null,
+      });
+    } else if (ev.type === "proposal-status") {
+      const p = proposals.get(ev.target);
+      if (p && p.status === "pending") {
+        p.status = ev.decision;
+        p.decidedBy = ev.actor;
+        p.decidedTs = ev.ts;
+        p.decisionReason = ev.reason || "";
+        if (ev.materializedId) p.materializedId = ev.materializedId;
+      }
     }
   }
-  return { episodes, facts: [...facts.values()], links, core: [...core.values()] };
+  return { episodes, facts: [...facts.values()], links, core: [...core.values()], proposals: [...proposals.values()] };
 }
 
 export function loadMemory(dir, owner, repo) {
@@ -434,6 +576,11 @@ export function memoryStats(dir, owner, repo) {
     byType,
     episodes: state.episodes.length,
     facts: { total: state.facts.length, current: current.length, superseded: state.facts.length - current.length },
+    proposals: {
+      pending: state.proposals.filter((x) => x.status === "pending").length,
+      ratified: state.proposals.filter((x) => x.status === "ratified").length,
+      rejected: state.proposals.filter((x) => x.status === "rejected").length,
+    },
     links: state.links.length,
     coreBlocks: state.core.map((c) => c.label),
     bytes,

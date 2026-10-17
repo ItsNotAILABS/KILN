@@ -47,6 +47,7 @@ import {
 } from "./lib/sites.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
+  proposeMemory, resolveProposal,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
 } from "./lib/memory.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
@@ -627,6 +628,53 @@ async function cmdMemory(args) {
     });
     console.log(pack.text);
     console.error(`[memory: ${pack.usedTokens}/${pack.budgetTokens} tokens${pack.overBudget ? " OVER BUDGET (core alone exceeds it)" : ""}]`);
+  } else if (sub === "propose-fact") {
+    const r = proposeMemory(dir, owner, repo, {
+      kind: "fact",
+      payload: {
+        subject: need(args, "subject"), predicate: need(args, "predicate"), object: need(args, "object"),
+        sourceEpisodes: csv(need(args, "sources")), supersedes: csv(args.supersedes),
+        validFrom: args.from, confidence: args.confidence ? Number(args.confidence) : undefined,
+      },
+      rationale: args.rationale ? String(args.rationale) : "",
+      actor,
+    });
+    console.log(`proposed fact ${r.event.id} (seq ${r.event.seq}) — pending ratification`);
+  } else if (sub === "propose-link") {
+    const r = proposeMemory(dir, owner, repo, {
+      kind: "link",
+      payload: { from: need(args, "from"), to: need(args, "to"), relation: need(args, "relation") },
+      rationale: args.rationale ? String(args.rationale) : "",
+      actor,
+    });
+    console.log(`proposed link ${r.event.id} (seq ${r.event.seq}) — pending ratification`);
+  } else if (sub === "propose-core") {
+    const r = proposeMemory(dir, owner, repo, {
+      kind: "core",
+      payload: { label: need(args, "label"), value: need(args, "value"), description: args.description },
+      rationale: args.rationale ? String(args.rationale) : "",
+      actor,
+    });
+    console.log(`proposed core ${r.event.id} (seq ${r.event.seq}) — pending ratification`);
+  } else if (sub === "proposals") {
+    const st = loadMemory(dir, owner, repo);
+    const want = args.status ? String(args.status) : null;
+    const list = want ? st.proposals.filter((x) => x.status === want) : st.proposals;
+    for (const p of list) {
+      const what = p.proposalKind === "fact"
+        ? `${p.payload.subject} ${p.payload.predicate} ${p.payload.object}`
+        : p.proposalKind === "link" ? `${p.payload.from} -[${p.payload.relation}]-> ${p.payload.to}` : `core "${p.payload.label}"`;
+      console.log(`${p.id}  ${p.status.padEnd(8)} ${p.proposalKind.padEnd(4)} by ${p.actor}  ${what}${p.rationale ? `  — ${p.rationale}` : ""}`);
+    }
+    if (!list.length) console.log("(no proposals)");
+  } else if (sub === "ratify" || sub === "reject") {
+    const r = resolveProposal(dir, owner, repo, {
+      proposal: need(args, "proposal"),
+      decision: sub === "ratify" ? "ratified" : "rejected",
+      reason: args.reason ? String(args.reason) : "",
+      actor,
+    });
+    console.log(`${r.decision} ${r.proposal.id}${r.materialized ? ` → materialized as ${r.materialized.type} ${r.materialized.id}` : ""} @ ${r.commit.slice(0, 12)}`);
   } else if (sub === "stats") {
     console.log(JSON.stringify(memoryStats(dir, owner, repo), null, 2));
   } else if (sub === "verify") {
@@ -634,7 +682,7 @@ async function cmdMemory(args) {
     console.log(JSON.stringify(v, null, 2));
     if (!v.ok) process.exit(1);
   } else {
-    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify --repo <owner>/<repo> [...]");
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]");
     process.exit(2);
   }
 }

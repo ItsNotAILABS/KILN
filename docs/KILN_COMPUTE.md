@@ -115,6 +115,34 @@ the cap. A node already dead at the cap is revived deliberately with
 `swarm.mjs node revive <id|name>`, which resets its budget and lets the
 daemon respawn it on the next tick.
 
+### App guardrails (2026-10-17)
+
+Apps are long-lived services, so they get service-shaped guardrails
+(the invoke sandbox's namespace jail doesn't fit a process that must
+bind a real port and run for months):
+
+- **Environment allowlist** — the app gets `PATH`/`HOME`/`TMPDIR`/
+  `PORT` plus only its declared `env`. It never inherits the worker's
+  environment, which may hold daemon secrets. (Predates this pass.)
+- **Memory cap** — `memoryMB` at deploy (64..16384, default 512) is
+  written to `app.json`. The worker samples the app's whole process
+  tree RSS from `/proc` every 5s; a breach kills the tree, is recorded
+  in `app-state.json` (`capBreaches`, `lastBreachRssBytes`), and the
+  normal restart-with-backoff loop applies.
+- **Metering** — the same samples record `rssBytes`, `cpuMs`,
+  `startedAt`, `restarts`, and `lastExit` to `app-state.json`, surfaced
+  as `runtime` in app status/list. CPU is metered, not capped.
+- **Bounded logs** — app output pipes through a rotating writer:
+  `app.log` rotates at 10MB (`KILN_APP_LOG_MAX_BYTES`), keeping
+  `.1`/`.2`. An app can no longer fill the disk by talking forever.
+
+**Honest bounds:** the memory cap is polling enforcement (≤5s lag),
+not a cgroup — this cell mounts `/sys/fs/cgroup` read-only, so kernel
+accounting isn't available here; if that changes, `memory.max` is the
+upgrade path. Apps still share the host network namespace (they bind
+real ports by design) and run as the daemon's OS user; per-app users
+and netns are future work, not current claims.
+
 - `GET /v1/compute/apps` — list (with TCP readiness per app)
 - `GET /v1/compute/apps/:id` — one app: worker liveness + port readiness probe
 - `GET /v1/compute/apps/:id/logs?tail=100` — logs
