@@ -18,7 +18,7 @@ import {
   statSync, writeFileSync,
 } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const INDEX_SCHEMA = "kiln.context-index.v1";
 const PACK_SCHEMA = "kiln.context-pack.v2";
@@ -47,7 +47,7 @@ function sha256(value) {
 }
 
 function atomicJson(path, value) {
-  const tmp = path + ".tmp-" + process.pid;
+  const tmp = path + ".tmp-" + process.pid + "-" + randomUUID();
   writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
   renameSync(tmp, path);
 }
@@ -86,6 +86,20 @@ function secretPath(path) {
   return SECRET_PATH_PATTERNS.some((r) => r.test(path));
 }
 
+const SECRET_CONTENT_PATTERNS = [
+  /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{40,}\b/,
+  /\bgh[pousr]_[A-Za-z0-9_]{30,}\b/,
+  /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/,
+  /\bAIza[0-9A-Za-z_-]{30,}\b/,
+];
+
+function sensitiveContent(body) {
+  const sample = body.length > 2_000_000 ? body.slice(0, 2_000_000) : body;
+  return SECRET_CONTENT_PATTERNS.some((r) => r.test(sample));
+}
+
 function safeTextFile(base, rel) {
   if (!rel || rel.includes("\0") || secretPath(rel)) return null;
   const absolute = resolve(base, rel);
@@ -101,7 +115,8 @@ function safeTextFile(base, rel) {
   let body;
   try { body = readFileSync(canonical, "utf8"); } catch { return null; }
   if (body.includes("\0")) return null;
-  return { absolute: canonical, bytes: st.size, body };
+  if (sensitiveContent(body)) return { absolute: canonical, bytes: st.size, body: null, sensitive: true };
+  return { absolute: canonical, bytes: st.size, body, sensitive: false };
 }
 
 function terms(text) {
@@ -211,6 +226,7 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
     if (secretPath(rel)) { skipped.push({ path: rel, reason: "secret-path-policy" }); continue; }
     const f = safeTextFile(base, rel);
     if (!f) { skipped.push({ path: rel, reason: "unsupported-or-unsafe" }); continue; }
+    if (f.sensitive) { skipped.push({ path: rel, reason: "secret-content-policy" }); continue; }
     const fileHash = sha256(f.body);
     const previous = previousFiles.get(rel);
     const signals = codeSignals(rel, f.body);
