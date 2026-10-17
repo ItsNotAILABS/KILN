@@ -202,6 +202,14 @@ export class SwarmClient {
     }
     return this.contextQuery(node, query, { ...options, knownHashes });
   }
+  async contextSit(node, query, options = {}) {
+    if (!node) throw new Error("contextSit: node is required");
+    if (!query || !String(query).trim()) throw new Error("contextSit: query is required");
+    return this._req("POST", `/v1/context/nodes/${encodeURIComponent(node)}/sit`, {
+      query: String(query),
+      ...options,
+    });
+  }
   async contextReceiptsVerify() {
     return this._req("POST", "/v1/context/receipts/verify", {});
   }
