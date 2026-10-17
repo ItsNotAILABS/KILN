@@ -254,6 +254,15 @@ function findDef(name) {
   return d;
 }
 
+function kilnRepoIdentity(repoRef) {
+  const value = String(repoRef || "");
+  let m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\.git\/?$/);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
+  if (m) return { owner: m[1], repo: m[2] };
+  return null;
+}
+
 // ---------------------------------------------------------------- impl
 
 async function impl(ctx, name, args) {
@@ -315,21 +324,20 @@ async function impl(ctx, name, args) {
         expandDependencies: true,
       });
       let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
-      const repoRef = String(ctx.node?.repo || "");
-      const m = repoRef.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
-      if (m) {
+      const identity = kilnRepoIdentity(ctx.node?.repo);
+      if (identity) {
         try {
           memory = {
             available: true,
-            owner: m[1],
-            repo: m[2],
-            ...agentAwareness(ctx.dir, m[1], m[2], {
+            owner: identity.owner,
+            repo: identity.repo,
+            ...agentAwareness(ctx.dir, identity.owner, identity.repo, {
               query,
               budgetTokens: args.memoryTokens === undefined ? 1200 : needNum(args, "memoryTokens"),
             }),
           };
         } catch (e) {
-          memory = { available: false, owner: m[1], repo: m[2], reason: e.message };
+          memory = { available: false, owner: identity.owner, repo: identity.repo, reason: e.message };
         }
       }
       const contextReceipt = appendContextReceipt(ctx.dir, {
