@@ -109,8 +109,10 @@ function terms(text) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_./-]+/g, " ")
     .toLowerCase();
-  const out = normalized.match(/[a-z][a-z0-9]{1,63}/g) || [];
-  return out.filter((x) => x.length > 1);
+  const out = normalized.match(/[a-z][a-z0-9]{1,63}|\d+/g) || [];
+  return out
+    .map((x) => /^\d+$/.test(x) ? String(Number.parseInt(x, 10)) : x)
+    .filter((x) => x.length > 1 || /^\d+$/.test(x));
 }
 
 function unique(xs) { return [...new Set(xs.filter(Boolean))]; }
