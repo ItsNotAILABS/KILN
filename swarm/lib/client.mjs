@@ -109,6 +109,27 @@ export class SwarmClient {
     return this._req("POST", `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
   }
 
+  // ---- Context Fabric (node-bound local repository retrieval) ----
+  async buildContextIndex(node, options = {}) {
+    if (!node) throw new Error("buildContextIndex: node is required");
+    return this._req("POST", `/context/${encodeURIComponent(node)}/index`, options);
+  }
+  async contextStatus(node) {
+    if (!node) throw new Error("contextStatus: node is required");
+    return this._req("GET", `/context/${encodeURIComponent(node)}/status`);
+  }
+  async queryContext(node, query, options = {}) {
+    if (!node) throw new Error("queryContext: node is required");
+    if (!query || !String(query).trim()) throw new Error("queryContext: query is required");
+    return this._req("POST", `/context/${encodeURIComponent(node)}/query`, { query, ...options });
+  }
+  async queryContextDelta(node, query, priorPack, options = {}) {
+    const knownHashes = {};
+    for (const item of priorPack?.items || []) if (item.path && item.sha256) knownHashes[item.path] = item.sha256;
+    for (const item of priorPack?.unchanged || []) if (item.path && item.sha256) knownHashes[item.path] = item.sha256;
+    return this.queryContext(node, query, { ...options, knownHashes });
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});
