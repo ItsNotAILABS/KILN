@@ -39,7 +39,7 @@ const DENY_PATTERNS = [
   "&&", "||", ";", "|", ">", "<", "\n", "\r", "\0",
 ];
 
-function checkShellArgs(command, args) {
+function checkShellArgs(workdir, command, args) {
   const bin = basename(String(command)).toLowerCase();
   if (SHELL_BINS.has(bin)) {
     throw new ToolError(`jail: shell binaries are not executable tools (got "${command}")`);
@@ -48,10 +48,21 @@ function checkShellArgs(command, args) {
   for (const pat of DENY_PATTERNS) {
     if (joined.includes(pat)) throw new ToolError(`jail: denied pattern ${JSON.stringify(pat)} in command`);
   }
-  if (String(command).includes("/")) {
-    // A path command must stay inside the work dir.
-    return "path-command";
+  const base = resolve(workdir);
+  for (const raw of args || []) {
+    const value = String(raw);
+    const candidates = [value];
+    const eq = value.indexOf("=");
+    if (eq >= 0) candidates.push(value.slice(eq + 1));
+    for (const candidate of candidates) {
+      if (!candidate.startsWith("/")) continue;
+      const absolute = resolve(candidate);
+      if (absolute !== base && !absolute.startsWith(base + sep)) {
+        throw new ToolError(`jail: absolute argument escapes work dir: ${candidate}`);
+      }
+    }
   }
+  if (String(command).includes("/")) return "path-command";
   return "bin";
 }
 
@@ -59,7 +70,7 @@ const MAX_OUTPUT = 64 * 1024;
 
 /** Shared jailed execution for shell.exec and project.release. */
 async function execJailed(workdir, command, cmdArgs, timeoutMs) {
-  const kind = checkShellArgs(command, cmdArgs);
+  const kind = checkShellArgs(workdir, command, cmdArgs);
   let bin = command;
   if (kind === "path-command") bin = jailPath(workdir, command);
   return await runCmd(bin, cmdArgs.map(String), { cwd: workdir, timeoutMs });
