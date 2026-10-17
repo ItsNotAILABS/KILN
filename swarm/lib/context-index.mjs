@@ -14,8 +14,8 @@
  */
 import { execFileSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, readFileSync, realpathSync, renameSync,
-  statSync, writeFileSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync,
+  statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -190,13 +190,53 @@ function indexPath(indexDir, repoRoot) {
   return join(indexDir, id + ".json");
 }
 
+function objectPath(indexDir, digest) {
+  return join(indexDir, "objects", digest.slice(0, 2), digest + ".txt");
+}
+
+function storeChunkObject(indexDir, text) {
+  const digest = sha256(text);
+  const path = objectPath(indexDir, digest);
+  if (existsSync(path)) return { digest, written: false, bytes: 0 };
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = path + ".tmp-" + process.pid + "-" + randomUUID();
+  writeFileSync(tmp, text, { mode: 0o600 });
+  if (existsSync(path)) {
+    try { unlinkSync(tmp); } catch {}
+    return { digest, written: false, bytes: 0 };
+  }
+  renameSync(tmp, path);
+  return { digest, written: true, bytes: Buffer.byteLength(text, "utf8") };
+}
+
+function hydratePersistedChunks(indexDir, data) {
+  const chunks = [];
+  for (const chunk of data.chunks || []) {
+    if (typeof chunk.text === "string") {
+      chunks.push(chunk);
+      continue;
+    }
+    if (!chunk.objectDigest || !/^[0-9a-f]{64}$/.test(chunk.objectDigest)) return null;
+    const path = objectPath(indexDir, chunk.objectDigest);
+    if (!existsSync(path)) return null;
+    let text;
+    try { text = readFileSync(path, "utf8"); } catch { return null; }
+    if (sha256(text) !== chunk.objectDigest) return null;
+    chunks.push({ ...chunk, text });
+  }
+  return chunks;
+}
+
 export function loadIndex(indexDir, repoRoot) {
   const base = canonicalRepoRoot(repoRoot);
   const path = indexPath(indexDir, base);
   if (!existsSync(path)) return null;
-  const data = JSON.parse(readFileSync(path, "utf8"));
+  let data;
+  try { data = JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
   if (data.schema !== INDEX_SCHEMA || data.repoRoot !== base) return null;
-  return data;
+  const chunks = hydratePersistedChunks(indexDir, data);
+  if (!chunks) return null;
+  return { ...data, chunks };
 }
 
 /**
@@ -240,6 +280,16 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
     }
   }
 
+  let casObjectsWritten = 0;
+  let casObjectsReused = 0;
+  let casBytesWritten = 0;
+  for (const chunk of chunks) {
+    const stored = storeChunkObject(indexDir, chunk.text);
+    chunk.objectDigest = stored.digest;
+    if (stored.written) { casObjectsWritten++; casBytesWritten += stored.bytes; }
+    else casObjectsReused++;
+  }
+
   const documentFrequency = Object.create(null);
   let totalTerms = 0;
   for (const c of chunks) {
@@ -276,6 +326,9 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
       cacheReuseRatio: files.length ? reusedFiles / files.length : 0,
       rebuiltFiles,
       skippedFiles: skipped.length,
+      casObjectsWritten,
+      casObjectsReused,
+      casBytesWritten,
     },
     documentFrequency,
   };
@@ -285,7 +338,11 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
     files: index.files,
     chunkIds: index.chunks.map((c) => c.id),
   }));
-  atomicJson(indexPath(indexDir, base), index);
+  const persisted = {
+    ...index,
+    chunks: index.chunks.map(({ text, ...metadata }) => metadata),
+  };
+  atomicJson(indexPath(indexDir, base), persisted);
   return index;
 }
 
@@ -481,6 +538,41 @@ export function queryContextIndex(index, query, opts = {}) {
 export function refreshAndQuery(repoRoot, indexDir, query, opts = {}) {
   const index = buildContextIndex(repoRoot, indexDir, opts);
   return { index, pack: queryContextIndex(index, query, opts) };
+}
+
+export function pruneContextCas(indexDir) {
+  const live = new Set();
+  if (!existsSync(indexDir)) return { removedObjects: 0, reclaimedBytes: 0, liveObjects: 0 };
+  for (const name of readdirSync(indexDir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const data = JSON.parse(readFileSync(join(indexDir, name), "utf8"));
+      for (const c of data.chunks || []) if (c.objectDigest) live.add(c.objectDigest);
+    } catch {}
+  }
+  const objectsRoot = join(indexDir, "objects");
+  let removedObjects = 0, reclaimedBytes = 0, observedObjects = 0;
+  if (existsSync(objectsRoot)) {
+    for (const prefix of readdirSync(objectsRoot)) {
+      const dir = join(objectsRoot, prefix);
+      let st; try { st = statSync(dir); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith(".txt")) continue;
+        const digest = name.slice(0, -4);
+        const path = join(dir, name);
+        observedObjects++;
+        if (live.has(digest)) continue;
+        try {
+          const bytes = statSync(path).size;
+          unlinkSync(path);
+          removedObjects++;
+          reclaimedBytes += bytes;
+        } catch {}
+      }
+    }
+  }
+  return { removedObjects, reclaimedBytes, liveObjects: live.size, observedObjects };
 }
 
 export const contextSchemas = { INDEX_SCHEMA, PACK_SCHEMA };
