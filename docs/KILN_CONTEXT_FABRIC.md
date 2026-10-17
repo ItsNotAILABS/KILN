@@ -143,3 +143,43 @@ Do not advertise a token-reduction percentage from `byteReduction`. The benchmar
 - E5: independent production/security evidence.
 
 Context Fabric is not production-certified merely because the modules exist.
+
+
+## Context sit: code + durable memory
+
+A KILN node can use `context.sit` when it needs both the current code tree and durable repository memory:
+
+```json
+{
+  "tool": "context.sit",
+  "args": {
+    "query": "promotion policy and prior decisions",
+    "maxBytes": 18000,
+    "maxChunks": 10,
+    "memoryTokens": 1200
+  }
+}
+```
+
+Memory is fused only when the node is actually attached to a KILN-native repository. The tool derives owner/repo from that node's own remote (loopback Git URL or local KILN bare path). It does not accept an arbitrary memory repository argument.
+
+## Promotion with context provenance
+
+The SDK can bind a context result into a real KILN GitHub promotion:
+
+```js
+const contextResult = await kiln.contextQuery(
+  "muse",
+  "promotion implementation and policy",
+  { maxBytes: 24000 },
+);
+
+const receipt = await kiln.promoteFromContext({
+  repo: "muse/project",
+  github: "ItsNotAILABS/project",
+  contextResult,
+  ci: "context-fabric-gate",
+});
+```
+
+The promotion carries digests and receipt hashes, not raw query text or retrieved source.
