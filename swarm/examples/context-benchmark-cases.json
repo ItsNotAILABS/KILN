@@ -1,0 +1,7 @@
+[
+  {"query":"context pack local retrieval token budget","expectedPaths":["swarm/lib/context-index.mjs"]},
+  {"query":"bearer token localhost daemon api","expectedPaths":["swarm/lib/httpapi.mjs"]},
+  {"query":"agent node capability grant receipt","expectedPaths":["swarm/lib/tools.mjs","swarm/lib/receipts.mjs"]},
+  {"query":"git clone push native repository","expectedPaths":["swarm/lib/git.mjs"]},
+  {"query":"persistent worker daemon restart heartbeat","expectedPaths":["swarm/lib/daemon.mjs","swarm/lib/worker.mjs"]}
+]
