@@ -19,7 +19,7 @@ import {
  * self-deadlock plus a 120s API freeze for everyone else. Async keeps the
  * loop alive so the clone's own HTTP requests get answered.
  */
-export function gitClone(repo, workdir, timeoutMs) {
+function gitClone(repo, workdir, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn("git", ["clone", repo, workdir], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";
@@ -36,61 +36,9 @@ export function gitClone(repo, workdir, timeoutMs) {
       clearTimeout(timer);
       if (code !== 0) {
         reject(new Error(`nodes: git clone failed: ${(err || out).trim().slice(0, 500) || `signal ${signal}`}`));
-      } else {
-        // Best-effort memory fetch (phase 5), awaited before resolve so
-        // callers see the finished state — but it swallows everything
-        // and time-boxes each step, so it can never fail or hang a clone.
-        fetchMemoryRef(workdir).then(() => resolve(), () => resolve());
-      }
+      } else resolve();
     });
   });
-}
-
-/** Async one-shot git in a workdir; resolves { code, out }, never rejects. */
-function gitRun(workdir, args, timeoutMs) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn("git", ["-C", workdir, ...args], { stdio: ["ignore", "pipe", "pipe"] });
-    } catch { resolve({ code: -1, out: "" }); return; }
-    let out = "";
-    child.stdout.on("data", (d) => { out += d; });
-    child.on("error", () => resolve({ code: -1, out }));
-    const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch {}
-      resolve({ code: -1, out });
-    }, timeoutMs);
-    if (timer.unref) timer.unref();
-    child.on("close", (code) => { clearTimeout(timer); resolve({ code, out }); });
-  });
-}
-
-/**
- * Best-effort: give a fresh clone the repo's memory chain
- * (refs/kiln/memory, phase 5). Runs AFTER a successful clone and can
- * never fail it — every step is best-effort and non-zero exits are
- * ignored.
- *
- * ASYNC for the same reason gitClone is (E3): this runs inside the
- * daemon when a node clones a repo the daemon itself serves, so a
- * spawnSync ls-remote would block the event loop against its own HTTP
- * server and deadlock until the timeout — the exact bug E3 pins.
- *
- * The refspec is persisted ONLY when the ref provably exists on the
- * remote: an exact refspec naming an absent ref makes every later
- * plain `git fetch` exit 128 (verified), which would poison the
- * workdir for the node's whole life. So: probe with ls-remote first;
- * configure + fetch only on a non-empty answer.
- */
-async function fetchMemoryRef(workdir) {
-  try {
-    const ls = await gitRun(workdir, ["ls-remote", "origin", "refs/kiln/memory"], 15000);
-    if (ls.code !== 0 || !ls.out.trim()) return;
-    await gitRun(workdir, ["config", "--add", "remote.origin.fetch",
-      "+refs/kiln/memory:refs/kiln/memory"], 15000);
-    await gitRun(workdir, ["fetch", "-q", "origin",
-      "+refs/kiln/memory:refs/kiln/memory"], 15000);
-  } catch { /* best effort: a memory fetch must never fail a clone */ }
 }
 
 function gitSync(workdir, args) {

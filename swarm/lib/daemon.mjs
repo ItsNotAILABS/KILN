@@ -22,7 +22,7 @@ import {
   pidIsDaemon, pidIsWorker, processStartId, heartbeatAgeMs, touchHeartbeat, writeJobFile, readJobFile,
 } from "./state.mjs";
 import { appendEvent, pendingJobs } from "./queue.mjs";
-import { createNode } from "./nodes.mjs";
+import { createNode, budgetRestoreDue, restoreBudget } from "./nodes.mjs";
 import { nowSec } from "./grant.mjs";
 import { startApiServer } from "./httpapi.mjs";
 import { settleComputeJobs } from "./compute.mjs";
@@ -130,6 +130,7 @@ function spawnWorker(dir, id) {
   closeSync(out); closeSync(err);
   const node = loadNode(dir, id);
   node.workerPid = child.pid;
+  node.workerSpawnedAt = Date.now();
   saveNode(dir, node);
   touchHeartbeat(dir, id);
   log(`spawned worker for ${node.name} (${id.slice(0, 12)}…) pid=${child.pid}`);
@@ -155,6 +156,15 @@ function reconcile(dir, cfg) {
     const st = nodeStatus(dir, cfg, node);
     if (st === "idle" || st === "working" || st === "stale") {
       if (st === "stale") { logStaleHeartbeat(node); staleNodes.push(node); }
+      // Earned budget restore: sustained health (alive + fresh heartbeat
+      // for the full window) refills the restart budget, so deaths the
+      // node didn't cause — daemon/host kills — can't permanently retire
+      // a healthy long-lived node. Crash loops never earn this.
+      if (st !== "stale" && budgetRestoreDue(node, Date.now())) {
+        const was = restoreBudget(node);
+        saveNode(dir, node);
+        log(`node ${node.name}: restart budget restored (${was} → 0) after sustained health`);
+      }
       continue; // live worker (or at least a live pid) — adopt it
     }
     // dead worker: respawn per policy

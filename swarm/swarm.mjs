@@ -9,6 +9,7 @@
  *                        [--policy never|on-failure|always] [--max-restarts N] [--dir PATH]
  *   swarm.mjs node list [--dir PATH]
  *   swarm.mjs node stop <id|name> [--dir PATH]
+ *   swarm.mjs node revive <id|name> [--dir PATH]
  *   swarm.mjs node logs <id|name> [--tail N] [--dir PATH]
  *   swarm.mjs job submit --plan FILE [--name N] [--mind M] [--node ID] [--dir PATH]
  *   swarm.mjs job list [--dir PATH]
@@ -33,7 +34,7 @@ import {
   stateDir as defaultStateDir, ensureStateDir, listNodeIds, loadNode, saveNode,
   resolveNode, pidAlive, pidIsDaemon, heartbeatAgeMs, nodeDir, loadApiToken,
 } from "./lib/state.mjs";
-import { createNode } from "./lib/nodes.mjs";
+import { createNode, reviveNode } from "./lib/nodes.mjs";
 import { loadKeypair } from "./lib/keys.mjs";
 import { loadKeyFile } from "./lib/state.mjs";
 import { parseCaps, capsToNames, nowSec } from "./lib/grant.mjs";
@@ -328,6 +329,14 @@ async function cmdNode(args) {
       n.workerPid = null; n.lastExit = 0; saveNode(dir, n);
       console.log(`stopped worker for ${n.name}`);
     } else console.log(`${n.name}: no live worker`);
+  } else if (sub === "revive") {
+    if (!args._[2]) { console.error("usage: node revive <id|name>"); process.exit(2); }
+    const { node: n, was } = reviveNode(dir, args._[2]);
+    console.log(`revived node ${n.name}: restart budget reset (${was} → 0), last exit cleared`);
+    const d = daemonJson(dir);
+    console.log(d && pidAlive(d.pid)
+      ? "  daemon will respawn the worker on its next tick (autostart + restart policy permitting)"
+      : "  daemon not running — the worker starts when the daemon does");
   } else if (sub === "logs") {
     if (!args._[2]) { console.error("usage: node logs <id|name>"); process.exit(2); }
     const id = resolveNode(dir, args._[2]);

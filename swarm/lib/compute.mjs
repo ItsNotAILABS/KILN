@@ -37,13 +37,13 @@
  * so invoke() does not widen the trust boundary; it just makes it ergonomic.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import os from "node:os";
 import { createConnection } from "node:net";
 import { appendEvent, newJobId, replay, readEvents } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
-import { nodeDir, loadNode, saveNode, listNodeIds, writeFileAtomicSync } from "./state.mjs";
+import { nodeDir, loadNode, saveNode, listNodeIds } from "./state.mjs";
 import { nowSec } from "./grant.mjs";
 import { checkShellArgs } from "./tools.mjs";
 
@@ -206,9 +206,12 @@ function loadStore(dir) {
   }
 }
 
-/** Atomic store write (tmp + fsync + rename, via the shared helper). */
+/** Atomic store write (tmp + rename). */
 function saveStore(dir, store) {
-  writeFileAtomicSync(computePath(dir), JSON.stringify(store, null, 2) + "\n");
+  const p = computePath(dir);
+  const tmp = p + ".tmp";
+  writeFileSync(tmp, JSON.stringify(store, null, 2) + "\n");
+  renameSync(tmp, p);
 }
 
 // Exported for lib/preview.mjs (single store, no duplication).
@@ -843,17 +846,7 @@ function checkAppEnv(env) {
  * Deploy a repo as a persistent supervised service. The worker boots the
  * app's command on (re)start and restarts it on crash; logs go to app.log.
  */
-/** App memory cap: wider than the invocation range — services are long-lived. */
-function needAppMemoryMB(v) {
-  if (v === undefined) return 512;
-  const n = Number(v);
-  if (!Number.isInteger(n) || n < 64 || n > 16384) {
-    throw new ComputeError(400, "memoryMB must be an integer in 64..16384");
-  }
-  return n;
-}
-
-export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, port, memoryMB }) {
+export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, port }) {
   checkAppName(name);
   if (typeof repo !== "string" || !repo.trim()) throw new ComputeError(400, "repo is required");
   if (typeof command !== "string" || !command.trim()) throw new ComputeError(400, "command is required");
@@ -889,10 +882,10 @@ export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, 
     args: argv,
     env: cleanEnv,
     port: p,
-    memoryMB: needAppMemoryMB(memoryMB),
     deployedAt: new Date().toISOString(),
   };
-  writeFileAtomicSync(join(nodeDir(dir, node.id), "app.json"), JSON.stringify(appCfg, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(join(nodeDir(dir, node.id), "app.json"), JSON.stringify(appCfg, null, 2) + "\n", { mode: 0o600 });
+  try { chmodSync(join(nodeDir(dir, node.id), "app.json"), 0o600); } catch { /* best effort */ }
   return { appId: node.id, name, status: "deploying" };
 }
 
@@ -928,19 +921,11 @@ export async function appStatus(dir, appId) {
   if (cfg.port && workerAlive) {
     ready = await probeTcp(cfg.port);
   }
-  // Runtime metering written by the worker's app supervisor (may be
-  // absent for apps deployed before metering existed).
-  let runtime = null;
-  try {
-    runtime = JSON.parse(readFileSync(join(nodeDir(dir, appId), "app-state.json"), "utf8"));
-  } catch { /* no state yet */ }
   return {
     appId,
     name: cfg.name,
     command: cfg.command,
     port: cfg.port,
-    memoryMB: cfg.memoryMB ?? null,
-    runtime,
     deployedAt: cfg.deployedAt || null,
     workerAlive,
     // status reflects application readiness, not just process liveness:
