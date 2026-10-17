@@ -50,15 +50,25 @@ try {
     print(queryContextIndex(index,String(need(a,"query")),{maxBytes:num(a,"max-bytes",24000),maxChunks:num(a,"max-chunks",12),mmrLambda:num(a,"mmr-lambda",0.78)}));
   } else if(cmd==="index"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
-    print(await client.buildContextIndex(String(need(a,"node")),{chunkLines:num(a,"chunk-lines",undefined),overlap:num(a,"overlap",undefined)}));
+    print(await client.contextIndex(String(need(a,"node")),{chunkLines:num(a,"chunk-lines",undefined),overlap:num(a,"overlap",undefined)}));
   } else if(cmd==="query"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
-    print(await client.queryContext(String(need(a,"node")),String(need(a,"query")),{maxBytes:num(a,"max-bytes",24000),maxChunks:num(a,"max-chunks",12),mmrLambda:num(a,"mmr-lambda",0.78)}));
+    print(await client.contextQuery(String(need(a,"node")),String(need(a,"query")),{maxBytes:num(a,"max-bytes",24000),maxChunks:num(a,"max-chunks",12),mmrLambda:num(a,"mmr-lambda",0.78)}));
+  } else if(cmd==="delta"){
+    const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
+    const fs=await import("node:fs");
+    const prior=JSON.parse(fs.readFileSync(resolve(String(need(a,"prior"))),"utf8"));
+    print(await client.contextDelta(String(need(a,"node")),String(need(a,"query")),prior,{
+      maxBytes:num(a,"max-bytes",24000),maxChunks:num(a,"max-chunks",12),mmrLambda:num(a,"mmr-lambda",0.78)
+    }));
   } else if(cmd==="status"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
     print(await client.contextStatus(String(need(a,"node"))));
+  } else if(cmd==="verify"){
+    const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
+    print(await client.contextReceiptsVerify());
   } else {
-    console.error("usage: context.mjs local-index|local-query|index|query|status [options]");
+    console.error("usage: context.mjs local-index|local-query|index|query|delta|status|verify [options]");
     process.exit(2);
   }
 } catch(e) {
