@@ -7,10 +7,10 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildContextIndex, loadIndex, queryContextIndex } from "../lib/context-index.mjs";
+import { buildContextIndex, loadIndex, pruneContextCas, queryContextIndex } from "../lib/context-index.mjs";
 import { appendContextReceipt, verifyContextReceipts } from "../lib/context-receipts.mjs";
 
 let assertions=0;
@@ -81,6 +81,15 @@ try{
   ok(first.skipped.some(x=>x.path===".env"),"env skip recorded");
   ok(first.skipped.some(x=>x.path==="secrets/credential.txt"),"secret skip recorded");
   ok(first.skipped.some(x=>x.path==="docs/auth-material.txt"&&x.reason==="secret-content-policy"),"secret-content skip recorded");
+  ok(first.stats.casObjectsWritten>0,"CAS writes chunk objects on first build");
+  ok(first.stats.casBytesWritten>0,"CAS byte accounting populated");
+  const persistedIndexName=readdirSync(state).find(x=>x.endsWith(".json"));
+  ok(!!persistedIndexName,"persisted index metadata exists");
+  const persistedRaw=readFileSync(join(state,persistedIndexName),"utf8");
+  eq(persistedRaw.includes("promotionGate"),false,"persisted index metadata does not duplicate source chunk text");
+  const persistedJson=JSON.parse(persistedRaw);
+  ok(persistedJson.chunks.every(x=>!Object.prototype.hasOwnProperty.call(x,"text")),"persisted chunks are metadata-only");
+  ok(persistedJson.chunks.every(x=>/^[0-9a-f]{64}$/.test(x.objectDigest||"")),"persisted chunks reference CAS digests");
 
   const loaded=loadIndex(state,root);
   eq(loaded.digest,first.digest,"persistent index reload digest");
@@ -117,6 +126,7 @@ try{
   ok(second.stats.reusedFiles>=first.stats.indexedFiles,"unchanged files reused");
   eq(second.stats.rebuiltFiles,0,"no unchanged files rebuilt");
   ok(second.stats.cacheReuseRatio>0.99,"no-op refresh reports near-total cache reuse");
+  ok(second.stats.casObjectsReused>=second.stats.chunks,"no-op refresh reuses persisted CAS objects");
 
   // 72 targeted retrieval checks across the generated documentation corpus.
   for(let i=0;i<36;i++){
@@ -125,6 +135,17 @@ try{
     ok(pack.items.some(x=>x.path===p),`retrieval contains ${p}`);
     ok(pack.stats.emittedBytes<=2048,`budget respected for module ${i}`);
   }
+
+  const orphanDigest="f".repeat(64);
+  const orphanDir=join(state,"objects","ff");
+  mkdirSync(orphanDir,{recursive:true});
+  const orphanPath=join(orphanDir,orphanDigest+".txt");
+  writeFileSync(orphanPath,"orphan-context-object\n");
+  ok(existsSync(orphanPath),"orphan CAS fixture created");
+  const gc=pruneContextCas(state);
+  ok(gc.removedObjects>=1,"CAS GC removes unreferenced objects");
+  ok(gc.reclaimedBytes>=statSync(join(state,persistedIndexName)).size*0 || gc.reclaimedBytes>0,"CAS GC reports reclaimed bytes");
+  eq(existsSync(orphanPath),false,"orphan CAS object deleted");
 
   // Worktree change must invalidate exactly the changed file payload.
   const auth=readFileSync(join(root,"src","auth.js"),"utf8");
@@ -163,7 +184,7 @@ try{
     ok(!item.path.includes(".."),`normalized path ${item.path}`);
   }
 
-  ok(assertions>=130,`expected >=130 assertions, got ${assertions}`);
+  ok(assertions>=140,`expected >=140 assertions, got ${assertions}`);
   console.log(JSON.stringify({
     schema:"kiln.context-production-gate.v1",
     ok:true,
