@@ -284,7 +284,7 @@ A pack can say “revision X, dirty worktree digest Y.” This prevents a clean-
 
 ### 6.1 Identifier-aware tokenization
 
-Source code contains camelCase, snake_case, paths, namespaces, and punctuation-heavy identifiers. Natural-language retrieval fails if:
+Source code contains camelCase, snake_case, paths, namespaces, punctuation-heavy identifiers, issue numbers and generated module identifiers. Natural-language retrieval fails if:
 
 ```text
 githubPushRequiresApproval
@@ -292,7 +292,7 @@ githubPushRequiresApproval
 
 is treated as one opaque token.
 
-The implementation normalizes camelCase boundaries and separators before lexical indexing:
+The implementation normalizes camelCase boundaries and separators before lexical indexing. Numeric runs are retained and canonicalized so `04` and `4` become the same retrieval term; this was added after the 166-assertion gate exposed ambiguity in numbered module retrieval:
 
 ```text
 github Push Requires Approval
@@ -478,7 +478,7 @@ C_{memory}.
 
 **Memory context** answers: what has this repository learned, decided, superseded, or experienced?
 
-They must not be merged blindly.
+They must not be merged blindly. The implementation now exposes this distinction directly as `context.sit`: code is retrieved from the node's current Git worktree, while durable memory is included only when the node's own configured remote resolves to that same KILN-native owner/repository. The caller cannot nominate an unrelated memory repository.
 
 A future `sit` operation should allocate a budget:
 
@@ -809,6 +809,10 @@ CriticalAuthorizationFailures = 0.
 
 The branch includes `swarm/scripts/validate-context-fabric.mjs`, designed as a 120+ assertion deterministic gate.
 
+**Current core result (2026-10-17): 166/166 assertions passed** in a clean disposable Git fixture using the exact v2 `context-index.mjs` and signed `context-receipts.mjs` branch contents. Two earlier red runs exposed ranking defects (multi-term code-symbol intent and normalized numeric terms); both defects were fixed before this green result. The produced validation receipt reported `kiln.context-production-gate.v1`, `ok: true`, a signed two-entry context receipt chain, and deterministic index/worktree digests for that fixture.
+
+This is **core E2 evidence**, not a claim that the entire KILN daemon/Workspace/NEXUS integration has completed E3. The GitHub Actions workflow also fired once but failed before a runner was assigned (`runner_id: 0`, empty steps), so that run is classified as infrastructure-unexecuted rather than code failure or success.
+
 It exercises:
 
 - schema identity,
@@ -828,7 +832,7 @@ It exercises:
 - source-excerpt exclusion,
 - per-file hash invariants.
 
-The current ChatGPT execution environment could not fetch the branch into its container because DNS to GitHub is disabled. Therefore this paper does **not** claim that the 120+ gate has passed in CI yet. It is a release requirement, not a fictional success.
+Because the execution container cannot resolve GitHub directly, the three exact core branch files were materialized from the GitHub connector and executed locally. The 166-assertion core gate passes. Full daemon/node/Workspace/NEXUS regression remains a separate E3 gate and is not inferred from this result.
 
 ---
 
@@ -860,6 +864,9 @@ The current ChatGPT execution environment could not fetch the branch into its co
 - `swarm/lib/promote.mjs`  
   Existing real GitHub publisher, extended with bounded context evidence.
 
+- `swarm/lib/client.mjs` `promoteFromContext(...)`  
+  Converts a real query result into digest-only promotion provenance (node, pack/index/worktree digests, signed context receipt hash and revision) and sends it through the governed promotion API.
+
 - `swarm/scripts/validate-context-fabric.mjs`  
   Production-gate assertion harness.
 
@@ -881,7 +888,10 @@ The current ChatGPT execution environment could not fetch the branch into its co
 ### KILN Workspace
 
 - `src/lib/kiln/context.server.ts`  
-  Disabled-by-default server bridge. The daemon token remains server-side.
+  Disabled-by-default server bridge. The daemon token remains server-side. It exposes node listing, index, query, sit, status and receipt verification against the v2 daemon routes.
+
+- `src/routes/context.tsx`  
+  First-class operator surface for node selection, index state, code retrieval, code+memory sit, delta follow-ups, provenance hashes, byte/token estimates, omissions and signed-receipt verification.
 
 ### NEXUS
 
@@ -998,4 +1008,4 @@ Context retrieval never implies any of these mutation authorities.
 - **E4** staged operational evidence
 - **E5** independently verified production evidence
 
-Current Context Fabric branch is beyond a paper-only E1 state: implementation and deterministic test artifacts exist, and earlier isolated index tests were locally exercised. The current-mainline v2 integration still requires the complete focused/full suite and 120+ gate to execute on an environment with the branch available before it is described as E3.
+Current Context Fabric v2 has **E2 evidence for the retrieval/receipt core: 166 deterministic assertions pass**. The complete current-mainline daemon/node/Workspace/NEXUS composition remains E2/E3-candidate until the focused integration tests and full KILN regression suite execute on a functioning runner or KILN development machine. No fixed token-saving percentage or external security certification is claimed.
