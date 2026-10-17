@@ -1,32 +1,14 @@
 /**
- * Local HTTP API for the swarm daemon — so anything built in the forge
- * (a model service, a protocol daemon, an AI agent) can use the swarm
- * as a feature, not just the CLI.
+ * Local HTTP API for the swarm daemon.
  *
- *  - Binds 127.0.0.1 ONLY. Never 0.0.0.0.
- *  - Bearer token from <stateDir>/api.token (0600). Compared with
- *    timingSafeEqual. GET /health is the only unauthenticated route.
- *  - Port: config.apiPort, KILN_SWARM_API_PORT wins, 0 = ephemeral.
- *
- * Routes:
- *   GET  /health
- *   POST /jobs                      {name, plan{steps[]}, mind?, node?, repo?} -> {id}
- *   GET  /jobs                      -> {jobs:[...]}
- *   GET  /jobs/:id                  -> {job} | 404
- *   POST /nodes                     {name, caps, ttlSec, repo?, mind?, policy?} -> {id,name}
- *   GET  /nodes                     -> {nodes:[...]}
- *   POST /nodes/:id/stop            -> {ok:true}
- *   GET  /nodes/:id/logs?tail=N&stream=stdout|stderr -> {stream, log}
- *   POST /receipts/verify           {node?} -> {results:[...]}
- * Git hosting (KILN-native repos, served via git http-backend CGI):
- *   POST /git/:owner/:repo            create repo (auth required)
- *   GET  /git                         list repos (public)
- *   GET  /git/:owner/:repo/info/refs?service=...   (public)
- *   POST /git/:owner/:repo/git-upload-pack          (public — clone/fetch)
- *   POST /git/:owner/:repo/git-receive-pack         (auth required — push)
+ * Security invariants:
+ * - Binds 127.0.0.1 only.
+ * - GET /health and read-only Git listing/clone are the only unauthenticated surfaces.
+ * - Context retrieval is authenticated and node-bound; callers cannot provide arbitrary filesystem paths.
+ * - Repository content is never executed by the context subsystem.
  */
 import { createServer } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import {
@@ -40,6 +22,7 @@ import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
+import { buildContextIndex, loadIndex, queryContextIndex } from "./context-index.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -92,18 +75,12 @@ function send(res, code, obj, extraHeaders = {}) {
   res.writeHead(code, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(body),
+    "cache-control": "no-store",
     ...extraHeaders,
   });
   res.end(body);
 }
 
-/**
- * 401 challenge for the auth gate. RFC 7235: a 401 MUST carry
- * WWW-Authenticate, otherwise clients (notably git, which relies on the
- * 401 -> retry-with-credentials flow for userinfo URLs like
- * http://oauth2:<token>@host/...) never retry and the push dies with a
- * confusing transport error instead of authenticating.
- */
 function unauthorized(res) {
   return send(
     res,
@@ -113,10 +90,6 @@ function unauthorized(res) {
   );
 }
 
-/**
- * Bearer <token>, or HTTP Basic where the password is the token — that's how
- * `git` sends credentials embedded in a URL (http://oauth2:<token>@host/...).
- */
 function checkAuth(req, token) {
   const auth = req.headers.authorization || "";
   if (auth.startsWith("Bearer ")) {
@@ -135,25 +108,36 @@ function checkAuth(req, token) {
   return false;
 }
 
+function contextIndexDir(dir) {
+  const p = join(dir, "context-indexes");
+  mkdirSync(p, { recursive: true, mode: 0o700 });
+  return p;
+}
+
+function contextNode(dir, raw) {
+  const id = resolveNode(dir, String(raw));
+  const node = loadNode(dir, id);
+  if (!node.workdir || !existsSync(node.workdir)) throw new Error("node has no available workdir");
+  if (!existsSync(join(node.workdir, ".git"))) throw new Error("node workdir is not a Git checkout");
+  return { id, node };
+}
+
 export function startApiServer(dir, cfg) {
   const token = loadApiToken(dir);
-  let apiPort = 0; // filled in once listening; used for clone URLs
+  let apiPort = 0;
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://127.0.0.1");
       const path = url.pathname;
 
       if (req.method === "GET" && path === "/health") {
-        return send(res, 200, { ok: true, version: 1, service: "kiln-swarm" });
+        return send(res, 200, { ok: true, version: 2, service: "kiln-swarm", contextFabric: "v2" });
       }
 
-      // ---- git hosting: public routes (list/clone/fetch need no token) ----
       if (req.method === "GET" && path === "/git") {
         return send(res, 200, { repos: listRepos(dir) });
       }
-      // gitReceive is set for receive-pack; served after the auth gate below.
-      // NOTE: only paths WITH a trailing smart-http segment are intercepted
-      // here; bare /git/:owner/:repo (repo create) falls through to auth.
+
       let gitReceive = null;
       {
         const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(\/.*)?$/);
@@ -168,37 +152,25 @@ export function startApiServer(dir, cfg) {
           if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
             return send(res, 404, { error: "no such repo" });
           }
-          if (kind === "receive") {
-            gitReceive = { owner, repo };
-          } else {
-            await serveGitHttp(dir, req, res);
-            return;
-          }
+          if (kind === "receive") gitReceive = { owner, repo };
+          else { await serveGitHttp(dir, req, res); return; }
         }
       }
 
-      // ---- auth (everything below here) ----
-      if (!checkAuth(req, token)) {
-        return unauthorized(res);
-      }
+      if (!checkAuth(req, token)) return unauthorized(res);
 
-      // Authenticated push path — the token was verified BEFORE the backend
-      // runs, so an unauthenticated push never reaches git at all.
       if (gitReceive) {
         await serveGitHttp(dir, req, res);
         return;
       }
 
-      // ---- git repo create ----
       {
         const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "POST" && m) {
           try {
             const r = createRepo(dir, m[1], m[2]);
             return send(res, 201, {
-              ok: true,
-              owner: r.owner,
-              repo: r.repo,
+              ok: true, owner: r.owner, repo: r.repo,
               cloneUrl: `http://127.0.0.1:${apiPort}/git/${r.owner}/${r.repo}`,
             });
           } catch (e) {
@@ -208,12 +180,83 @@ export function startApiServer(dir, cfg) {
         }
       }
 
-      // ---- jobs ----
+      // ---- Context Fabric: node-bound local retrieval ----
+      {
+        const m = path.match(/^\/context\/([A-Za-z0-9_.-]+)\/index$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); }
+          catch (e) { return send(res, 404, { error: e.message }); }
+          const b = await readBody(req);
+          const index = buildContextIndex(bound.node.workdir, contextIndexDir(dir), {
+            chunkLines: b.chunkLines,
+            overlap: b.overlap,
+          });
+          return send(res, 200, {
+            node: bound.id,
+            index: {
+              schema: index.schema,
+              digest: index.digest,
+              revision: index.revision,
+              dirty: index.dirty,
+              worktreeDigest: index.worktreeDigest,
+              generatedAt: index.generatedAt,
+              stats: index.stats,
+              skipped: index.skipped,
+            },
+          });
+        }
+      }
+      {
+        const m = path.match(/^\/context\/([A-Za-z0-9_.-]+)\/query$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); }
+          catch (e) { return send(res, 404, { error: e.message }); }
+          const b = await readBody(req);
+          if (!b.query || !String(b.query).trim()) return send(res, 400, { error: "query is required" });
+          const indexDir = contextIndexDir(dir);
+          let index = loadIndex(indexDir, bound.node.workdir);
+          if (!index || b.refresh !== false) {
+            index = buildContextIndex(bound.node.workdir, indexDir, {
+              chunkLines: b.chunkLines,
+              overlap: b.overlap,
+            });
+          }
+          const pack = queryContextIndex(index, String(b.query), {
+            maxBytes: b.maxBytes,
+            maxChunks: b.maxChunks,
+            mmrLambda: b.mmrLambda,
+            knownHashes: b.knownHashes,
+          });
+          return send(res, 200, { node: bound.id, pack });
+        }
+      }
+      {
+        const m = path.match(/^\/context\/([A-Za-z0-9_.-]+)\/status$/);
+        if (req.method === "GET" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); }
+          catch (e) { return send(res, 404, { error: e.message }); }
+          const index = loadIndex(contextIndexDir(dir), bound.node.workdir);
+          if (!index) return send(res, 404, { error: "context index not built" });
+          return send(res, 200, {
+            node: bound.id,
+            index: {
+              digest: index.digest,
+              revision: index.revision,
+              dirty: index.dirty,
+              worktreeDigest: index.worktreeDigest,
+              generatedAt: index.generatedAt,
+              stats: index.stats,
+            },
+          });
+        }
+      }
+
       if (req.method === "POST" && path === "/jobs") {
         const b = await readBody(req);
-        if (!b.plan || !Array.isArray(b.plan.steps)) {
-          return send(res, 400, { error: "plan.steps[] is required" });
-        }
+        if (!b.plan || !Array.isArray(b.plan.steps)) return send(res, 400, { error: "plan.steps[] is required" });
         const job = {
           id: newJobId(),
           name: String(b.name || `job-${Date.now()}`),
@@ -238,7 +281,6 @@ export function startApiServer(dir, cfg) {
         }
       }
 
-      // ---- nodes ----
       if (req.method === "POST" && path === "/nodes") {
         const b = await readBody(req);
         if (!b.name) return send(res, 400, { error: "name is required" });
@@ -247,9 +289,7 @@ export function startApiServer(dir, cfg) {
         const ttl = parseInt(b.ttlSec ?? 86400, 10);
         if (!(ttl > 0)) return send(res, 400, { error: "ttlSec must be positive seconds" });
         const node = await createNode(dir, {
-          name: String(b.name),
-          caps,
-          expiresAt: nowSec() + ttl,
+          name: String(b.name), caps, expiresAt: nowSec() + ttl,
           repo: b.repo ? String(b.repo) : null,
           mind: String(b.mind || "script"),
           restartPolicy: String(b.policy || "on-failure"),
@@ -282,14 +322,11 @@ export function startApiServer(dir, cfg) {
           const stream = url.searchParams.get("stream") === "stderr" ? "stderr.log" : "stdout.log";
           const tail = Math.min(Math.max(parseInt(url.searchParams.get("tail") || "50", 10) || 50, 1), 2000);
           const p = join(nodeDir(dir, id), stream);
-          const log = existsSync(p)
-            ? readFileSync(p, "utf8").split("\n").slice(-tail).join("\n")
-            : "";
+          const log = existsSync(p) ? readFileSync(p, "utf8").split("\n").slice(-tail).join("\n") : "";
           return send(res, 200, { stream: stream.replace(".log", ""), tail, log });
         }
       }
 
-      // ---- receipts ----
       if (req.method === "POST" && path === "/receipts/verify") {
         const b = await readBody(req);
         let ids = listNodeIds(dir);
@@ -314,10 +351,9 @@ export function startApiServer(dir, cfg) {
 
   const wanted = process.env.KILN_SWARM_API_PORT !== undefined
     ? parseInt(process.env.KILN_SWARM_API_PORT, 10)
-    : (cfg.apiPort ?? 18787); // 0 = ephemeral; ?? keeps 0, || would eat it
+    : (cfg.apiPort ?? 18787);
   return new Promise((resolve, reject) => {
     server.on("error", reject);
-    // 127.0.0.1 ONLY — the API never binds a public interface.
     server.listen(wanted, "127.0.0.1", () => {
       const port = server.address().port;
       apiPort = port;
