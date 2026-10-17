@@ -23,6 +23,7 @@ import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import { buildContextIndex, loadIndex, queryContextIndex } from "./context-index.mjs";
+import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -192,8 +193,16 @@ export function startApiServer(dir, cfg) {
             chunkLines: b.chunkLines,
             overlap: b.overlap,
           });
+          const receipt = appendContextReceipt(dir, {
+            operation: "index",
+            node: bound.id,
+            indexDigest: index.digest,
+            revision: index.revision,
+            worktreeDigest: index.worktreeDigest,
+          });
           return send(res, 200, {
             node: bound.id,
+            receipt,
             index: {
               schema: index.schema,
               digest: index.digest,
@@ -229,7 +238,19 @@ export function startApiServer(dir, cfg) {
             mmrLambda: b.mmrLambda,
             knownHashes: b.knownHashes,
           });
-          return send(res, 200, { node: bound.id, pack });
+          const receipt = appendContextReceipt(dir, {
+            operation: "query",
+            node: bound.id,
+            query: b.query,
+            indexDigest: index.digest,
+            packDigest: pack.digest,
+            revision: pack.revision,
+            worktreeDigest: pack.worktreeDigest,
+            emittedBytes: pack.stats.emittedBytes,
+            emittedChunks: pack.stats.emittedChunks,
+            unchangedChunks: pack.stats.unchangedChunks,
+          });
+          return send(res, 200, { node: bound.id, receipt, pack });
         }
       }
       {
@@ -325,6 +346,11 @@ export function startApiServer(dir, cfg) {
           const log = existsSync(p) ? readFileSync(p, "utf8").split("\n").slice(-tail).join("\n") : "";
           return send(res, 200, { stream: stream.replace(".log", ""), tail, log });
         }
+      }
+
+      if (req.method === "POST" && path === "/context/receipts/verify") {
+        const result = verifyContextReceipts(dir);
+        return send(res, result.ok ? 200 : 409, result);
       }
 
       if (req.method === "POST" && path === "/receipts/verify") {
