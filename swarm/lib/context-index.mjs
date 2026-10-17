@@ -319,11 +319,21 @@ export function queryContextIndex(index, query, opts = {}) {
   const fileMeta = new Map(index.files.map((x) => [x.path, x]));
   const ranked = index.chunks.map((chunk) => {
     const meta = fileMeta.get(chunk.path) || {};
-    const symbolTerms = new Set((meta.symbols || []).flatMap((s) => terms(s)));
-    const symbolBoost = qTerms.reduce((n, t) => n + (symbolTerms.has(t) ? 1.4 : 0), 0);
+    let symbolBoost = 0;
+    let bestSymbolCoverage = 0;
+    for (const symbol of meta.symbols || []) {
+      const symbolTerms = new Set(terms(symbol));
+      const matched = qTerms.reduce((n, t) => n + (symbolTerms.has(t) ? 1 : 0), 0);
+      if (!matched) continue;
+      const coverage = matched / Math.max(1, symbolTerms.size);
+      bestSymbolCoverage = Math.max(bestSymbolCoverage, coverage);
+      const multiTermBonus = matched >= 2 ? 2.0 + 0.5 * matched : 0;
+      symbolBoost = Math.max(symbolBoost, matched * 1.4 + multiTermBonus);
+    }
+    const symbolCoverageBoost = bestSymbolCoverage >= 1 ? 1.25 : bestSymbolCoverage * 0.75;
     return {
       chunk,
-      relevance: bm25(index, qTerms, chunk, opts) + pathBoost(chunk.path, qTerms) + symbolBoost,
+      relevance: bm25(index, qTerms, chunk, opts) + pathBoost(chunk.path, qTerms) + symbolBoost + symbolCoverageBoost,
     };
   }).filter((x) => x.relevance > 0);
 
