@@ -1,0 +1,54 @@
+name: Context Fabric
+
+on:
+  pull_request:
+    paths:
+      - "swarm/lib/context-*.mjs"
+      - "swarm/context.mjs"
+      - "swarm/scripts/context-*.mjs"
+      - "swarm/test/context-*.test.mjs"
+      - "swarm/examples/context-*.json"
+      - "docs/KILN_CONTEXT_FABRIC.md"
+      - "research/FORNAX_CONTEXT_FABRIC_RESEARCH_V2.md"
+      - ".github/workflows/context-fabric.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "swarm/lib/context-*.mjs"
+      - "swarm/context.mjs"
+      - "swarm/scripts/context-*.mjs"
+      - "swarm/test/context-*.test.mjs"
+      - ".github/workflows/context-fabric.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  context-fabric:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax
+        run: |
+          node --check swarm/lib/context-index.mjs
+          node --check swarm/lib/context-receipts.mjs
+          node --check swarm/context.mjs
+          node --check swarm/scripts/context-benchmark.mjs
+          node --check swarm/scripts/validate-context-fabric.mjs
+      - name: Focused tests
+        working-directory: swarm
+        run: node --test test/context-index.test.mjs test/context-receipts.test.mjs test/context-tool.test.mjs
+      - name: 120 assertion production gate
+        working-directory: swarm
+        run: node scripts/validate-context-fabric.mjs
+      - name: Benchmark smoke
+        working-directory: swarm
+        run: node scripts/context-benchmark.mjs --repo .. --cases examples/context-benchmark-cases.json > /tmp/context-benchmark.json
+      - name: Full swarm regression suite
+        working-directory: swarm
+        run: node --test test/*.test.mjs
