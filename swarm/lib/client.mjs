@@ -130,6 +130,10 @@ export class SwarmClient {
     return this.queryContext(node, query, { ...options, knownHashes });
   }
 
+  async verifyContextReceipts() {
+    return this._req("POST", "/context/receipts/verify", {});
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});
