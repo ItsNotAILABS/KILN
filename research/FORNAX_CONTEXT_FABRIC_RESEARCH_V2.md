@@ -224,7 +224,7 @@ The pack does not claim completeness. `omissions` makes truncation and policy fi
 
 `swarm/lib/context-receipts.mjs` emits `kiln.context-receipt.v1`.
 
-The receipt stores the SHA-256 of the query, not the raw query, and stores pack/index/worktree digests rather than source excerpts. Receipts are hash-chained.
+The receipt stores the SHA-256 of the query, not the raw query, and stores pack/index/worktree digests rather than source excerpts. Receipts are hash-chained, serialized through an atomic append lock, and signed by a dedicated local Ed25519 receipt key. Node-originated retrieval is additionally cross-anchored by the node's normal signed tool receipt.
 
 This allows auditability without turning audit logs into a second copy of private source code.
 
@@ -872,6 +872,12 @@ The current ChatGPT execution environment could not fetch the branch into its co
 - `swarm/test/context-tool.test.mjs`  
   Agent-native tool + signed-receipt privacy test.
 
+- `swarm/test/context-api.test.mjs`  
+  Real-daemon authenticated API, SDK, delta and signed-context-receipt integration test.
+
+- `swarm/test/context-promotion.test.mjs`  
+  Digest-only promotion provenance validation and malformed-evidence refusal.
+
 ### KILN Workspace
 
 - `src/lib/kiln/context.server.ts`  
@@ -992,4 +998,4 @@ Context retrieval never implies any of these mutation authorities.
 - **E4** staged operational evidence
 - **E5** independently verified production evidence
 
-Current Context Fabric branch is primarily E1 with portions previously locally exercised at E2; the new mainline integration and 120+ gate must be executed before the integrated release is described as E3.
+Current Context Fabric branch is beyond a paper-only E1 state: implementation and deterministic test artifacts exist, and earlier isolated index tests were locally exercised. The current-mainline v2 integration still requires the complete focused/full suite and 120+ gate to execute on an environment with the branch available before it is described as E3.
