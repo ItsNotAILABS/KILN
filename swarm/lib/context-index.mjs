@@ -17,7 +17,7 @@ import {
   existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync,
   statSync, unlinkSync, writeFileSync,
 } from "node:fs";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 const INDEX_SCHEMA = "kiln.context-index.v1";
