@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildContextIndex, loadIndex, pruneContextCas, queryContextIndex } from "../lib/context-index.mjs";
@@ -144,7 +144,7 @@ try{
   ok(existsSync(orphanPath),"orphan CAS fixture created");
   const gc=pruneContextCas(state);
   ok(gc.removedObjects>=1,"CAS GC removes unreferenced objects");
-  ok(gc.reclaimedBytes>=statSync(join(state,persistedIndexName)).size*0 || gc.reclaimedBytes>0,"CAS GC reports reclaimed bytes");
+  ok(gc.reclaimedBytes>0,"CAS GC reports reclaimed bytes");
   eq(existsSync(orphanPath),false,"orphan CAS object deleted");
 
   // Worktree change must invalidate exactly the changed file payload.
