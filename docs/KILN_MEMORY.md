@@ -219,8 +219,25 @@ with a hand-forged commit appended outside the library).
    counts. Pinned by `test/memory-proposals.test.mjs`. The proposer
    itself is any agent with read access — the daemon has no LLM and
    invents nothing.
-5. **Fetch/promote refspecs** — daemon serves `refs/kiln/memory` in the
-   default fetch refspec and `promote` carries memory to GitHub.
+5. **Fetch/promote refspecs** — ✅ BUILT 2026-10-17. `promote` carries
+   `refs/kiln/memory` to GitHub in the same run as the branch (skip
+   with `memory: false`): the local chain is replayed commit-by-commit
+   through the Git Data API — created when the GitHub ref is absent,
+   incremental when the remote event ids are a prefix of the local
+   chain, up-to-date when they match. Divergence (unknown ids, a
+   longer remote, a prefix mismatch, an unparseable remote subject) is
+   a loud skip on the receipt (`memory: {status: "diverged"}` +
+   warning), never a force. Every replayed blob — event files and
+   large-episode content blobs alike — is SHA-asserted against its
+   local oid before the ref moves (content-addressed, so the GitHub
+   copy verifies byte-for-byte); a failed memory step is recorded on
+   the receipt without failing the branch promotion. Node checkouts
+   fetch the memory ref too: `gitClone` probes with `ls-remote` and
+   only then persists the `+refs/kiln/memory:refs/kiln/memory` refspec
+   (an exact refspec for an absent ref makes every later fetch exit
+   128). The daemon already serves the ref via git transport.
+   Network-free core pinned by `test/promote.test.mjs`
+   (`listMemoryCommits` / `planMemoryReplay` + clone gating).
 6. **Cross-repo memory** — explicitly linked memories across repos
    (an episode in repo A cited by a fact in repo B), opt-in per link,
    never a merged global store. Per-repo stays the default and the
