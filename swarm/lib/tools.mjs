@@ -17,6 +17,8 @@ import { runSandboxed } from "./sandbox.mjs";
 import { buildContextIndex, queryContextIndex } from "./context-index.mjs";
 import { appendContextReceipt } from "./context-receipts.mjs";
 import { agentAwareness } from "./memory.mjs";
+import { boundContextRequest } from "./context-policy.mjs";
+import { recordContextMetric } from "./context-metrics.mjs";
 
 export class ToolError extends Error {
   constructor(message) {
@@ -44,7 +46,7 @@ const DENY_PATTERNS = [
 ];
 
 /** Exported for compute app validation: same jail philosophy, no shell. */
-export function checkShellArgs(command, args) {
+export function checkShellArgs(command, args, workdir = null) {
   const bin = basename(String(command)).toLowerCase();
   if (SHELL_BINS.has(bin)) {
     throw new ToolError(`jail: shell binaries are not executable tools (got "${command}")`);
@@ -53,10 +55,23 @@ export function checkShellArgs(command, args) {
   for (const pat of DENY_PATTERNS) {
     if (joined.includes(pat)) throw new ToolError(`jail: denied pattern ${JSON.stringify(pat)} in command`);
   }
-  if (String(command).includes("/")) {
-    // A path command must stay inside the work dir.
-    return "path-command";
+  if (workdir) {
+    const base = resolve(workdir);
+    for (const raw of args || []) {
+      const value = String(raw);
+      const candidates = [value];
+      const eq = value.indexOf("=");
+      if (eq >= 0) candidates.push(value.slice(eq + 1));
+      for (const candidate of candidates) {
+        if (!candidate.startsWith("/")) continue;
+        const absolute = resolve(candidate);
+        if (absolute !== base && !absolute.startsWith(base + sep)) {
+          throw new ToolError(`jail: absolute argument escapes work dir: ${candidate}`);
+        }
+      }
+    }
   }
+  if (String(command).includes("/")) return "path-command";
   return "bin";
 }
 
@@ -64,7 +79,7 @@ const MAX_OUTPUT = 64 * 1024;
 
 /** Shared jailed execution for shell.exec and project.release. */
 async function execJailed(workdir, command, cmdArgs, timeoutMs, sandbox) {
-  const kind = checkShellArgs(command, cmdArgs);
+  const kind = checkShellArgs(command, cmdArgs, workdir);
   let bin = command;
   if (kind === "path-command") bin = jailPath(workdir, command);
   if (sandbox) return await execSandboxed(workdir, bin, cmdArgs.map(String), timeoutMs, sandbox);
@@ -286,21 +301,18 @@ async function impl(ctx, name, args) {
       return { ok: true, out: readdirSync(p).join("\n") };
     }
     case "context.query": {
-      const query = needStr(args, "query");
-      if (!query.trim()) throw new ToolError("context.query: empty query");
+      const started = Date.now();
+      let request;
+      try { request = boundContextRequest(args, "query"); }
+      catch (e) { throw new ToolError("context.query: " + e.message); }
       const indexDir = join(ctx.dir, "context-indexes");
       mkdirSync(indexDir, { recursive: true, mode: 0o700 });
       const index = buildContextIndex(workdir, indexDir);
-      const pack = queryContextIndex(index, query, {
-        maxBytes: args.maxBytes === undefined ? 24000 : needNum(args, "maxBytes"),
-        maxChunks: args.maxChunks === undefined ? 12 : needNum(args, "maxChunks"),
-        knownHashes: args.knownHashes && typeof args.knownHashes === "object" ? args.knownHashes : {},
-        expandDependencies: args.expandDependencies !== false,
-      });
+      const pack = queryContextIndex(index, request.query, request);
       const contextReceipt = appendContextReceipt(ctx.dir, {
         operation: "node-query",
         node: ctx.nodeId,
-        query,
+        query: request.query,
         indexDigest: index.digest,
         packDigest: pack.digest,
         revision: pack.revision,
@@ -309,20 +321,25 @@ async function impl(ctx, name, args) {
         emittedChunks: pack.stats.emittedChunks,
         unchangedChunks: pack.stats.unchangedChunks,
       });
-      return { ok: true, out: JSON.stringify(pack), contextReceipt };
+      const metric = recordContextMetric(ctx.dir, {
+        kind: "query",
+        packDigest: pack.digest,
+        stats: pack.stats,
+        reusedFiles: index.stats.reusedFiles,
+        rebuiltFiles: index.stats.rebuiltFiles,
+        latencyMs: Date.now() - started,
+      });
+      return { ok: true, out: JSON.stringify(pack), contextReceipt, metric };
     }
     case "context.sit": {
-      const query = needStr(args, "query");
-      if (!query.trim()) throw new ToolError("context.sit: empty query");
+      const started = Date.now();
+      let request;
+      try { request = boundContextRequest(args, "sit"); }
+      catch (e) { throw new ToolError("context.sit: " + e.message); }
       const indexDir = join(ctx.dir, "context-indexes");
       mkdirSync(indexDir, { recursive: true, mode: 0o700 });
       const index = buildContextIndex(workdir, indexDir);
-      const code = queryContextIndex(index, query, {
-        maxBytes: args.maxBytes === undefined ? 18000 : needNum(args, "maxBytes"),
-        maxChunks: args.maxChunks === undefined ? 10 : needNum(args, "maxChunks"),
-        knownHashes: args.knownHashes && typeof args.knownHashes === "object" ? args.knownHashes : {},
-        expandDependencies: true,
-      });
+      const code = queryContextIndex(index, request.query, request);
       let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
       const identity = kilnRepoIdentity(ctx.node?.repo);
       if (identity) {
@@ -332,8 +349,8 @@ async function impl(ctx, name, args) {
             owner: identity.owner,
             repo: identity.repo,
             ...agentAwareness(ctx.dir, identity.owner, identity.repo, {
-              query,
-              budgetTokens: args.memoryTokens === undefined ? 1200 : needNum(args, "memoryTokens"),
+              query: request.query,
+              budgetTokens: request.memoryTokens,
             }),
           };
         } catch (e) {
@@ -343,7 +360,7 @@ async function impl(ctx, name, args) {
       const contextReceipt = appendContextReceipt(ctx.dir, {
         operation: "node-sit",
         node: ctx.nodeId,
-        query,
+        query: request.query,
         indexDigest: index.digest,
         packDigest: code.digest,
         revision: code.revision,
@@ -352,7 +369,15 @@ async function impl(ctx, name, args) {
         emittedChunks: code.stats.emittedChunks,
         unchangedChunks: code.stats.unchangedChunks,
       });
-      return { ok: true, out: JSON.stringify({ schema: "kiln.context-sit.v1", code, memory }), contextReceipt };
+      const metric = recordContextMetric(ctx.dir, {
+        kind: "sit",
+        packDigest: code.digest,
+        stats: code.stats,
+        reusedFiles: index.stats.reusedFiles,
+        rebuiltFiles: index.stats.rebuiltFiles,
+        latencyMs: Date.now() - started,
+      });
+      return { ok: true, out: JSON.stringify({ schema: "kiln.context-sit.v1", code, memory }), contextReceipt, metric };
     }
     case "shell.exec": {
       return await execArgs(workdir, args, "shell.exec", 30000);
