@@ -213,6 +213,9 @@ export class SwarmClient {
   async contextReceiptsVerify() {
     return this._req("POST", "/v1/context/receipts/verify", {});
   }
+  async contextMetrics() {
+    return this._req("GET", "/v1/context/metrics");
+  }
 
   // ---- governed promotion (KILN-native repo -> organization GitHub) ----
   async promote({ repo, github, branch, rebase = false, force = false, contextEvidence } = {}) {
