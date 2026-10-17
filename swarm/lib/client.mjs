@@ -206,6 +206,36 @@ export class SwarmClient {
     return this._req("POST", "/v1/context/receipts/verify", {});
   }
 
+  // ---- governed promotion (KILN-native repo -> organization GitHub) ----
+  async promote({ repo, github, branch, rebase = false, force = false, contextEvidence } = {}) {
+    if (!repo || !String(repo).includes("/")) throw new Error("promote: repo must be owner/repo");
+    return this._req("POST", "/v1/promote", {
+      repo: String(repo),
+      github: github ? String(github) : undefined,
+      branch: branch ? String(branch) : undefined,
+      rebase: !!rebase,
+      force: !!force,
+      contextEvidence,
+    });
+  }
+  async promoteFromContext({ repo, github, branch, rebase = false, force = false, contextResult, ci } = {}) {
+    const pack = contextResult?.pack;
+    const receipt = contextResult?.receipt;
+    if (!pack || !receipt) throw new Error("promoteFromContext: contextResult with pack + receipt is required");
+    return this.promote({
+      repo, github, branch, rebase, force,
+      contextEvidence: {
+        node: contextResult.node,
+        packDigest: pack.digest,
+        indexDigest: pack.indexDigest,
+        worktreeDigest: pack.worktreeDigest,
+        contextReceiptHash: receipt.hash,
+        revision: pack.revision,
+        ci: ci ? String(ci) : undefined,
+      },
+    });
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});
