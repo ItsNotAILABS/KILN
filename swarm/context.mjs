@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { SwarmClient } from "./lib/client.mjs";
 import { buildContextIndex, queryContextIndex } from "./lib/context-index.mjs";
+import { boundContextRequest, contextLimits } from "./lib/context-policy.mjs";
 
 function parse(argv) {
   const out={_:[]};
@@ -47,7 +48,13 @@ try {
   } else if(cmd==="local-query"){
     const repo=resolve(String(need(a,"repo")));
     const index=buildContextIndex(repo,directState(a),{chunkLines:num(a,"chunk-lines",undefined),overlap:num(a,"overlap",undefined)});
-    print(queryContextIndex(index,String(need(a,"query")),{maxBytes:num(a,"max-bytes",24000),maxChunks:num(a,"max-chunks",12),mmrLambda:num(a,"mmr-lambda",0.78)}));
+    const request=boundContextRequest({
+      query:String(need(a,"query")),
+      maxBytes:num(a,"max-bytes",24000),
+      maxChunks:num(a,"max-chunks",12),
+      mmrLambda:num(a,"mmr-lambda",0.78),
+    },"query");
+    print(queryContextIndex(index,request.query,request));
   } else if(cmd==="index"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
     print(await client.contextIndex(String(need(a,"node")),{chunkLines:num(a,"chunk-lines",undefined),overlap:num(a,"overlap",undefined)}));
@@ -64,11 +71,16 @@ try {
   } else if(cmd==="status"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
     print(await client.contextStatus(String(need(a,"node"))));
+  } else if(cmd==="metrics"){
+    const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
+    print(await client.contextMetrics());
+  } else if(cmd==="limits"){
+    print(contextLimits());
   } else if(cmd==="verify"){
     const client=await SwarmClient.connect({dir:a.dir?resolve(String(a.dir)):undefined});
     print(await client.contextReceiptsVerify());
   } else {
-    console.error("usage: context.mjs local-index|local-query|index|query|delta|status|verify [options]");
+    console.error("usage: context.mjs local-index|local-query|index|query|delta|status|metrics|limits|verify [options]");
     process.exit(2);
   }
 } catch(e) {
