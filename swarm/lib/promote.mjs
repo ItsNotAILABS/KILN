@@ -59,6 +59,37 @@ export class PromoteError extends Error {
   }
 }
 
+function boundedEvidence(input) {
+  if (input === undefined || input === null) return null;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new PromoteError("bad_evidence", "context evidence must be an object");
+  }
+  const out = {};
+  const hashFields = ["packDigest", "indexDigest", "worktreeDigest", "contextReceiptHash"];
+  for (const k of hashFields) {
+    if (input[k] === undefined || input[k] === null) continue;
+    const v = String(input[k]);
+    if (!/^[0-9a-f]{64}$/i.test(v)) throw new PromoteError("bad_evidence", `${k} must be a 64-character hex digest`);
+    out[k] = v.toLowerCase();
+  }
+  if (input.node !== undefined) {
+    const v = String(input.node);
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(v)) throw new PromoteError("bad_evidence", "node evidence identifier is invalid");
+    out.node = v;
+  }
+  if (input.revision !== undefined) {
+    const v = String(input.revision);
+    if (!/^[0-9a-f]{7,64}$/i.test(v)) throw new PromoteError("bad_evidence", "revision evidence must be a Git-style hex id");
+    out.revision = v.toLowerCase();
+  }
+  if (input.ci !== undefined) {
+    const v = String(input.ci).slice(0, 256);
+    if (/[\r\n]/.test(v)) throw new PromoteError("bad_evidence", "ci evidence must be a single line");
+    out.ci = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // ---------------------------------------------------------------- credential
 
 /**
@@ -226,6 +257,7 @@ export async function promoteRepo(dir, owner, repo, opts = {}) {
     newTip: null,
     url: null,
     credential: null,
+    contextEvidence: null,
     warnings: [],
     error: null,
     startedAt: new Date().toISOString(),
@@ -247,6 +279,8 @@ export async function promoteRepo(dir, owner, repo, opts = {}) {
 }
 
 async function promoteInner(dir, owner, repo, opts, receipt) {
+  receipt.contextEvidence = boundedEvidence(opts.contextEvidence);
+
   if (!repoExists(dir, owner, repo)) {
     throw new PromoteError("repo_not_found", `no such KILN repo: ${owner}/${repo}`);
   }
