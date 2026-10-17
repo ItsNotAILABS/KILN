@@ -51,7 +51,7 @@
  *   POST /git/:owner/:repo/memory/verify     -> {ok, events, commits}
  */
 import { createServer } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import {
@@ -66,6 +66,8 @@ import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import { promoteRepo } from "./promote.mjs";
+import { buildContextIndex, loadIndex, queryContextIndex } from "./context-index.mjs";
+import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory, agentAwareness,
@@ -84,6 +86,20 @@ import {
 } from "./preview.mjs";
 
 const MAX_BODY = 1024 * 1024;
+
+function contextIndexDir(dir) {
+  const p = join(dir, "context-indexes");
+  mkdirSync(p, { recursive: true, mode: 0o700 });
+  return p;
+}
+
+function resolveContextNode(dir, raw) {
+  const id = resolveNode(dir, String(raw));
+  const node = loadNode(dir, id);
+  if (!node.workdir || !existsSync(node.workdir)) throw new Error("node has no available workdir");
+  if (!existsSync(join(node.workdir, ".git"))) throw new Error("node workdir is not a Git checkout");
+  return { id, node };
+}
 
 function nodeStatus(dir, cfg, node) {
   const alive = pidAlive(node.workerPid);
@@ -194,7 +210,7 @@ export function startApiServer(dir, cfg) {
       const path = url.pathname;
 
       if (req.method === "GET" && path === "/health") {
-        return send(res, 200, { ok: true, version: 1, service: "kiln-swarm" });
+        return send(res, 200, { ok: true, version: 2, service: "kiln-swarm", contextFabric: "v2" });
       }
 
       // ---- git hosting: public routes (list/clone/fetch need no token) ----
@@ -378,6 +394,106 @@ export function startApiServer(dir, cfg) {
             return send(res, 400, { error: e.message });
           }
         }
+      }
+
+      // ---- Context Fabric: authenticated, node-bound local repository cognition ----
+      {
+        const m = path.match(/^\/v1\/context\/nodes\/([A-Za-z0-9_.-]+)\/(index|query|status)$/);
+        if (m) {
+          let bound;
+          try { bound = resolveContextNode(dir, m[1]); }
+          catch (e) { return send(res, 404, { error: e.message }); }
+          const action = m[2];
+          const idxDir = contextIndexDir(dir);
+
+          if (req.method === "POST" && action === "index") {
+            const b = await readBody(req);
+            const index = buildContextIndex(bound.node.workdir, idxDir, {
+              chunkLines: b.chunkLines,
+              overlap: b.overlap,
+            });
+            const receipt = appendContextReceipt(dir, {
+              operation: "api-index",
+              node: bound.id,
+              indexDigest: index.digest,
+              revision: index.revision,
+              worktreeDigest: index.worktreeDigest,
+            });
+            return send(res, 200, {
+              node: bound.id,
+              receipt,
+              index: {
+                schema: index.schema,
+                digest: index.digest,
+                revision: index.revision,
+                dirty: index.dirty,
+                worktreeDigest: index.worktreeDigest,
+                generatedAt: index.generatedAt,
+                stats: index.stats,
+                skipped: index.skipped,
+              },
+            });
+          }
+
+          if (req.method === "POST" && action === "query") {
+            const b = await readBody(req);
+            const query = String(b.query || "").trim();
+            if (!query || query.length > 4096) {
+              return send(res, 400, { error: "query is required and must be <= 4096 characters" });
+            }
+            let index = loadIndex(idxDir, bound.node.workdir);
+            if (!index || b.refresh !== false) {
+              index = buildContextIndex(bound.node.workdir, idxDir, {
+                chunkLines: b.chunkLines,
+                overlap: b.overlap,
+              });
+            }
+            const pack = queryContextIndex(index, query, {
+              maxBytes: b.maxBytes,
+              maxChunks: b.maxChunks,
+              mmrLambda: b.mmrLambda,
+              knownHashes: b.knownHashes,
+              expandDependencies: b.expandDependencies !== false,
+              maxDependencyChunks: b.maxDependencyChunks,
+            });
+            const receipt = appendContextReceipt(dir, {
+              operation: "api-query",
+              node: bound.id,
+              query,
+              indexDigest: index.digest,
+              packDigest: pack.digest,
+              revision: pack.revision,
+              worktreeDigest: pack.worktreeDigest,
+              emittedBytes: pack.stats.emittedBytes,
+              emittedChunks: pack.stats.emittedChunks,
+              unchangedChunks: pack.stats.unchangedChunks,
+            });
+            return send(res, 200, { node: bound.id, receipt, pack });
+          }
+
+          if (req.method === "GET" && action === "status") {
+            const index = loadIndex(idxDir, bound.node.workdir);
+            if (!index) return send(res, 404, { error: "context index not built" });
+            return send(res, 200, {
+              node: bound.id,
+              index: {
+                digest: index.digest,
+                revision: index.revision,
+                dirty: index.dirty,
+                worktreeDigest: index.worktreeDigest,
+                generatedAt: index.generatedAt,
+                stats: index.stats,
+              },
+            });
+          }
+
+          return send(res, 405, { error: "method not allowed" });
+        }
+      }
+
+      if (req.method === "POST" && path === "/v1/context/receipts/verify") {
+        const result = verifyContextReceipts(dir);
+        return send(res, result.ok ? 200 : 409, result);
       }
 
       // ---- jobs ----
