@@ -66,7 +66,7 @@ import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import { promoteRepo } from "./promote.mjs";
-import { buildContextIndex, loadIndex, queryContextIndex } from "./context-index.mjs";
+import { buildContextIndex, loadIndex, pruneContextCas, queryContextIndex } from "./context-index.mjs";
 import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.mjs";
 import { boundContextRequest, contextLimits } from "./context-policy.mjs";
 import { recordContextMetric, loadContextMetrics, contextMetricsSummary } from "./context-metrics.mjs";
@@ -571,6 +571,10 @@ export function startApiServer(dir, cfg) {
       if (req.method === "POST" && path === "/v1/context/receipts/verify") {
         const result = verifyContextReceipts(dir);
         return send(res, result.ok ? 200 : 409, result);
+      }
+
+      if (req.method === "POST" && path === "/v1/context/gc") {
+        return send(res, 200, { gc: pruneContextCas(contextIndexDir(dir)) });
       }
 
       if (req.method === "GET" && path === "/v1/context/metrics") {
