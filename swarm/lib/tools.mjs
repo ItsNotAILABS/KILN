@@ -16,6 +16,7 @@ import { loadApiToken } from "./state.mjs";
 import { runSandboxed } from "./sandbox.mjs";
 import { buildContextIndex, queryContextIndex } from "./context-index.mjs";
 import { appendContextReceipt } from "./context-receipts.mjs";
+import { agentAwareness } from "./memory.mjs";
 
 export class ToolError extends Error {
   constructor(message) {
@@ -236,6 +237,7 @@ export const TOOL_DEFS = [
   { name: "fs.write", caps: 0, desc: "Write a file inside the work dir (creates parents)", args: { path: "string", content: "string" } },
   { name: "fs.list", caps: 0, desc: "List a directory inside the work dir", args: { path: "string?" } },
   { name: "context.query", caps: 0, desc: "Retrieve a bounded, provenance-rich context pack from this node worktree", args: { query: "string", maxBytes: "number?", maxChunks: "number?", knownHashes: "object?", expandDependencies: "boolean?" } },
+  { name: "context.sit", caps: 0, desc: "Assemble current code context plus this node own KILN-repo durable memory when available", args: { query: "string", maxBytes: "number?", maxChunks: "number?", memoryTokens: "number?", knownHashes: "object?" } },
   { name: "shell.exec", caps: 0, desc: "Run a binary with argv, no shell, jailed cwd, timeout. Optional sandbox: {memoryMB (64..2048, default 256), network (default false), metricsFile} runs a node runner inside Linux namespaces (fresh mount/pid/uts/ipc; net only if network:true), hides /home /root (/etc when offline), caps the JS heap, SIGKILLs past 2x RSS, timeout with SIGTERM-then-SIGKILL teeth.", args: { command: "string", args: "string[]?", timeoutMs: "number?", sandbox: "object?" } },
   { name: "git.status", caps: 0, desc: "git status --porcelain in the work dir", args: {} },
   { name: "git.log", caps: 0, desc: "git log --oneline in the work dir", args: { n: "number?" } },
@@ -299,6 +301,50 @@ async function impl(ctx, name, args) {
         unchangedChunks: pack.stats.unchangedChunks,
       });
       return { ok: true, out: JSON.stringify(pack), contextReceipt };
+    }
+    case "context.sit": {
+      const query = needStr(args, "query");
+      if (!query.trim()) throw new ToolError("context.sit: empty query");
+      const indexDir = join(ctx.dir, "context-indexes");
+      mkdirSync(indexDir, { recursive: true, mode: 0o700 });
+      const index = buildContextIndex(workdir, indexDir);
+      const code = queryContextIndex(index, query, {
+        maxBytes: args.maxBytes === undefined ? 18000 : needNum(args, "maxBytes"),
+        maxChunks: args.maxChunks === undefined ? 10 : needNum(args, "maxChunks"),
+        knownHashes: args.knownHashes && typeof args.knownHashes === "object" ? args.knownHashes : {},
+        expandDependencies: true,
+      });
+      let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
+      const repoRef = String(ctx.node?.repo || "");
+      const m = repoRef.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
+      if (m) {
+        try {
+          memory = {
+            available: true,
+            owner: m[1],
+            repo: m[2],
+            ...agentAwareness(ctx.dir, m[1], m[2], {
+              query,
+              budgetTokens: args.memoryTokens === undefined ? 1200 : needNum(args, "memoryTokens"),
+            }),
+          };
+        } catch (e) {
+          memory = { available: false, owner: m[1], repo: m[2], reason: e.message };
+        }
+      }
+      const contextReceipt = appendContextReceipt(ctx.dir, {
+        operation: "node-sit",
+        node: ctx.nodeId,
+        query,
+        indexDigest: index.digest,
+        packDigest: code.digest,
+        revision: code.revision,
+        worktreeDigest: code.worktreeDigest,
+        emittedBytes: code.stats.emittedBytes,
+        emittedChunks: code.stats.emittedChunks,
+        unchangedChunks: code.stats.unchangedChunks,
+      });
+      return { ok: true, out: JSON.stringify({ schema: "kiln.context-sit.v1", code, memory }), contextReceipt };
     }
     case "shell.exec": {
       return await execArgs(workdir, args, "shell.exec", 30000);
@@ -405,11 +451,12 @@ export async function runTool(ctx, name, args) {
   } catch (e) {
     result = { ok: false, error: e.code ? `${e.code}: ${e.message}` : e.message };
   }
-  if (name === "context.query") {
+  if (name === "context.query" || name === "context.sit") {
     const safeArgs = {
       queryDigest: result?.contextReceipt?.queryDigest || null,
       maxBytes: args?.maxBytes ?? 24000,
-      maxChunks: args?.maxChunks ?? 12,
+      maxChunks: args?.maxChunks ?? (name === "context.sit" ? 10 : 12),
+      memoryTokens: name === "context.sit" ? (args?.memoryTokens ?? 1200) : undefined,
       expandDependencies: args?.expandDependencies !== false,
     };
     const safeResult = {
