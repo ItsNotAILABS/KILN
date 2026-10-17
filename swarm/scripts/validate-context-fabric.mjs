@@ -54,6 +54,8 @@ function repo(){
   }
   writeFileSync(join(root,".env"),"KILN_SECRET=never-index-this\n");
   writeFileSync(join(root,"secrets","credential.txt"),"never-index-this-either\n");
+  const privateKeyMarker=["-----BEGIN ","PRIVATE KEY","-----"].join("");
+  writeFileSync(join(root,"docs","auth-material.txt"),privateKeyMarker+"\nfixture-only\n");
   git(root,["add","."]);
   git(root,["commit","-qm","fixture"]);
   return root;
@@ -75,8 +77,10 @@ try{
   eq(first.stats.cacheReuseRatio,0,"first build has no cache reuse");
   eq(first.files.some(x=>x.path===".env"),false,"env excluded");
   eq(first.files.some(x=>x.path==="secrets/credential.txt"),false,"secret dir excluded");
+  eq(first.files.some(x=>x.path==="docs/auth-material.txt"),false,"secret-content file excluded");
   ok(first.skipped.some(x=>x.path===".env"),"env skip recorded");
   ok(first.skipped.some(x=>x.path==="secrets/credential.txt"),"secret skip recorded");
+  ok(first.skipped.some(x=>x.path==="docs/auth-material.txt"&&x.reason==="secret-content-policy"),"secret-content skip recorded");
 
   const loaded=loadIndex(state,root);
   eq(loaded.digest,first.digest,"persistent index reload digest");
@@ -159,7 +163,7 @@ try{
     ok(!item.path.includes(".."),`normalized path ${item.path}`);
   }
 
-  ok(assertions>=128,`expected >=128 assertions, got ${assertions}`);
+  ok(assertions>=130,`expected >=130 assertions, got ${assertions}`);
   console.log(JSON.stringify({
     schema:"kiln.context-production-gate.v1",
     ok:true,
