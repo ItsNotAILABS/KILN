@@ -113,6 +113,40 @@ function terms(text) {
   return out.filter((x) => x.length > 1);
 }
 
+function unique(xs) { return [...new Set(xs.filter(Boolean))]; }
+
+function codeSignals(path, body) {
+  const ext = extension(path);
+  const symbols = [];
+  const imports = [];
+  if ([".js",".jsx",".ts",".tsx",".mjs",".mts"].includes(ext)) {
+    for (const m of body.matchAll(/\b(?:export\s+)?(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)/g)) symbols.push(m[1]);
+    for (const m of body.matchAll(/\b(?:import[^"']*from\s*|import\s*\(|require\s*\()\s*["']([^"']+)["']/g)) imports.push(m[1]);
+  } else if (ext === ".py") {
+    for (const m of body.matchAll(/^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)/gm)) symbols.push(m[1]);
+    for (const m of body.matchAll(/^\s*(?:from\s+([A-Za-z0-9_.]+)\s+import|import\s+([A-Za-z0-9_.]+))/gm)) imports.push(m[1] || m[2]);
+  } else if (ext === ".go") {
+    for (const m of body.matchAll(/^\s*(?:func|type)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)/gm)) symbols.push(m[1]);
+    for (const m of body.matchAll(/"([^"]+)"/g)) if (m[1].includes("/")) imports.push(m[1]);
+  } else if (ext === ".rs") {
+    for (const m of body.matchAll(/\b(?:fn|struct|enum|trait|type|mod)\s+([A-Za-z_][A-Za-z0-9_]*)/g)) symbols.push(m[1]);
+    for (const m of body.matchAll(/\buse\s+([^;]+);/g)) imports.push(m[1].trim());
+  }
+  return { symbols: unique(symbols).slice(0, 1000), imports: unique(imports).slice(0, 1000) };
+}
+
+function resolveLocalDependency(index, fromPath, spec) {
+  if (!spec || !spec.startsWith(".")) return null;
+  const fromDir = fromPath.includes("/") ? fromPath.slice(0, fromPath.lastIndexOf("/")) : "";
+  const raw = resolve("/", fromDir, spec).replace(/^\//, "");
+  const candidates = [
+    raw, raw + ".js", raw + ".ts", raw + ".tsx", raw + ".jsx", raw + ".mjs",
+    raw + ".py", raw + "/index.js", raw + "/index.ts", raw + "/index.tsx",
+  ];
+  const known = new Set(index.files.map((x) => x.path));
+  return candidates.find((x) => known.has(x)) || null;
+}
+
 function chunkFile(path, body, fileHash, chunkLines, overlap) {
   const lines = body.split("\n");
   const step = Math.max(1, chunkLines - overlap);
@@ -177,7 +211,8 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
     if (!f) { skipped.push({ path: rel, reason: "unsupported-or-unsafe" }); continue; }
     const fileHash = sha256(f.body);
     const previous = previousFiles.get(rel);
-    files.push({ path: rel, sha256: fileHash, bytes: Buffer.byteLength(f.body, "utf8") });
+    const signals = codeSignals(rel, f.body);
+    files.push({ path: rel, sha256: fileHash, bytes: Buffer.byteLength(f.body, "utf8"), symbols: signals.symbols, imports: signals.imports });
     if (previous?.sha256 === fileHash && prior?.chunkLines === chunkLines && prior?.overlap === overlap) {
       chunks.push(...(previousChunks.get(rel) || []));
       reusedFiles++;
@@ -281,10 +316,16 @@ export function queryContextIndex(index, query, opts = {}) {
   const lambda = Math.max(0, Math.min(1, Number(opts.mmrLambda ?? 0.78)));
   const knownHashes = opts.knownHashes && typeof opts.knownHashes === "object" ? opts.knownHashes : {};
 
-  const ranked = index.chunks.map((chunk) => ({
-    chunk,
-    relevance: bm25(index, qTerms, chunk, opts) + pathBoost(chunk.path, qTerms),
-  })).filter((x) => x.relevance > 0);
+  const fileMeta = new Map(index.files.map((x) => [x.path, x]));
+  const ranked = index.chunks.map((chunk) => {
+    const meta = fileMeta.get(chunk.path) || {};
+    const symbolTerms = new Set((meta.symbols || []).flatMap((s) => terms(s)));
+    const symbolBoost = qTerms.reduce((n, t) => n + (symbolTerms.has(t) ? 1.4 : 0), 0);
+    return {
+      chunk,
+      relevance: bm25(index, qTerms, chunk, opts) + pathBoost(chunk.path, qTerms) + symbolBoost,
+    };
+  }).filter((x) => x.relevance > 0);
 
   const selected = [];
   while (ranked.length && selected.length < maxChunks) {
@@ -298,6 +339,26 @@ export function queryContextIndex(index, query, opts = {}) {
     }
     const [picked] = ranked.splice(bestIndex, 1);
     selected.push({ ...picked, mmr: bestScore });
+  }
+
+  if (opts.expandDependencies !== false && selected.length) {
+    const existing = new Set(selected.map((x) => x.chunk.path));
+    const maxDependencyChunks = Math.max(0, Math.min(10, Number(opts.maxDependencyChunks ?? 3)));
+    let added = 0;
+    for (const parent of [...selected]) {
+      if (added >= maxDependencyChunks) break;
+      const meta = fileMeta.get(parent.chunk.path);
+      for (const spec of meta?.imports || []) {
+        if (added >= maxDependencyChunks) break;
+        const dep = resolveLocalDependency(index, parent.chunk.path, spec);
+        if (!dep || existing.has(dep)) continue;
+        const chunk = index.chunks.find((c) => c.path === dep);
+        if (!chunk) continue;
+        selected.push({ chunk, relevance: parent.relevance * 0.35, mmr: parent.mmr * 0.35, dependencyOf: parent.chunk.path });
+        existing.add(dep);
+        added++;
+      }
+    }
   }
 
   const fileHashes = Object.fromEntries(index.files.map((f) => [f.path, f.sha256]));
@@ -324,6 +385,7 @@ export function queryContextIndex(index, query, opts = {}) {
       sha256: fileHash,
       score: Number(x.relevance.toFixed(6)),
       mmr: Number(x.mmr.toFixed(6)),
+      dependencyOf: x.dependencyOf || null,
       bytes: actualBytes,
       tokenEstimate: Math.ceil(actualBytes / 4),
       excerpt,
