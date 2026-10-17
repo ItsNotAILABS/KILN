@@ -40,9 +40,11 @@ jobs:
           node --check swarm/context.mjs
           node --check swarm/scripts/context-benchmark.mjs
           node --check swarm/scripts/validate-context-fabric.mjs
+          node --check swarm/lib/context-policy.mjs
+          node --check swarm/lib/context-metrics.mjs
       - name: Focused tests
         working-directory: swarm
-        run: node --test test/context-index.test.mjs test/context-receipts.test.mjs test/context-tool.test.mjs
+        run: node --test test/context-*.test.mjs
       - name: 120 assertion production gate
         working-directory: swarm
         run: node scripts/validate-context-fabric.mjs
