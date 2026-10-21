@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
+import { scanSecretContent } from "./secret-scan.mjs";
 
 const INDEX_SCHEMA = "kiln.context-index.v1";
 const PACK_SCHEMA = "kiln.context-pack.v2";
@@ -209,6 +210,8 @@ export function buildContextIndex(repoRoot, indexDir, opts = {}) {
     if (secretPath(rel)) { skipped.push({ path: rel, reason: "secret-path-policy" }); continue; }
     const f = safeTextFile(base, rel);
     if (!f) { skipped.push({ path: rel, reason: "unsupported-or-unsafe" }); continue; }
+    const secretScan = scanSecretContent(f.body);
+    if (!secretScan.safe) { skipped.push({ path: rel, reason: "secret-content-policy", classes: secretScan.findings.map((x) => x.type) }); continue; }
     const fileHash = sha256(f.body);
     const previous = previousFiles.get(rel);
     const signals = codeSignals(rel, f.body);
