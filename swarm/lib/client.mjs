@@ -134,6 +134,28 @@ export class SwarmClient {
     return this._req("POST", "/context/receipts/verify", {});
   }
 
+  // ---- Repository cognition / knowledge / promotion ----
+  async buildRepoGraph(node) {
+    if (!node) throw new Error("buildRepoGraph: node is required");
+    return this._req("POST", `/graph/${encodeURIComponent(node)}/build`, {});
+  }
+  async impact(node, paths, { depth = 2 } = {}) {
+    if (!node) throw new Error("impact: node is required");
+    if (!Array.isArray(paths) || !paths.length) throw new Error("impact: paths[] is required");
+    return this._req("POST", `/graph/${encodeURIComponent(node)}/impact`, { paths, depth });
+  }
+  async putFact(node, fact) {
+    if (!node) throw new Error("putFact: node is required");
+    return this._req("POST", `/knowledge/${encodeURIComponent(node)}/facts`, fact);
+  }
+  async queryFacts(node, query = "") {
+    if (!node) throw new Error("queryFacts: node is required");
+    return this._req("POST", `/knowledge/${encodeURIComponent(node)}/query`, { query });
+  }
+  async evaluatePromotion(request) {
+    return this._req("POST", "/porta/evaluate", request);
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});
