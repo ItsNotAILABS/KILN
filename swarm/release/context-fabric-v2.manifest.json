@@ -1,0 +1,51 @@
+{
+  "schema": "kiln.context-fabric-release.v2",
+  "branch": "civitas/context-fabric-v1",
+  "generated_at": "2026-10-21",
+  "status": "implementation-candidate",
+  "capabilities": [
+    "content-addressed incremental repository index",
+    "BM25/path/symbol retrieval with MMR",
+    "dependency expansion and delta context",
+    "secret-path and secret-content pre-index filtering",
+    "repository cognition graph and impact propagation",
+    "hash-bound verified repository facts with staleness",
+    "exact-token hook and estimated fallback",
+    "compiled source+graph+fact mission packs",
+    "privacy-bounded context receipts",
+    "loopback node-bound daemon APIs",
+    "SwarmClient APIs",
+    "Workspace server-only bridge",
+    "NEXUS federation contracts",
+    "pure PORTA promotion policy"
+  ],
+  "validation": {
+    "local_core_tests": {
+      "passed": 6,
+      "failed": 0
+    },
+    "production_gate_assertions": {
+      "passed": 221,
+      "failed": 0
+    },
+    "scope": "new core modules reconstructed from branch source and executed locally",
+    "excluded": [
+      "full existing KILN repository suite",
+      "live daemon end-to-end",
+      "kiln-workspace build",
+      "NEXUS full validators",
+      "provider tokenizer benchmark",
+      "GitHub promotion execution"
+    ]
+  },
+  "truth_boundary": {
+    "implemented": true,
+    "core_module_validation": true,
+    "full_repo_validated": false,
+    "benchmarked_token_savings": false,
+    "production_deployed": false,
+    "security_audited": false
+  },
+  "research": "research/FORNAX_CONTEXT_FABRIC_RESEARCH_V2.md",
+  "production_boundary": "swarm/docs/CONTEXT_FABRIC_PRODUCTION.md"
+}
