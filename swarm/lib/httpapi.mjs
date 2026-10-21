@@ -27,6 +27,7 @@ import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.
 import { buildRepoGraph, impactFromPaths } from "./repo-graph.mjs";
 import { putFact, queryFacts, evaluateFacts } from "./knowledge-ledger.mjs";
 import { evaluatePromotion } from "./porta.mjs";
+import { compileContext } from "./context-compiler.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -275,6 +276,45 @@ export function startApiServer(dir, cfg) {
               stats: index.stats,
             },
           });
+        }
+      }
+
+      // ---- Compiled mission context: source + graph + verified facts ----
+      {
+        const m = path.match(/^\/context\/([A-Za-z0-9_.-]+)\/compile$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); } catch (e) { return send(res, 404, { error: e.message }); }
+          const b = await readBody(req);
+          if (!b.query || !String(b.query).trim()) return send(res, 400, { error: "query is required" });
+          const index = buildContextIndex(bound.node.workdir, contextIndexDir(dir));
+          const sourcePack = queryContextIndex(index, String(b.query), {
+            maxBytes: b.maxBytes,
+            maxChunks: b.maxChunks,
+            mmrLambda: b.mmrLambda,
+            knownHashes: b.knownHashes,
+          });
+          const mission = await compileContext({
+            index,
+            sourcePack,
+            knowledgeDir: join(nodeDir(dir, bound.id), "knowledge"),
+            query: String(b.query),
+            tokenBudget: Number(b.tokenBudget || 12000),
+            includeFacts: b.includeFacts !== false,
+            includeGraph: b.includeGraph !== false,
+          });
+          const receipt = appendContextReceipt(dir, {
+            operation: "compile",
+            node: bound.id,
+            query: b.query,
+            indexDigest: index.digest,
+            packDigest: mission.digest,
+            revision: mission.revision,
+            worktreeDigest: mission.worktreeDigest,
+            emittedBytes: Buffer.byteLength(JSON.stringify(mission.sections), "utf8"),
+            emittedChunks: mission.sections.length,
+          });
+          return send(res, 200, { node: bound.id, receipt, mission });
         }
       }
 
