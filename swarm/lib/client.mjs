@@ -134,6 +134,12 @@ export class SwarmClient {
     return this._req("POST", "/context/receipts/verify", {});
   }
 
+  async compileContext(node, query, options = {}) {
+    if (!node) throw new Error("compileContext: node is required");
+    if (!query || !String(query).trim()) throw new Error("compileContext: query is required");
+    return this._req("POST", `/context/${encodeURIComponent(node)}/compile`, { query, ...options });
+  }
+
   // ---- Repository cognition / knowledge / promotion ----
   async buildRepoGraph(node) {
     if (!node) throw new Error("buildRepoGraph: node is required");
