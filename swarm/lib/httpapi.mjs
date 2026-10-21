@@ -24,6 +24,9 @@ import { loadKeyFile } from "./state.mjs";
 import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
 import { buildContextIndex, loadIndex, queryContextIndex } from "./context-index.mjs";
 import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.mjs";
+import { buildRepoGraph, impactFromPaths } from "./repo-graph.mjs";
+import { putFact, queryFacts, evaluateFacts } from "./knowledge-ledger.mjs";
+import { evaluatePromotion } from "./porta.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -273,6 +276,67 @@ export function startApiServer(dir, cfg) {
             },
           });
         }
+      }
+
+      // ---- Repository cognition graph / impact ----
+      {
+        const m = path.match(/^\/graph\/([A-Za-z0-9_.-]+)\/build$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); } catch (e) { return send(res, 404, { error: e.message }); }
+          const index = buildContextIndex(bound.node.workdir, contextIndexDir(dir));
+          const graph = buildRepoGraph(index);
+          return send(res, 200, { node: bound.id, graph });
+        }
+      }
+      {
+        const m = path.match(/^\/graph\/([A-Za-z0-9_.-]+)\/impact$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); } catch (e) { return send(res, 404, { error: e.message }); }
+          const b = await readBody(req);
+          if (!Array.isArray(b.paths) || !b.paths.length) return send(res, 400, { error: "paths[] is required" });
+          const index = buildContextIndex(bound.node.workdir, contextIndexDir(dir));
+          const graph = buildRepoGraph(index);
+          return send(res, 200, { node: bound.id, impact: impactFromPaths(graph, b.paths.map(String), { depth: b.depth }) });
+        }
+      }
+
+      // ---- Verified repository knowledge ledger ----
+      {
+        const m = path.match(/^\/knowledge\/([A-Za-z0-9_.-]+)\/facts$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); } catch (e) { return send(res, 404, { error: e.message }); }
+          const b = await readBody(req);
+          try {
+            const fact = putFact(join(nodeDir(dir, bound.id), "knowledge"), {
+              subject: b.subject, predicate: b.predicate, value: b.value,
+              evidence: Array.isArray(b.evidence) ? b.evidence : [],
+              confidence: b.confidence || "verified", actor: b.actor || bound.id,
+            });
+            return send(res, 201, { node: bound.id, fact });
+          } catch (e) { return send(res, 400, { error: e.message }); }
+        }
+      }
+      {
+        const m = path.match(/^\/knowledge\/([A-Za-z0-9_.-]+)\/query$/);
+        if (req.method === "POST" && m) {
+          let bound;
+          try { bound = contextNode(dir, m[1]); } catch (e) { return send(res, 404, { error: e.message }); }
+          const b = await readBody(req);
+          const index = buildContextIndex(bound.node.workdir, contextIndexDir(dir));
+          const facts = b.query ? queryFacts(join(nodeDir(dir, bound.id), "knowledge"), index, String(b.query))
+            : evaluateFacts(join(nodeDir(dir, bound.id), "knowledge"), index);
+          return send(res, 200, { node: bound.id, facts });
+        }
+      }
+
+      // ---- PORTA pure promotion decision (no push/merge side effects) ----
+      if (req.method === "POST" && path === "/porta/evaluate") {
+        const b = await readBody(req);
+        const decision = evaluatePromotion(b);
+        return send(res, decision.decision === "allow" ? 200 : 409, { decision });
       }
 
       if (req.method === "POST" && path === "/jobs") {
