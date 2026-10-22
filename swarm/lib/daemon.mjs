@@ -138,9 +138,10 @@ function spawnWorker(dir, id) {
 }
 
 function nodeStatus(dir, cfg, node) {
-  // pidIsWorker, not bare pidAlive: a dead worker's pid can be recycled by
-  // an unrelated process, which must NOT be adopted as a live worker.
-  const alive = pidIsWorker(node.workerPid, dir);
+  // pidIsWorker with the node id, not bare pidAlive: a dead worker's pid
+  // can be recycled by an unrelated process — or by ANOTHER node's worker —
+  // and neither must be adopted as this node's live worker.
+  const alive = pidIsWorker(node.workerPid, dir, node.id);
   const hbAge = heartbeatAgeMs(dir, node.id);
   const fresh = hbAge < cfg.heartbeatTimeoutMs;
   if (alive && fresh) return readJobFile(dir, node.id) ? "working" : "idle";
@@ -188,7 +189,7 @@ function reapExited(dir) {
   // reconcile() handles the respawn.
   for (const id of listNodeIds(dir)) {
     const node = loadNode(dir, id);
-    if (node.workerPid && !pidIsWorker(node.workerPid, dir)) {
+    if (node.workerPid && !pidIsWorker(node.workerPid, dir, node.id)) {
       if (node.lastExit === null || node.lastExit === undefined) {
         // We don't know the exit code; treat unknown death as failure-ish.
         node.lastExit = 1;
