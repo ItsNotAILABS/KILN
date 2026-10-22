@@ -48,7 +48,7 @@ import {
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
-  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
+  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory,
 } from "./lib/memory.mjs";
 import { memorySigningPubkey, signatureSummary } from "./lib/memory-signing.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
@@ -583,6 +583,36 @@ async function cmdMemory(args) {
   const sub = args._[1];
   const dir = dirOf(args);
   ensureStateDir(dir);
+  // Phase 6 cross-repo recall: `memory recall-all --q <query>` (or
+  // `memory recall --repo '*'`). No --repo: the query fans out over
+  // every repo chain in the state dir; excluded (unverifiable)
+  // chains are reported on stderr, never silently skipped.
+  if (sub === "recall-all" || (sub === "recall" && (args.all === true || args.repo === "*" || args.repo === "*/*"))) {
+    const r = recallCrossRepo(dir, String(need(args, "q")), {
+      limit: args.limit ? Number(args.limit) : 10,
+      kinds: csv(args.kinds),
+      tags: csv(args.tags),
+      asOf: args.asof ? String(args.asof) : undefined,
+      since: args.since ? String(args.since) : undefined,
+      until: args.until ? String(args.until) : undefined,
+      includeSuperseded: !!args.superseded,
+    });
+    if (args.json) {
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      for (const x of r.results) {
+        console.log(`${x.score.toFixed(3)}  ${x.repo}  ${x.kind.padEnd(7)} seq=${x.seq} via=${x.via} engine=${x.engine}  ${x.title || x.text.slice(0, 80)}`);
+      }
+      if (!r.results.length) console.log("(no recall hits)");
+      for (const s of r.repos) {
+        if (s.status === "empty") console.error(`[memory: ${s.repo} has no memory]`);
+      }
+    }
+    for (const ex of r.excluded) {
+      console.error(`[memory: EXCLUDED ${ex.repo} — chain failed verification: ${ex.error}]`);
+    }
+    return;
+  }
   const [owner, repo] = repoArg(args);
   const actor = args.actor ? String(args.actor) : "cli";
   if (sub === "remember") {
@@ -690,7 +720,7 @@ async function cmdMemory(args) {
     const st = loadMemory(dir, owner, repo);
     console.log(JSON.stringify({ ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) }, null, 2));
   } else {
-    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify|pubkey|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]");
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify|pubkey|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]  ·  memory recall-all --q <query> [--limit N] [--json] (cross-repo, phase 6)");
     process.exit(2);
   }
 }

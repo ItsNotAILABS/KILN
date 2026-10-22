@@ -49,6 +49,9 @@
  *   POST /git/:owner/:repo/memory/core       {label, value, description?}
  *   GET  /git/:owner/:repo/memory/core|facts|recall|context|stats
  *   POST /git/:owner/:repo/memory/verify     -> {ok, events, commits}
+ *   GET  /memory/recall?q=…                  cross-repo recall (phase 6):
+ *                                    fused hits with per-repo provenance;
+ *                                    unverifiable chains excluded + named
  * Sites (first-class sites: frontend repo + backend repo + artifact + app):
  *   POST /v1/sites                  {name, frontend:"o/r", backend:"o/r",
  *                                    artifact?, computeApp?} -> {ok, site}
@@ -78,7 +81,7 @@ import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
-  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
+  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory,
 } from "./memory.mjs";
 import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
 import {
@@ -291,6 +294,26 @@ export function startApiServer(dir, cfg) {
           }
         } catch (e) { plog(`ci enqueue failed (non-fatal): ${e.message}`); }
         return;
+      }
+
+      // ---- cross-repo memory recall (phase 6; authenticated) ----
+      // Read-time fan-out over every repo chain in the state dir;
+      // unverifiable chains are excluded and named in the envelope.
+      if (req.method === "GET" && path === "/memory/recall") {
+        try {
+          const r = recallCrossRepo(dir, url.searchParams.get("q") || "", {
+            limit: parseInt(url.searchParams.get("limit") || "10", 10) || 10,
+            kinds: (url.searchParams.get("kinds") || "").split(",").filter(Boolean),
+            tags: (url.searchParams.get("tags") || "").split(",").filter(Boolean),
+            asOf: url.searchParams.get("asOf") || undefined,
+            since: url.searchParams.get("since") || undefined,
+            until: url.searchParams.get("until") || undefined,
+            includeSuperseded: url.searchParams.get("includeSuperseded") === "1",
+          });
+          return send(res, 200, r);
+        } catch (e) {
+          return send(res, 400, { error: e.message });
+        }
       }
 
       // ---- per-repo memory (authenticated; held from the git block above) ----

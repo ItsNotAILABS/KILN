@@ -68,9 +68,14 @@ import { canon, sha256hex, sha256hexOfCanon } from "./canon.mjs";
 import { repoPath, repoExists } from "./git.mjs";
 import { recallIndexed, memoryIndexInfo } from "./memory-index.mjs";
 import { fuseRecallVectors, memoryVectorsInfo } from "./memory-vectors.mjs";
+import { recallCrossRepo } from "./memory-cross.mjs";
 import {
   loadOrCreateMemoryKey, loadMemoryKey, verifyEventSignatures, signatureSummary,
 } from "./memory-signing.mjs";
+
+// Phase 6 entry point, re-exported so every surface imports memory
+// from this one module (implementation: lib/memory-cross.mjs).
+export { recallCrossRepo };
 
 export const MEMORY_REF = "refs/kiln/memory";
 const INLINE_MAX = 4096;          // content chars kept inline in the event JSON
@@ -691,8 +696,18 @@ function estimateTokens(text) {
  * vector tier (lib/memory-vectors.mjs) is enabled it fuses cosine
  * similarity into the ranking and adds a `fusion` provenance block;
  * any tier failure serves the lexical result untouched.
+ *
+ * With owner "*" this is the phase-6 cross-repo mode: the query fans
+ * out over every repo chain in the state dir and returns fused,
+ * provenance-tagged results (lib/memory-cross.mjs). Per-repo recall
+ * — this function with a real owner — is the default and unchanged.
  */
 export function recall(dir, owner, repo, query, opts = {}) {
+  // Phase 6 cross-repo mode: owner "*" fans out over every repo
+  // chain in the state dir (lib/memory-cross.mjs); `repo` is ignored
+  // ("*" by convention). Opt-in only — single-repo behavior below is
+  // unchanged.
+  if (owner === "*") return recallCrossRepo(dir, query, opts);
   const asOfSec = opts.asOf ? isoToSec(opts.asOf, "asOf") : Math.floor(Date.now() / 1000);
   const pre = {
     asOfSec,

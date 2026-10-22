@@ -150,6 +150,24 @@ export class SwarmClient {
     if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
     return this._req("GET", `${this._memBase(owner, repo)}/recall?${qs}`);
   }
+  /**
+   * Cross-repo recall (phase 6): fused recall over EVERY repo chain
+   * in the state dir. Returns {crossRepo: true, query, results[],
+   * repos[], excluded[]} — each hit carries its repo, engine and
+   * chain signing posture; chains that fail verification are
+   * excluded and named in `excluded`, never silently skipped.
+   */
+  async memoryRecallAll(q, opts = {}) {
+    const qs = new URLSearchParams({ q: String(q || "") });
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    if (opts.kinds && opts.kinds.length) qs.set("kinds", opts.kinds.join(","));
+    if (opts.tags && opts.tags.length) qs.set("tags", opts.tags.join(","));
+    if (opts.asOf) qs.set("asOf", opts.asOf);
+    if (opts.since) qs.set("since", opts.since);
+    if (opts.until) qs.set("until", opts.until);
+    if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
+    return this._req("GET", `/memory/recall?${qs}`);
+  }
   /** Budgeted context pack: {core, facts, episodes, text, usedTokens, budgetTokens, overBudget}. */
   async memoryContext(owner, repo, { query, budgetTokens, asOf } = {}) {
     const qs = new URLSearchParams();

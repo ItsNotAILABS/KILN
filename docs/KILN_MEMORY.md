@@ -2,8 +2,9 @@
 
 **Status:** v1 merged to main (`e45c69f`) and live since 2026-10-14 —
 library + HTTP API + client SDK + CLI. Phase 1 (FTS5 index sidecar)
-built 2026-10-17; phase 2 (signed events) and phase 3 (vector recall
-tier) built 2026-10-22: see "Phases after v1" below.
+built 2026-10-17; phases 2 (signed events), 3 (vector recall tier)
+and 6 (cross-repo recall) built 2026-10-22. **The phase list is
+complete** — see "Phases after v1" below.
 
 ## The one-sentence version
 
@@ -121,6 +122,14 @@ BM25** (pure JS, no dependencies — the swarm's standing rule), then:
   eligibility — its candidate universe is the same kinds /
   since / until / tags / `factsAt()` rules, computed from the
   replayed, signature-verified state.
+- **spans repos on request (phase 6)**: `recallCrossRepo` fans the
+  same per-repo recall out over every chain in the state dir and
+  fuses the results. Each repo is first read through the phase-2
+  signature-verified path; scores are max-normalized per repo
+  before merging (per-repo corpus statistics are not comparable),
+  and every hit carries its repo, its engine/tier, and its chain's
+  signing posture. It is a read-time fan-out — there is no merged
+  global store, and per-repo recall stays the default.
 
 `buildContext({query?, budgetTokens})` assembles the pack an agent
 actually receives: **core blocks first (always), then facts, then
@@ -145,17 +154,22 @@ library, and with a hash-intact but signature-stale event).
 - **Library** — `swarm/lib/memory.mjs`:
   `remember`, `assertFact`, `supersedeFact`, `linkMemories`, `setCore`,
   `loadMemory`, `factsAt`, `recall`, `buildContext`, `memoryStats`,
-  `verifyMemory`, `readEvents`.
+  `verifyMemory`, `readEvents`. Cross-repo (phase 6):
+  `recallCrossRepo(dir, query, opts)` in `lib/memory-cross.mjs`,
+  also reached as `recall(dir, "*", "*", query, opts)`.
 - **HTTP API** (authenticated, under the repo's namespace):
   `POST /git/:o/:r/memory/episodes|facts|supersede|links|core`,
   `GET  /git/:o/:r/memory/core|facts|recall|context|stats`,
   `POST /git/:o/:r/memory/verify`.
+  Cross-repo: `GET /memory/recall?q=…` (authenticated, top-level).
 - **Client SDK** — `SwarmClient.memoryRemember / memoryFact /
   memorySupersede / memoryLink / memorySetCore / memoryCore /
-  memoryFacts / memoryRecall / memoryContext / memoryStats /
-  memoryVerify`.
+  memoryFacts / memoryRecall / memoryRecallAll / memoryContext /
+  memoryStats / memoryVerify`.
 - **CLI** — `swarm.mjs memory remember|fact|supersede|link|core|
   core-get|facts|recall|context|stats|verify|pubkey --repo <owner>/<repo>`.
+  Cross-repo: `swarm.mjs memory recall-all --q <query>` (or
+  `memory recall --repo '*'`).
   The CLI calls the library directly (same code path as the API), so
   memory works with the daemon down.
 
@@ -198,6 +212,16 @@ library, and with a hash-intact but signature-stale event).
   chain; signatures make tampering evident against any *other*
   copy of the chain (a clone, the GitHub replay), they do not make
   a single held copy incorruptible.
+- **Cross-repo recall (phase 6) is a fan-out, not an index.** Every
+  cross-repo query pays one verified replay (hash + signature walk,
+  O(events)) per repo with a memory ref, plus that repo's own
+  (sidecar-served) recall. There is no cross-repo index and no
+  posture cache; at today's scale (a handful of repos, ≤ ~10³
+  events each) that is the honest price of never trusting an
+  unverified chain. A repo whose chain fails verification
+  contributes nothing — including its honestly-written events,
+  because once a chain fails, none of it is trustworthy — and is
+  named in the result envelope instead.
 - **No automatic extraction yet.** Facts are asserted explicitly by
   agents/humans today. The consolidation phase (Letta sleep-time /
   Mem0 extraction) proposes facts from episodes *as proposals* —
@@ -319,7 +343,39 @@ library, and with a hash-intact but signature-stale event).
    128). The daemon already serves the ref via git transport.
    Network-free core pinned by `test/promote.test.mjs`
    (`listMemoryCommits` / `planMemoryReplay` + clone gating).
-6. **Cross-repo memory** — explicitly linked memories across repos
-   (an episode in repo A cited by a fact in repo B), opt-in per link,
-   never a merged global store. Per-repo stays the default and the
-   boundary.
+6. **Cross-repo memory** — ✅ BUILT 2026-10-22
+   (`lib/memory-cross.mjs`). `recallCrossRepo(dir, query, opts)` —
+   also `recall(dir, "*", "*", …)`, CLI `memory recall-all` /
+   `memory recall --repo '*'`, HTTP `GET /memory/recall`, SDK
+   `memoryRecallAll` — fans one query out over every repo chain in
+   the state dir and fuses the results. Each repo is gated on the
+   phase-2 signature-verified read (`readEvents`) before it is
+   searched: a chain that fails verification is **excluded and
+   named** in the envelope (`repos[]` with `status: "excluded"` +
+   the error, mirrored in a top-level `excluded` list) — exclusion
+   is a reported fact, never a silent skip, and the CLI prints it
+   to stderr. Every hit carries provenance: `repo`, `engine`
+   ("index" | "scan"), the `fusion` block when the vector tier
+   engaged, its chain's `signing` summary, and `repoScore` (its raw
+   in-repo score). Merging max-normalizes per repo — each repo's
+   top returned score becomes the divisor, the same normalization
+   phase-3 fusion applies to its lexical base — so merged scores
+   read as strength-within-repo in [0, 1] and a big corpus cannot
+   drown a small one on corpus statistics alone. Eligibility is the
+   per-repo recall's own (kinds / since / until / tags /
+   `factsAt()`), so parity holds by construction; global option
+   errors (bad dates) throw once up front instead of masquerading
+   as exclusions. `KILN_MEMORY_CROSSREPO=off` disables the mode
+   loudly; single-repo recall is untouched. **Deviation from the
+   original sketch, stated plainly:** the sketch imagined
+   cross-repo *links* — a fact in repo B citing an episode in
+   repo A at write time. That is **not** built: writes remain
+   strictly per-repo (provenance ids resolve inside their own
+   chain, and that boundary is load-bearing for verification).
+   What shipped is the recall half of the phase — spanning repos
+   at read time, opt-in per query, never a merged global store.
+   Cross-repo citation at write time remains future work if it is
+   ever wanted. Pinned by `test/memory-cross.test.mjs` (fusion +
+   provenance, forged-chain exclusion, eligibility parity,
+   single-repo invariance, kill switch, CLI + daemon SDK
+   round-trip).
