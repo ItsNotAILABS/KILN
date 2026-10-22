@@ -80,6 +80,7 @@ import {
   proposeMemory, resolveProposal,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
 } from "./memory.mjs";
+import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
 import {
   snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
 } from "./ci.mjs";
@@ -375,6 +376,14 @@ export function startApiServer(dir, cfg) {
           }
           if (req.method === "POST" && rest === "/memory/verify") {
             return send(res, 200, verifyMemory(dir, owner, repo));
+          }
+          if (req.method === "GET" && rest === "/memory/pubkey") {
+            // Phase 2 discovery: the state dir's memory signing key
+            // (public half) + this repo's signature posture. Creates
+            // the key on first use, like a first write would.
+            const pub = memorySigningPubkey(dir, { create: true });
+            const st = loadMemory(dir, owner, repo);
+            return send(res, 200, { ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) });
           }
           return send(res, 404, { error: "not found" });
         } catch (e) {

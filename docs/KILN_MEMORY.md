@@ -2,7 +2,8 @@
 
 **Status:** v1 merged to main (`e45c69f`) and live since 2026-10-14 —
 library + HTTP API + client SDK + CLI. Phase 1 (FTS5 index sidecar)
-built 2026-10-17: see "Phases after v1" below.
+built 2026-10-17; phase 2 (signed events) built 2026-10-22: see
+"Phases after v1" below.
 
 ## The one-sentence version
 
@@ -124,8 +125,10 @@ Every fact cites its episodes; every episode can cite its origin
 (commit, receipt, job). A context pack names the event id and seq of
 everything it includes. `verifyMemory` independently walks the ref:
 commits must be linear, exactly one event per commit, seq gapless,
-hash chain intact, blob sha256s matching. Forgery is detected (tested
-with a hand-forged commit appended outside the library).
+hash chain intact, blob sha256s matching, and — since phase 2 —
+every post-epoch event's Ed25519 signature valid. Forgery is
+detected (tested with a hand-forged commit appended outside the
+library, and with a hash-intact but signature-stale event).
 
 ## Surfaces
 
@@ -142,7 +145,7 @@ with a hand-forged commit appended outside the library).
   memoryFacts / memoryRecall / memoryContext / memoryStats /
   memoryVerify`.
 - **CLI** — `swarm.mjs memory remember|fact|supersede|link|core|
-  core-get|facts|recall|context|stats|verify --repo <owner>/<repo>`.
+  core-get|facts|recall|context|stats|verify|pubkey --repo <owner>/<repo>`.
   The CLI calls the library directly (same code path as the API), so
   memory works with the daemon down.
 
@@ -172,9 +175,14 @@ with a hand-forged commit appended outside the library).
   honest BM25 than fake "AI search". The embedding phase plugs a
   vector column into the same ranking (Loom's persisted-embedding
   pattern) behind the same `recall` API.
-- **Events are hash-chained, not node-signed.** When a swarm node
-  writes memory, v2 signs the event with the node's ed25519 key,
-  receipts-style, so "which agent asserted this" is cryptographic.
+- **Events are hash-chained and signed** (phase 2, above) — but the
+  signature proves *which installation's memory key wrote the
+  event*, not which human or agent drove it: `actor` stays a
+  self-claimed string inside the signed body. A compromised state
+  dir (key + repos together) can forge a fully self-consistent
+  chain; signatures make tampering evident against any *other*
+  copy of the chain (a clone, the GitHub replay), they do not make
+  a single held copy incorruptible.
 - **No automatic extraction yet.** Facts are asserted explicitly by
   agents/humans today. The consolidation phase (Letta sleep-time /
   Mem0 extraction) proposes facts from episodes *as proposals* —
@@ -198,8 +206,40 @@ with a hand-forged commit appended outside the library).
    stays the fallback and the auditor. `memoryStats` reports the
    sidecar's tip/doc count. Equivalence with the scan (hit sets + top
    hits) is pinned by `test/memory-index.test.mjs`.
-2. **Signed events** — node-key signatures on writes; `verifyMemory`
-   checks signatures for events that carry them.
+2. **Signed events** — ✅ BUILT 2026-10-22 (`lib/memory-signing.mjs`).
+   Every append through the library is signed at write time with
+   Ed25519 (node:crypto, no new dependencies) by a per-state-dir
+   memory key: generated on first use, stored at
+   `<stateDir>/memory-signing.key` (mode 0600, enforced on load),
+   never in the repo or in git. Each signed event carries `signer`
+   (sha256 of the raw public key), `signerKey` (the SPKI public key,
+   base64) and `sig` — the signature over the event's hash, receipts-
+   style. `signer`/`signerKey` sit inside the hashed body, so the
+   hash chain covers the claimed identity and the signature covers
+   the hash; verification needs no key server and works on any copy
+   of the chain, including the GitHub copy phase 5 replays.
+   Verification is enforced on every read (`readEvents`, hence
+   recall/context/stats/verify and the FTS5 sidecar sync) and on the
+   promote replay path (`listMemoryCommits` runs the full chain +
+   signature walk and refuses a chain that does not authenticate).
+   **The boundary:** history written before phase 2 is unsigned and
+   stays readable forever as *unsigned-legacy*. A chain's signing
+   epoch opens at its first signed event; from there on, a missing
+   signature, an unverifiable one, or a `signerKey` that does not hash
+   to the claimed `signer` is a loud error, never a silent trust.
+   `verifyMemory` and `memoryStats` report the posture
+   (`signed` / `legacy` / `epochStart` / `signers`); the public half
+   is discoverable via CLI `memory pubkey`, HTTP
+   `GET /memory/pubkey`, and SDK `memoryPubkey`. One honest
+   deviation from the original sketch: the signing identity is the
+   state dir's memory key, not per-node worker keys — the memory
+   library writes from the daemon/CLI/API processes, which hold no
+   node key; the event's `actor` field still names the acting agent,
+   and the signer names the writing installation. Pinned by
+   `test/memory-signing.test.mjs` (sign/verify round-trip, key
+   binding, stale-signature tamper with an intact hash chain,
+   post-epoch unsigned rejection, legacy readability + epoch opening,
+   promote replay rejection, loose-key-permissions refusal).
 3. **Embeddings** — optional persisted vectors per event (local model
    first), fused into recall ranking (semantic + BM25 + graph +
    temporal, Mem0-style multi-signal fusion).

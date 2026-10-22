@@ -48,8 +48,12 @@
  *     this replay as the fallback and the auditor.
  *   - Retrieval is lexical BM25 + recency + salience + 1-hop link
  *     expansion. No embeddings yet — no fake semantic search.
- *   - Events are hash-chained but not yet node-signed; signing with
- *     the acting node's ed25519 key (receipts-style) is a later phase.
+ *   - Events are hash-chained AND signed (phase 2, lib/memory-signing.mjs):
+ *     every append carries an Ed25519 signature by the state dir's
+ *     memory key, verified on every read. History written before
+ *     phase 2 stays readable as unsigned-legacy; the chain's signing
+ *     epoch opens at its first signed event, and from there on an
+ *     unsigned or badly-signed event is a loud error.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -59,6 +63,9 @@ import { randomBytes } from "node:crypto";
 import { canon, sha256hex, sha256hexOfCanon } from "./canon.mjs";
 import { repoPath, repoExists } from "./git.mjs";
 import { recallIndexed, memoryIndexInfo } from "./memory-index.mjs";
+import {
+  loadOrCreateMemoryKey, loadMemoryKey, verifyEventSignatures, signatureSummary,
+} from "./memory-signing.mjs";
 
 export const MEMORY_REF = "refs/kiln/memory";
 const INLINE_MAX = 4096;          // content chars kept inline in the event JSON
@@ -161,13 +168,20 @@ export function readEvents(dir, owner, repo) {
   for (const b of blobs) {
     let ev;
     try { ev = JSON.parse(b.raw); } catch { throw new Error(`memory: event ${b.path} is not valid JSON`); }
-    const { hash, ... unsigned } = ev;
+    // The hash covers the event body minus `hash` itself and minus
+    // `sig` (the signature signs the hash, so it cannot be inside it).
+    // `signer`/`signerKey` ARE covered — identity is part of the body.
+    const { hash, sig, ... unsigned } = ev;
     if (ev.prev !== prevHash) throw new Error(`memory: hash chain broken at ${b.path}`);
     if (sha256hexOfCanon(unsigned) !== hash) throw new Error(`memory: event hash mismatch at ${b.path}`);
     prevHash = hash;
     if (ev.type === "episode") ev.content = resolveContent(gd, ev);
     events.push(ev);
   }
+  // Phase 2: signature epoch rules over the whole chain (throws loudly
+  // on a missing post-epoch signature or a bad one). Pre-epoch events
+  // are unsigned-legacy and pass; see lib/memory-signing.mjs.
+  verifyEventSignatures(events);
   return { tip, events };
 }
 
@@ -175,6 +189,10 @@ export function readEvents(dir, owner, repo) {
 
 function appendEvent(dir, owner, repo, build) {
   const gd = requireRepo(dir, owner, repo);
+  // Phase 2: every write is signed by the state dir's memory key
+  // (generated on first use). A write that cannot sign fails here,
+  // loudly — never lands unsigned past the signing epoch.
+  const signKey = loadOrCreateMemoryKey(dir);
   let lastError = null;
   for (let attempt = 0; attempt < MAX_APPEND_RETRIES; attempt++) {
     const { tip, events } = readEvents(dir, owner, repo);
@@ -182,6 +200,10 @@ function appendEvent(dir, owner, repo, build) {
     const prevHash = seq ? events[seq - 1].hash : "GENESIS";
     const ev = build(seq, prevHash);
     if (!EVENT_TYPES.has(ev.type)) throw new Error(`memory: bad event type ${ev.type}`);
+    // Signer identity is part of the hashed body; the signature over
+    // the final hash is attached after the hash settles (below).
+    ev.signer = signKey.signer;
+    ev.signerKey = signKey.pubSpkiB64;
     ev.hash = sha256hexOfCanon(ev);
 
     const tmp = mkdtempSync(join(tmpdir(), "kiln-mem-idx-"));
@@ -197,9 +219,13 @@ function appendEvent(dir, owner, repo, build) {
         ev.contentBlob = { oid, size: ev.content.length, sha256: sha256hex(ev.content) };
         delete ev.content;
         // The hash must cover the final stored shape — recompute.
-        const { hash, ...unsigned } = ev;
+        const { hash, sig, ...unsigned } = ev;
         ev.hash = sha256hexOfCanon(unsigned);
       }
+
+      // Sign the final hash (receipts-style: the signature is over
+      // the hash hex string, verifiable from the event alone).
+      ev.sig = signKey.signText(ev.hash);
 
       const evOid = git(gd, ["hash-object", "-w", "--stdin"], { input: canon(ev) }).trim();
       const name = `events/${String(seq).padStart(8, "0")}-${ev.id}.json`;
@@ -583,6 +609,12 @@ export function memoryStats(dir, owner, repo) {
     },
     links: state.links.length,
     coreBlocks: state.core.map((c) => c.label),
+    signing: {
+      // The state dir's current write key (null until the first
+      // signed write creates it — reads never create it).
+      currentSigner: (loadMemoryKey(dir) || {}).signer || null,
+      ...signatureSummary(state.events),
+    },
     bytes,
     oldestTs: state.events.length ? state.events[0].ts : null,
     newestTs: state.events.length ? state.events[state.events.length - 1].ts : null,
@@ -594,7 +626,7 @@ export function memoryStats(dir, owner, repo) {
 export function verifyMemory(dir, owner, repo) {
   const gd = requireRepo(dir, owner, repo);
   const tip = memoryTip(gd);
-  if (!tip) return { ok: true, events: 0, commits: 0, tip: null };
+  if (!tip) return { ok: true, events: 0, commits: 0, tip: null, signatures: signatureSummary([]) };
   const lines = git(gd, ["rev-list", "--parents", "--reverse", tip]).trim().split("\n").filter(Boolean);
   let prevCommit = null;
   for (const line of lines) {
@@ -617,7 +649,13 @@ export function verifyMemory(dir, owner, repo) {
   for (let i = 0; i < state.events.length; i++) {
     if (state.events[i].seq !== i) return { ok: false, error: `event seq gap at ${i}` };
   }
-  return { ok: true, events: state.events.length, commits: lines.length, tip };
+  // Signatures were already enforced by loadMemory -> readEvents
+  // (a bad or post-epoch-missing signature threw above and became
+  // ok:false); the summary reports the chain's signing posture.
+  return {
+    ok: true, events: state.events.length, commits: lines.length, tip,
+    signatures: signatureSummary(state.events),
+  };
 }
 
 // ---------------------------------------------------------------- retrieval (BM25 + recency + salience + links)

@@ -178,6 +178,10 @@ export class SwarmClient {
   async memoryVerify(owner, repo) {
     return this._req("POST", `${this._memBase(owner, repo)}/verify`);
   }
+  /** Phase 2: the state dir's memory signing pubkey + this repo's signature posture. */
+  async memoryPubkey(owner, repo) {
+    return this._req("GET", `${this._memBase(owner, repo)}/pubkey`);
+  }
 
   // ---- receipts ----
   async verifyReceipts(node) {

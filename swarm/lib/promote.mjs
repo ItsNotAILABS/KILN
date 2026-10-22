@@ -60,6 +60,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { repoPath, repoExists } from "./git.mjs";
+import { verifyEventChain } from "./memory-signing.mjs";
 
 const execFileP = promisify(execFile);
 const API = "https://api.github.com";
@@ -194,6 +195,9 @@ export async function diffEntries(bare, parentRef, sha) {
  * no refs/kiln/memory. Pure git plumbing — unit-testable without
  * GitHub. An unparseable commit subject is a LOUD PromoteError: the
  * chain's subjects are its index, and guessing would corrupt replay.
+ * The parsed events are also fully verified (hash chain + phase-2
+ * signatures) before the list is returned — replay never carries a
+ * chain that does not authenticate.
  */
 export async function listMemoryCommits(bare) {
   let tip;
@@ -204,6 +208,7 @@ export async function listMemoryCommits(bare) {
   }
   const shas = (await gitText(bare, ["rev-list", "--reverse", tip])).split("\n").filter(Boolean);
   const out = [];
+  const parsedEvents = [];
   for (const sha of shas) {
     const parentsLine = await gitText(bare, ["rev-list", "--parents", "-1", sha]);
     const parts = parentsLine.split(/\s+/).filter(Boolean);
@@ -228,12 +233,24 @@ export async function listMemoryCommits(bare) {
         throw new PromoteError("git", `memory event ${added.path} in ${sha.slice(0, 12)} is not valid JSON`);
       }
       contentBlobOid = ev.contentBlob?.oid ?? null;
+      parsedEvents.push(ev);
     }
     out.push({
       sha, parent, id: m[2], type: m[1], message,
       author: { name: aName, email: aEmail, date: aDate },
       contentBlobOid,
     });
+  }
+  // Phase 2: never replay a chain that does not authenticate. The
+  // full walk (prev linkage, hash recompute, signature epoch rules)
+  // runs over the parsed events; a tampered event — body edited, hash
+  // recomputed but signature stale, signature stripped after the
+  // epoch — is a LOUD refusal here, before anything is uploaded.
+  // Pre-epoch events are unsigned-legacy and replay as before.
+  try {
+    verifyEventChain(parsedEvents);
+  } catch (e) {
+    throw new PromoteError("memory_verify", `memory chain of ${bare} failed verification: ${e.message}`);
   }
   return out;
 }

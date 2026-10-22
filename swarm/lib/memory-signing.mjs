@@ -34,10 +34,9 @@
  * names and carries its own signer key, so old events still verify).
  * The chain is the record of which keys signed what.
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { createPublicKey, verify } from "node:crypto";
-import { writeFileAtomicSync } from "./state.mjs";
 import { sha256hex, sha256hexOfCanon } from "./canon.mjs";
 import { newKeypair, loadKeypair } from "./keys.mjs";
 
@@ -102,7 +101,8 @@ export function loadOrCreateMemoryKey(dir) {
     privPkcs8B64: kp.privPkcs8B64,
     createdAt: new Date().toISOString(),
   };
-  writeFileAtomicSync(path, JSON.stringify(stored, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(path, JSON.stringify(stored, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(path, 0o600); // mode at create is umask-filtered; make it exact
   const handle = handleFromStored(stored);
   keyCache.set(dir, handle);
   return handle;

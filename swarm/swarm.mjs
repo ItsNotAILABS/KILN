@@ -50,6 +50,7 @@ import {
   proposeMemory, resolveProposal,
   loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory,
 } from "./lib/memory.mjs";
+import { memorySigningPubkey, signatureSummary } from "./lib/memory-signing.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
@@ -681,8 +682,15 @@ async function cmdMemory(args) {
     const v = verifyMemory(dir, owner, repo);
     console.log(JSON.stringify(v, null, 2));
     if (!v.ok) process.exit(1);
+  } else if (sub === "pubkey") {
+    // Phase 2 discovery: the state dir's memory signing key (public
+    // half only — the private key never leaves <dir>/memory-signing.key)
+    // plus this repo's signature posture. Creates the key on first use.
+    const pub = memorySigningPubkey(dir, { create: true });
+    const st = loadMemory(dir, owner, repo);
+    console.log(JSON.stringify({ ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) }, null, 2));
   } else {
-    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]");
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify|pubkey|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]");
     process.exit(2);
   }
 }
