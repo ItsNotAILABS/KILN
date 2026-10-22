@@ -20,10 +20,23 @@
 // while VIVAX logged "pulsus ok · Medicus exhausted=true". Rule now:
 //   foreign-alive ∧ Medicus still has budget → stand down (its budget
 //     runs first, exactly like the down case).
-//   foreign-alive ∧ recoveryExhausted latched → hand-back: the SAME
-//     proven latch-clear act. The Medicus's recovery authority then
-//     restarts the fenced Daemon under supervision or re-stamps the fence
-//     onto it — VIVAX never starts or stops the Daemon directly, ever.
+//   foreign-alive ∧ recoveryExhausted latched → hand-back (below).
+//     VIVAX never starts or stops the Daemon directly, ever.
+//
+// Hand-back mechanism (corrected 2026-10-18, after the first live fence
+// act FAILED verify-timeout on death 1725|2026-10-17T22:06:26.489Z):
+// the Medicus has NO adopt path — it stamps the fence only after its own
+// recovery, and its watchdog recovery cannot displace a live foreign
+// Daemon (8/8 attempts FAILED "fenced" on 2026-10-17, 22:10–22:52Z).
+// The original act also nulled expectedBootId, after which the restarted
+// Medicus saw an un-fenced healthy Daemon and stood down forever — the
+// re-stamp the charter contemplates (mode=adopted) had no implementation.
+// So in fence mode the act itself performs the re-stamp: clear ONLY the
+// exhaustion latch and set expectedBootId/expectedStartId to the live
+// Daemon — after verifying, with the Medicus's own pidIsDaemon test plus
+// the token health check, that the live process is genuinely this dir's
+// swarm Daemon. If the Daemon dies mid-act instead, the restarted
+// Medicus boots its own and the same verify reports mode=restarted.
 //
 // Nomina: VIVAX protocol · Medicus = doctor · its agents Vigil (watcher),
 // Examinator (coroner), Inquisitor (detective), Sanator (medic) ·
@@ -49,6 +62,7 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
+import { pidIsDaemon } from './lib/state.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const KILN = process.env.KILN_SWARM_DIR || join(homedir(), '.kiln-swarm');
@@ -80,6 +94,35 @@ export function decideVivax(s) {
   if (!s.medicusReadable) return { action: 'fail', reason: 'medicus-state-unreadable', foreign };
   if (!s.exhausted) return { action: 'stand-down', reason: 'medicus-recovering', foreign };
   return { action: 'act-down', reason: 'stay-alive', foreign };
+}
+
+// ------------------------------------------------------- latch-clear plan
+// Pure: the Medicus state the act writes, by mode. Unit-tested in
+// test/vivax.test.mjs. Down mode is the original proven field set — the
+// fence is nulled because the Medicus will boot a fresh Daemon and stamp
+// it. Fence mode clears ONLY the exhaustion latch and re-stamps the fence
+// onto the verified live Daemon (the hand-back's adopted branch): the
+// Medicus stamps only after a recovery it cannot perform against a live
+// Daemon, and a nulled fence makes it stand down forever (2026-10-17).
+/**
+ * @param {object} medicus  current Medicus state (not mutated)
+ * @param {'down'|'fence'} mode
+ * @param {?{bootId:string, startId:?string}} liveIdentity  fence mode only
+ */
+export function planLatchClear(medicus, mode, liveIdentity) {
+  const cleared = { ...medicus };
+  cleared.recoveryExhausted = false;
+  cleared.recoveryAttempts = 0;
+  cleared.nextRecoveryRetryTs = 0;
+  delete cleared.recoveryExhaustedTs;
+  if (mode === 'fence') {
+    cleared.expectedBootId = liveIdentity.bootId;
+    cleared.expectedStartId = liveIdentity.startId ?? null;
+  } else {
+    cleared.expectedBootId = null;
+    cleared.expectedStartId = null;
+  }
+  return cleared;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -128,8 +171,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------- the act
 // The one proven act, shared by the down case and the fence hand-back:
-// Medicus stop → timestamped state backup → clear exactly the latch fields
-// → Medicus start → verify health ∧ fence == live bootId ∧ :8901 answers.
+// Medicus stop → timestamped state backup → write the planned latch state
+// (planLatchClear — down mode nulls the fence, fence mode re-stamps it
+// onto the identity-verified live Daemon) → Medicus start → verify health
+// ∧ fence == live bootId ∧ :8901 answers.
 // VIVAX never starts or stops the Daemon itself.
 async function act({ dedupeKey, deathId, mode, foreignBootId }) {
   const vstate = readJson(VSTATE) || { actions: {} };
@@ -137,6 +182,27 @@ async function act({ dedupeKey, deathId, mode, foreignBootId }) {
   if (vstate.actions[dedupeKey]) {
     log(`‼ FAILED death=${deathId} reason=already-acted outcome=${vstate.actions[dedupeKey].outcome} — VIVAX acted on ${dedupeKey} once and will not loop. Manual attention required.`);
     emit(`VIVAX FAILED death=${deathId} reason=already-acted outcome=${vstate.actions[dedupeKey].outcome}`, 2);
+  }
+
+  // Fence mode only — verify the foreign Daemon before touching anything:
+  // it must still be the same boot, still healthy under the API token, and
+  // provably this dir's swarm Daemon (the Medicus's own pidIsDaemon test).
+  // Stamping the fence onto anything less is adopting a stranger. Aborts
+  // here stop no Medicus, edit no state, and record no dedupe — the next
+  // cycle sees the world as it then is (a gone Daemon takes the down path).
+  let liveIdentity = null;
+  if (mode === 'fence') {
+    const dj = readJson(DAEMON_JSON);
+    const healthyNow = await daemonHealth();
+    if (!healthyNow || !dj?.bootId || dj.bootId !== foreignBootId) {
+      log(`‼ FAILED death=${deathId} reason=foreign-daemon-gone — live Daemon no longer matches the foreign boot ${foreignBootId}; no state edited.`);
+      emit(`VIVAX FAILED death=${deathId} reason=foreign-daemon-gone`, 2);
+    }
+    if (!dj.pid || !pidIsDaemon(dj.pid, KILN)) {
+      log(`‼ FAILED death=${deathId} reason=foreign-identity-unverified — pid ${dj.pid || '-'} is not verifiably the swarm Daemon for ${KILN}; refusing to stamp the fence. No state edited.`);
+      emit(`VIVAX FAILED death=${deathId} reason=foreign-identity-unverified`, 2);
+    }
+    liveIdentity = { bootId: dj.bootId, startId: dj.startId ?? null };
   }
 
   log(`ACTING death=${deathId} mode=${mode} — clearing the Medicus exhaustion latch (VIVAX protocol, standing directive).`);
@@ -162,19 +228,17 @@ async function act({ dedupeKey, deathId, mode, foreignBootId }) {
     emit(`VIVAX FAILED death=${deathId} reason=backup-failed`, 2);
   }
 
-  // c · Clear the latch — exactly the proven field set, nothing else.
-  const cleared = { ...medicus };
-  cleared.recoveryExhausted = false;
-  cleared.recoveryAttempts = 0;
-  cleared.nextRecoveryRetryTs = 0;
-  cleared.expectedBootId = null;
-  cleared.expectedStartId = null;
-  delete cleared.recoveryExhaustedTs;
+  // c · Write the planned latch state — exactly planLatchClear's field
+  // set, nothing else (down mode nulls the fence; fence mode re-stamps
+  // it onto the verified live Daemon — see the header's hand-back note).
+  const cleared = planLatchClear(medicus, mode, liveIdentity);
   try {
     const tmp = `${MEDICUS_STATE}.vivax-tmp`;
     writeFileSync(tmp, JSON.stringify(cleared, null, 2) + '\n');
     renameSync(tmp, MEDICUS_STATE);
-    log('Latch cleared: recoveryExhausted=false recoveryAttempts=0 nextRecoveryRetryTs=0 expectedBootId=null expectedStartId=null');
+    log(mode === 'fence'
+      ? `Latch cleared + fence re-stamped: recoveryExhausted=false recoveryAttempts=0 nextRecoveryRetryTs=0 expectedBootId=${cleared.expectedBootId} expectedStartId=${cleared.expectedStartId}`
+      : 'Latch cleared: recoveryExhausted=false recoveryAttempts=0 nextRecoveryRetryTs=0 expectedBootId=null expectedStartId=null');
   } catch (e) {
     log(`‼ FAILED death=${deathId} reason=state-edit-failed ${e.message}`);
     emit(`VIVAX FAILED death=${deathId} reason=state-edit-failed`, 2);
