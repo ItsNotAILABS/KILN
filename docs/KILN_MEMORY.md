@@ -2,8 +2,8 @@
 
 **Status:** v1 merged to main (`e45c69f`) and live since 2026-10-14 —
 library + HTTP API + client SDK + CLI. Phase 1 (FTS5 index sidecar)
-built 2026-10-17; phase 2 (signed events) built 2026-10-22: see
-"Phases after v1" below.
+built 2026-10-17; phase 2 (signed events) and phase 3 (vector recall
+tier) built 2026-10-22: see "Phases after v1" below.
 
 ## The one-sentence version
 
@@ -110,7 +110,17 @@ BM25** (pure JS, no dependencies — the swarm's standing rule), then:
   hit is pulled in with a score bonus and a `via: "link:<relation>:<id>"`
   marker, so every ranking decision is explainable;
 - filters by kind, tags, and time window; facts can be queried as of
-  any date.
+  any date;
+- **fuses the phase-3 vector tier** into the same ranking: each doc's
+  cosine similarity to the query vector is blended with its
+  normalized lexical score (weight 0.35), and eligible docs the
+  lexical pass missed can enter as `via: "vector"` hits. A fused
+  result keeps its lexical `engine` and names the tier in a `fusion`
+  block (embedder id, dimension, weight, signal label); docs carry
+  their raw cosine as `vectorScore`. The tier never widens
+  eligibility — its candidate universe is the same kinds /
+  since / until / tags / `factsAt()` rules, computed from the
+  replayed, signature-verified state.
 
 `buildContext({query?, budgetTokens})` assembles the pack an agent
 actually receives: **core blocks first (always), then facts, then
@@ -171,10 +181,15 @@ library, and with a hash-intact but signature-stale event).
   events per repo; the scale phase adds a rebuildable index sidecar
   (SQLite FTS5 under the state dir, derived from the ref, never the
   source of truth) — the Loom/dakai-`loom` pattern.
-- **Retrieval is lexical**, not semantic. No embeddings yet: rather
-  honest BM25 than fake "AI search". The embedding phase plugs a
-  vector column into the same ranking (Loom's persisted-embedding
-  pattern) behind the same `recall` API.
+- **Retrieval is lexical at its core** — BM25 plus, since phase 3, a
+  persisted-vector tier whose default embedder is deterministic
+  feature hashing (shared tokens + character n-grams). That is a
+  lexical signal wearing a vector's clothes: it bridges morphology
+  ("invoice" ↔ "invoices"), it does **not** know synonyms or meaning,
+  and it is never presented as semantic search — every fused result
+  names the embedder and labels the signal. A real local neural
+  embedder remains future work behind the same interface (phase 3
+  notes below); rather an honest hashing tier than fake "AI search".
 - **Events are hash-chained and signed** (phase 2, above) — but the
   signature proves *which installation's memory key wrote the
   event*, not which human or agent drove it: `actor` stays a
@@ -240,9 +255,35 @@ library, and with a hash-intact but signature-stale event).
    binding, stale-signature tamper with an intact hash chain,
    post-epoch unsigned rejection, legacy readability + epoch opening,
    promote replay rejection, loose-key-permissions refusal).
-3. **Embeddings** — optional persisted vectors per event (local model
-   first), fused into recall ranking (semantic + BM25 + graph +
-   temporal, Mem0-style multi-signal fusion).
+3. **Embeddings** — ✅ BUILT 2026-10-22 (`lib/memory-vectors.mjs`).
+   Persisted vector per recallable doc in the same sidecar as the
+   FTS5 index (table `vectors`), synced only through the
+   signature-verified read path — a chain phase 2 rejects is never
+   embedded, and eligibility for vector additions mirrors `factsAt()`
+   + the episode filters exactly (pinned by parity tests, including a
+   forged-chain rejection). Fusion is Mem0-style multi-signal: the
+   lexical ranking (BM25 + salience + recency + graph) is blended
+   with cosine similarity at weight 0.35, vector-only hits enter
+   marked `via: "vector"`, and results carry a `fusion` provenance
+   block; `memoryStats` reports the tier under `vectors`.
+   `KILN_MEMORY_VECTORS=off` disables it; any tier error falls back
+   to the untouched lexical result, phase-1 style.
+   **The embedder, honestly:** the spec said "local model first" —
+   there is no local neural embedder in this ecosystem to wire.
+   MatDaemon's `matdaemon_embed_text` was checked first: it is
+   itself a deterministic signed hashing trick (its docs call it
+   lexical), and it lives behind a Python service the
+   zero-dependency swarm runtime cannot take as a dependency. So
+   the default embedder `hashing-v1` implements that same technique
+   in-process — signed feature hashing over the library's tokens +
+   character trigrams, 256-dim, deterministic, no calls, no keys.
+   It is a **placeholder-tier lexical signal, not semantic search**:
+   no synonyms, no meaning, and the code, the stats output, and
+   every fused result say so. The swap path is real, though:
+   embedders register by id (`registerEmbedder`), selection is
+   `KILN_MEMORY_EMBEDDER=<id>`, vectors are stamped with their
+   embedder id, and an id change re-embeds the corpus — a future
+   local neural embedder takes over without touching recall.
 4. **Consolidation proposals** — ✅ BUILT 2026-10-17. A consolidation
    pass reads new episodes and *proposes* facts/links/core edits; a
    human or the acting agent ratifies. Proposals are events too

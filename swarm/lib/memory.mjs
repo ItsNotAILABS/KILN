@@ -47,7 +47,11 @@
  *     lib/memory-index.mjs (phase 1) whenever it is available, with
  *     this replay as the fallback and the auditor.
  *   - Retrieval is lexical BM25 + recency + salience + 1-hop link
- *     expansion. No embeddings yet — no fake semantic search.
+ *     expansion, fused (phase 3, lib/memory-vectors.mjs) with a
+ *     persisted vector tier whose default embedder is deterministic
+ *     feature hashing — a lexical signal (shared tokens + character
+ *     n-grams), NOT semantic search. No fake "AI search": the tier
+ *     names its embedder in every fused result.
  *   - Events are hash-chained AND signed (phase 2, lib/memory-signing.mjs):
  *     every append carries an Ed25519 signature by the state dir's
  *     memory key, verified on every read. History written before
@@ -63,6 +67,7 @@ import { randomBytes } from "node:crypto";
 import { canon, sha256hex, sha256hexOfCanon } from "./canon.mjs";
 import { repoPath, repoExists } from "./git.mjs";
 import { recallIndexed, memoryIndexInfo } from "./memory-index.mjs";
+import { fuseRecallVectors, memoryVectorsInfo } from "./memory-vectors.mjs";
 import {
   loadOrCreateMemoryKey, loadMemoryKey, verifyEventSignatures, signatureSummary,
 } from "./memory-signing.mjs";
@@ -619,6 +624,7 @@ export function memoryStats(dir, owner, repo) {
     oldestTs: state.events.length ? state.events[0].ts : null,
     newestTs: state.events.length ? state.events[state.events.length - 1].ts : null,
     index: memoryIndexInfo(dir, owner, repo),
+    vectors: memoryVectorsInfo(dir, owner, repo),
   };
 }
 
@@ -681,19 +687,33 @@ function estimateTokens(text) {
  *
  * Served by the FTS5 sidecar (lib/memory-index.mjs) whenever it is
  * available; the full-replay scan below is the fallback and auditor.
- * The result names its engine: "index" or "scan".
+ * The result names its engine: "index" or "scan". When the phase-3
+ * vector tier (lib/memory-vectors.mjs) is enabled it fuses cosine
+ * similarity into the ranking and adds a `fusion` provenance block;
+ * any tier failure serves the lexical result untouched.
  */
 export function recall(dir, owner, repo, query, opts = {}) {
   const asOfSec = opts.asOf ? isoToSec(opts.asOf, "asOf") : Math.floor(Date.now() / 1000);
+  const pre = {
+    asOfSec,
+    sinceSec: opts.since ? isoToSec(opts.since, "since") : null,
+    untilSec: opts.until ? isoToSec(opts.until, "until") : null,
+  };
+  let base = null;
   try {
-    const r = recallIndexed(dir, owner, repo, query, opts, {
-      asOfSec,
-      sinceSec: opts.since ? isoToSec(opts.since, "since") : null,
-      untilSec: opts.until ? isoToSec(opts.until, "until") : null,
-    });
-    if (r) return r;
+    base = recallIndexed(dir, owner, repo, query, opts, pre);
   } catch { /* sidecar unavailable or stale — the scan decides (and throws what it must) */ }
-  return recallScan(dir, owner, repo, query, opts, asOfSec);
+  if (!base) base = recallScan(dir, owner, repo, query, opts, asOfSec);
+  // Phase 3: fuse the vector tier (lib/memory-vectors.mjs) into the
+  // lexical ranking. Any tier failure serves the base result
+  // untouched — including the chain-integrity errors the sync's
+  // verified read raises, which the scan above has already enforced
+  // identically by the time we get here.
+  try {
+    const fused = fuseRecallVectors(dir, owner, repo, query, opts, pre, base);
+    if (fused) return fused;
+  } catch { /* vector tier unavailable — the lexical result stands */ }
+  return base;
 }
 
 function recallScan(dir, owner, repo, query, opts = {}, asOf) {
