@@ -21,11 +21,11 @@
 import { spawn } from "node:child_process";
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync,
-  mkdtempSync, rmSync, statSync, createWriteStream, openSync, closeSync,
+  mkdtempSync, rmSync, statSync, statfsSync, readdirSync,
+  createWriteStream, openSync, closeSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
 import {
   ciDir, loadRepoConfig, parseSuiteResults, writeResult, readResult,
   readRunnerLock, runnerLockPath,
@@ -36,6 +36,44 @@ import { repoPath } from "./git.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STALE_LOCK_MS = 30 * 60 * 1000;
 const LOG_TAIL_LINES = 120;
+
+/**
+ * Scratch space for CI jobs — deliberately NOT os.tmpdir(). On the
+ * swarm host /tmp is a 512MB tmpfs, while one Minutely job needs >2GB
+ * (app node_modules alone is 1.8GB): every app-battery run died there
+ * of ENOSPC, and npm demotes tar-extraction ENOSPC to warnings, so the
+ * run only failed downstream (esbuild's postinstall could not find
+ * @esbuild/linux-x64; check suites failed at load on a partial tree).
+ * The state dir lives on the data disk beside the bare repos and the
+ * results, so scratch goes there too. KILN_CI_TMPDIR overrides.
+ */
+const SCRATCH_REAP_MS = 2 * 60 * 60 * 1000;
+
+function scratchBase(dir) {
+  const base = process.env.KILN_CI_TMPDIR || join(ciDir(dir), "tmp");
+  mkdirSync(base, { recursive: true });
+  return base;
+}
+
+/**
+ * Remove scratch left behind by a runner that was killed mid-job. The
+ * runner lock guarantees a single live drainer, so anything older
+ * than SCRATCH_REAP_MS cannot belong to a live job. Best-effort:
+ * maintenance must never fail a drain.
+ */
+function reapScratch(base) {
+  try {
+    for (const name of readdirSync(base)) {
+      if (!name.startsWith("kiln-ci-")) continue;
+      const p = join(base, name);
+      try {
+        if (Date.now() - statSync(p).mtimeMs > SCRATCH_REAP_MS) {
+          rmSync(p, { recursive: true, force: true });
+        }
+      } catch { /* one bad entry must not stop the reap */ }
+    }
+  } catch { /* scratch maintenance is best-effort */ }
+}
 
 function log(...a) {
   console.log(`[ci-runner ${new Date().toISOString()}]`, ...a);
@@ -103,9 +141,11 @@ function writeQueue(dir, jobs) {
  * it beside the result), so a failure is diagnosable from more
  * than its last 120 lines.
  */
-function runCmd(argv, cwd, timeoutMs, logStream = null) {
+function runCmd(argv, cwd, timeoutMs, logStream = null, env = null) {
   return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(argv[0], argv.slice(1), {
+      cwd, stdio: ["ignore", "pipe", "pipe"], ...(env ? { env } : {}),
+    });
     let out = "";
     // SUITE_RESULT verdict lines are collected line-buffered, independent
     // of the 200KB in-memory tail cap, and land in the result doc's
@@ -156,14 +196,27 @@ async function runJob(dir, job) {
   if (!cfg || !cfg.command) {
     return { status: "skipped", reason: "no CI config for repo" };
   }
-  const work = mkdtempSync(join(tmpdir(), "kiln-ci-"));
+  const scratch = scratchBase(dir);
+  const work = mkdtempSync(join(scratch, "kiln-ci-"));
   // The run's full transcript (clone + checkout + test command) streams
   // here — OUTSIDE the work dir, which is deleted below. writeResult
   // stores it beside the result JSON as the retained full log.
-  const logFile = join(tmpdir(), `kiln-ci-log-${job.id}.log`);
+  const logFile = join(scratch, `kiln-ci-log-${job.id}.log`);
   const logStream = createWriteStream(logFile, { flags: "w" });
   logStream.on("error", () => { /* a lost log must not fail the run */ });
   const section = (s) => { try { logStream.write(`\n[kiln-ci] $ ${s}\n`); } catch {} };
+  // Children inherit TMPDIR=scratch: their own temp files (npm's
+  // fallback downloads, check scripts' temp dirs) must not land on
+  // the same small system tmpfs the workdir just escaped.
+  const jobEnv = { ...process.env, TMPDIR: scratch };
+  // Name the scratch space + its headroom in the transcript, so a
+  // future space failure is diagnosable from the retained log alone.
+  let freeNote = "";
+  try {
+    const s = statfsSync(scratch);
+    freeNote = ` (${Math.floor((s.bavail * s.bsize) / 1048576)}MB free)`;
+  } catch { /* diagnostics only — never fail a run over statfs */ }
+  section(`scratch dir ${scratch}${freeNote}`);
   const startedMs = Date.now();
   try {
     const bare = repoPath(dir, job.owner, job.repo);
@@ -173,14 +226,14 @@ async function runJob(dir, job) {
     // Clone the exact pushed SHA from the local bare repo — no network.
     section(`git clone -q ${bare} src`);
     const clone = await runCmd(
-      ["git", "clone", "-q", bare, work + "/src"], tmpdir(), 60000, logStream
+      ["git", "clone", "-q", bare, work + "/src"], scratch, 60000, logStream, jobEnv
     );
     if (clone.exitCode !== 0) {
       return { status: "error", reason: "clone failed", logTail: clone.tail, logFile, suites: [] };
     }
     const src = work + "/src";
     section(`git -C src checkout -q ${job.sha}`);
-    const co = await runCmd(["git", "-C", src, "checkout", "-q", job.sha], tmpdir(), 30000, logStream);
+    const co = await runCmd(["git", "-C", src, "checkout", "-q", job.sha], scratch, 30000, logStream, jobEnv);
     if (co.exitCode !== 0) {
       return { status: "error", reason: `checkout ${job.sha.slice(0, 12)} failed`, logTail: co.tail, logFile, suites: [] };
     }
@@ -191,7 +244,7 @@ async function runJob(dir, job) {
     );
     const timeoutMs = cfg.timeoutMs || 600000;
     section(cfg.command);
-    const r = await runCmd(argv, src, timeoutMs, logStream);
+    const r = await runCmd(argv, src, timeoutMs, logStream, jobEnv);
     const durationMs = Date.now() - startedMs;
     return {
       status: r.timedOut ? "timeout" : r.exitCode === 0 ? "pass" : "fail",
@@ -217,6 +270,7 @@ async function main() {
     log("another live runner holds the lock — not draining");
     return;
   }
+  reapScratch(scratchBase(dir));
   log(`draining queue for ${dir}`);
   for (;;) {
     const jobs = readQueue(dir);
