@@ -6,9 +6,12 @@
  *
  * Drains <stateDir>/ci/queue.jsonl: for each job, clones the bare repo at
  * the pushed SHA into a temp dir, runs the repo's configured command from
- * <stateDir>/ci/repos.json, and writes the result via lib/ci.mjs. Removes
- * the runner lock when the queue is empty. Stale locks (>30 min) are
- * reaped — a crashed runner must not wedge CI forever.
+ * <stateDir>/ci/repos.json, and writes the result via lib/ci.mjs. The
+ * run's FULL output streams to a transcript file that lib/ci.mjs stores
+ * beside the result (the result JSON still carries a 120-line tail for
+ * quick display). Removes the runner lock when the queue is empty.
+ * Stale locks (>30 min) are reaped — a crashed runner must not wedge
+ * CI forever.
  *
  * Runs detached from the API server so a slow test suite can never block
  * pushes or the daemon tick.
@@ -16,7 +19,7 @@
 import { spawn } from "node:child_process";
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync,
-  mkdtempSync, rmSync, statSync,
+  mkdtempSync, rmSync, statSync, createWriteStream,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,12 +61,23 @@ function writeQueue(dir, jobs) {
   writeFileSync(join(ciDir(dir), "queue.jsonl"), jobs.map((j) => JSON.stringify(j)).join("\n") + (jobs.length ? "\n" : ""));
 }
 
-/** Run argv in cwd with a wall-clock timeout. Resolves { exitCode, timedOut, tail }. */
-function runCmd(argv, cwd, timeoutMs) {
+/**
+ * Run argv in cwd with a wall-clock timeout. Resolves
+ * { exitCode, timedOut, tail }. The in-memory tail (last
+ * LOG_TAIL_LINES lines) is what the result JSON carries for quick
+ * display; when logStream is given, the FULL output also streams to
+ * it — that file becomes the run's retained log (lib/ci.mjs stores
+ * it beside the result), so a failure is diagnosable from more
+ * than its last 120 lines.
+ */
+function runCmd(argv, cwd, timeoutMs, logStream = null) {
   return new Promise((resolve) => {
     const child = spawn(argv[0], argv.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
-    const cap = (d) => { out += d.toString(); if (out.length > 200000) out = out.slice(-200000); };
+    const cap = (d) => {
+      if (logStream) { try { logStream.write(d); } catch { /* log loss must not fail the run */ } }
+      out += d.toString(); if (out.length > 200000) out = out.slice(-200000);
+    };
     child.stdout.on("data", cap);
     child.stderr.on("data", cap);
     let timedOut = false;
@@ -82,6 +96,7 @@ function runCmd(argv, cwd, timeoutMs) {
     });
     child.on("error", (e) => {
       clearTimeout(t);
+      if (logStream) { try { logStream.write(`spawn failed: ${e.message}\n`); } catch {} }
       resolve({ exitCode: 1, timedOut: false, tail: `spawn failed: ${e.message}` });
     });
   });
@@ -93,6 +108,13 @@ async function runJob(dir, job) {
     return { status: "skipped", reason: "no CI config for repo" };
   }
   const work = mkdtempSync(join(tmpdir(), "kiln-ci-"));
+  // The run's full transcript (clone + checkout + test command) streams
+  // here — OUTSIDE the work dir, which is deleted below. writeResult
+  // stores it beside the result JSON as the retained full log.
+  const logFile = join(tmpdir(), `kiln-ci-log-${job.id}.log`);
+  const logStream = createWriteStream(logFile, { flags: "w" });
+  logStream.on("error", () => { /* a lost log must not fail the run */ });
+  const section = (s) => { try { logStream.write(`\n[kiln-ci] $ ${s}\n`); } catch {} };
   const startedMs = Date.now();
   try {
     const bare = repoPath(dir, job.owner, job.repo);
@@ -100,16 +122,18 @@ async function runJob(dir, job) {
       return { status: "error", reason: "repo vanished mid-queue" };
     }
     // Clone the exact pushed SHA from the local bare repo — no network.
+    section(`git clone -q ${bare} src`);
     const clone = await runCmd(
-      ["git", "clone", "-q", bare, work + "/src"], tmpdir(), 60000
+      ["git", "clone", "-q", bare, work + "/src"], tmpdir(), 60000, logStream
     );
     if (clone.exitCode !== 0) {
-      return { status: "error", reason: "clone failed", logTail: clone.tail };
+      return { status: "error", reason: "clone failed", logTail: clone.tail, logFile };
     }
     const src = work + "/src";
-    const co = await runCmd(["git", "-C", src, "checkout", "-q", job.sha], tmpdir(), 30000);
+    section(`git -C src checkout -q ${job.sha}`);
+    const co = await runCmd(["git", "-C", src, "checkout", "-q", job.sha], tmpdir(), 30000, logStream);
     if (co.exitCode !== 0) {
-      return { status: "error", reason: `checkout ${job.sha.slice(0, 12)} failed`, logTail: co.tail };
+      return { status: "error", reason: `checkout ${job.sha.slice(0, 12)} failed`, logTail: co.tail, logFile };
     }
     // argv-split the configured command (no shell — the operator wrote it,
     // but shell interpolation would still be a footgun).
@@ -117,7 +141,8 @@ async function runJob(dir, job) {
       s.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1")
     );
     const timeoutMs = cfg.timeoutMs || 600000;
-    const r = await runCmd(argv, src, timeoutMs);
+    section(cfg.command);
+    const r = await runCmd(argv, src, timeoutMs, logStream);
     const durationMs = Date.now() - startedMs;
     return {
       status: r.timedOut ? "timeout" : r.exitCode === 0 ? "pass" : "fail",
@@ -126,8 +151,10 @@ async function runJob(dir, job) {
       durationMs,
       command: cfg.command,
       logTail: r.tail,
+      logFile,
     };
   } finally {
+    await new Promise((res) => logStream.end(res));
     try { rmSync(work, { recursive: true, force: true }); } catch {}
   }
 }
@@ -150,7 +177,9 @@ async function main() {
       result = { status: "error", reason: `runner exception: ${e.message}` };
     }
     try {
-      writeResult(dir, job, result);
+      const doc = writeResult(dir, job, result);
+      // The temp transcript has been stored beside the result; drop it.
+      if (doc?.log && result.logFile) { try { unlinkSync(result.logFile); } catch {} }
     } catch (e) {
       log(`result write failed: ${e.message}`);
     }

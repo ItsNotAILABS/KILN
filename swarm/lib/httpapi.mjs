@@ -85,7 +85,7 @@ import {
 } from "./memory.mjs";
 import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
 import {
-  snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
+  snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest, readLog,
 } from "./ci.mjs";
 import {
   ComputeError, submitInvocation, getInvocation, waitInvocation,
@@ -219,12 +219,24 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, { repos: listRepos(dir) });
       }
       // CI status, GitHub commit-status style — public, like clone/fetch.
+      // ci/log/:sha serves the run's retained FULL log as text/plain
+      // (the status doc's logTail is only the last 120 lines).
       {
-        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/ci\/(status|latest)(?:\/([0-9a-f]{4,40}))?$/);
+        const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/ci\/(status|latest|log)(?:\/([0-9a-f]{4,40}))?$/);
         if (req.method === "GET" && m) {
           const owner = m[1], repo = m[2], which = m[3], sha = m[4] || null;
           if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
             return send(res, 404, { error: "no such repo" });
+          }
+          if (which === "log") {
+            const text = sha ? readLog(dir, owner, repo, sha) : null;
+            if (text === null) return send(res, 404, { error: "no CI log" });
+            res.writeHead(200, {
+              "content-type": "text/plain; charset=utf-8",
+              "content-length": Buffer.byteLength(text),
+            });
+            res.end(text);
+            return;
           }
           const doc = which === "status"
             ? (sha ? readResult(dir, owner, repo, sha) : null)
