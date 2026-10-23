@@ -24,7 +24,7 @@ import {
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { ciDir, loadRepoConfig, writeResult } from "./ci.mjs";
+import { ciDir, loadRepoConfig, parseSuiteResults, writeResult } from "./ci.mjs";
 import { repoPath } from "./git.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -74,9 +74,22 @@ function runCmd(argv, cwd, timeoutMs, logStream = null) {
   return new Promise((resolve) => {
     const child = spawn(argv[0], argv.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
+    // SUITE_RESULT verdict lines are collected line-buffered, independent
+    // of the 200KB in-memory tail cap, and land in the result doc's
+    // `suites` array (see parseSuiteResults in lib/ci.mjs).
+    let pendingLine = "";
+    const suites = [];
+    const collectSuites = (text, flush = false) => {
+      pendingLine += text;
+      const lines = pendingLine.split("\n");
+      pendingLine = flush ? "" : lines.pop();
+      for (const line of lines) suites.push(...parseSuiteResults(line));
+    };
     const cap = (d) => {
       if (logStream) { try { logStream.write(d); } catch { /* log loss must not fail the run */ } }
-      out += d.toString(); if (out.length > 200000) out = out.slice(-200000);
+      const text = d.toString();
+      collectSuites(text);
+      out += text; if (out.length > 200000) out = out.slice(-200000);
     };
     child.stdout.on("data", cap);
     child.stderr.on("data", cap);
@@ -87,17 +100,20 @@ function runCmd(argv, cwd, timeoutMs, logStream = null) {
     }, timeoutMs);
     child.on("close", (code) => {
       clearTimeout(t);
+      collectSuites("", true);
       const lines = out.split("\n");
       resolve({
         exitCode: code ?? 1,
         timedOut,
         tail: lines.slice(-LOG_TAIL_LINES).join("\n"),
+        suites,
       });
     });
     child.on("error", (e) => {
       clearTimeout(t);
+      collectSuites("", true);
       if (logStream) { try { logStream.write(`spawn failed: ${e.message}\n`); } catch {} }
-      resolve({ exitCode: 1, timedOut: false, tail: `spawn failed: ${e.message}` });
+      resolve({ exitCode: 1, timedOut: false, tail: `spawn failed: ${e.message}`, suites });
     });
   });
 }
@@ -127,13 +143,13 @@ async function runJob(dir, job) {
       ["git", "clone", "-q", bare, work + "/src"], tmpdir(), 60000, logStream
     );
     if (clone.exitCode !== 0) {
-      return { status: "error", reason: "clone failed", logTail: clone.tail, logFile };
+      return { status: "error", reason: "clone failed", logTail: clone.tail, logFile, suites: [] };
     }
     const src = work + "/src";
     section(`git -C src checkout -q ${job.sha}`);
     const co = await runCmd(["git", "-C", src, "checkout", "-q", job.sha], tmpdir(), 30000, logStream);
     if (co.exitCode !== 0) {
-      return { status: "error", reason: `checkout ${job.sha.slice(0, 12)} failed`, logTail: co.tail, logFile };
+      return { status: "error", reason: `checkout ${job.sha.slice(0, 12)} failed`, logTail: co.tail, logFile, suites: [] };
     }
     // argv-split the configured command (no shell — the operator wrote it,
     // but shell interpolation would still be a footgun).
@@ -152,6 +168,7 @@ async function runJob(dir, job) {
       command: cfg.command,
       logTail: r.tail,
       logFile,
+      suites: r.suites,
     };
   } finally {
     await new Promise((res) => logStream.end(res));

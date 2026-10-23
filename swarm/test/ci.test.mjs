@@ -14,7 +14,7 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeStateDir } from "./helpers.mjs";
@@ -70,10 +70,15 @@ describe("kiln CI", () => {
     });
     assert.equal(res.status, 201);
 
-    // Enroll it in CI with a fast always-pass command.
+    // Enroll it in CI with a fast always-pass command that emits more
+    // lines than the 120-line logTail (proving FULL log retention) plus
+    // two SUITE_RESULT verdict lines (proving per-suite persistence).
     mkdirSync(join(dir, "ci"), { recursive: true });
     writeFileSync(join(dir, "ci", "repos.json"), JSON.stringify({
-      "auro/ci-probe": { command: "node -e \"process.exit(0)\"", timeoutMs: 30000 },
+      "auro/ci-probe": {
+        command: "node -e \"for(let i=1;i<=150;i++) console.log('line '+i); console.log('SUITE_RESULT\\talpha\\tpass\\t12'); console.log('SUITE_RESULT\\tbeta suite\\tpass\\t34')\"",
+        timeoutMs: 30000,
+      },
     }));
 
     // Push a real commit through smart HTTP (async — see NOTE above).
@@ -95,6 +100,23 @@ describe("kiln CI", () => {
     const doc = readLatest(dir, "auro", "ci-probe", "main");
     assert.equal(doc.status, "pass");
     assert.equal(doc.sha, sha);
+
+    // Full-log retention: the doc points at the stored <sha>.log and the
+    // stored log holds the WHOLE run (line 1 and line 150), not a tail.
+    assert.equal(doc.log.file, `${sha}.log`);
+    assert.equal(doc.log.truncated, false);
+    assert.ok(doc.log.bytes > 1000);
+    const storedLog = readFileSync(
+      join(dir, "ci", "results", "auro", "ci-probe", doc.log.file), "utf8"
+    );
+    assert.match(storedLog, /^line 1$/m);
+    assert.match(storedLog, /^line 150$/m);
+
+    // Per-suite verdicts persisted on the result doc.
+    assert.deepEqual(doc.suites, [
+      { name: "alpha", status: "pass", durationMs: 12 },
+      { name: "beta suite", status: "pass", durationMs: 34 },
+    ]);
 
     // Public status endpoints.
     const s1 = await apiGet(`/git/auro/ci-probe/ci/status/${sha}`);

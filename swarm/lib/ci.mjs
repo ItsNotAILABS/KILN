@@ -221,3 +221,27 @@ export function readLog(dir, owner, repo, sha) {
     return null;
   }
 }
+
+// ---------------------------------------------------------- suite verdicts
+
+/**
+ * Parse explicit per-suite verdict lines emitted by CI commands:
+ *
+ *   SUITE_RESULT\t<name>\t<pass|fail>\t<duration-ms>
+ *
+ * (tab-separated so suite names may contain spaces). CI commands opt
+ * in by printing these lines — Minutely's scripts/test-all.sh emits
+ * one per suite (maque, sdk, keeper, program, and every app check:*).
+ * The runner collects them during the run and writeResult persists
+ * them as the result doc's `suites` array, so a red run names its
+ * failing suite without opening the full log.
+ */
+export function parseSuiteResults(log) {
+  if (typeof log !== "string") return [];
+  const suites = [];
+  for (const line of log.split("\n")) {
+    const m = line.match(/^SUITE_RESULT\t([^\t]+)\t(pass|fail)\t(\d+)$/);
+    if (m) suites.push({ name: m[1], status: m[2], durationMs: Number(m[3]) });
+  }
+  return suites;
+}
