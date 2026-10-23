@@ -53,6 +53,7 @@ import {
 } from "./lib/memory.mjs";
 import { memorySigningPubkey, signatureSummary } from "./lib/memory-signing.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
+import { buildDaemonSpawnEnv } from "./lib/daemon-env.mjs";
 import {
   doctorStart, doctorStop, doctorAlive, doctorRun, doctorCheck,
   daemonHealth, readJournal, diagnose, doctorDir, doctorAgents,
@@ -104,10 +105,21 @@ function daemonJson(dir) {
 function daemonStart(dir) {
   const d = daemonJson(dir);
   if (d && pidIsDaemon(d.pid, dir)) { console.error(`daemon already running pid=${d.pid}`); process.exit(1); }
+  // Persistent per-state-dir config: <dir>/daemon.env supplies env the
+  // starting process did not specify (see lib/daemon-env.mjs). This is
+  // the single spawn choke point — `daemon start`, `daemon watchdog`
+  // and the Doctor's medic (which invokes the watchdog) all reach the
+  // daemon through here, so the file takes effect on the next boot
+  // through any of them. Malformed lines are warned about and skipped,
+  // never fatal: config trouble must not strand a daemon.
+  const spawnEnv = buildDaemonSpawnEnv(dir);
+  for (const p of spawnEnv.problems) {
+    console.error(`daemon.env: line ${p.line} skipped (${p.reason}): ${p.text.trim()}`);
+  }
   const out = openSync(join(dir, "daemon.log"), "a");
   const child = spawn(process.execPath, [join(HERE, "lib", "daemon.mjs")], {
     detached: true, stdio: ["ignore", out, out],
-    env: { ...process.env, KILN_SWARM_DIR: dir },
+    env: spawnEnv.env,
   });
   child.unref();
   closeSync(out);
