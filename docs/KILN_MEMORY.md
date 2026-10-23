@@ -1,7 +1,8 @@
 # KILN Memory — infinite memory per repo
 
 **Status:** v1 merged to main (`e45c69f`) and live since 2026-10-14 —
-library + HTTP API + client SDK + CLI. Phase 1 (FTS5 index sidecar)
+library + HTTP API + client SDK + CLI. `memory sit` is the brief an
+agent prints before it writes. Phase 1 (FTS5 index sidecar)
 built 2026-10-17; phases 2 (signed events), 3 (vector recall tier)
 and 6 (cross-repo recall) built 2026-10-22. **The phase list is
 complete** — see "Phases after v1" below.
@@ -154,7 +155,8 @@ library, and with a hash-intact but signature-stale event).
 - **Library** — `swarm/lib/memory.mjs`:
   `remember`, `assertFact`, `supersedeFact`, `linkMemories`, `setCore`,
   `loadMemory`, `factsAt`, `recall`, `buildContext`, `memoryStats`,
-  `verifyMemory`, `readEvents`. Cross-repo (phase 6):
+  `verifyMemory`, `readEvents`, `agentAwareness` (the `sit` brief).
+  Cross-repo (phase 6):
   `recallCrossRepo(dir, query, opts)` in `lib/memory-cross.mjs`,
   also reached as `recall(dir, "*", "*", query, opts)`.
 - **HTTP API** (authenticated, under the repo's namespace):
@@ -162,12 +164,14 @@ library, and with a hash-intact but signature-stale event).
   `GET  /git/:o/:r/memory/core|facts|recall|context|stats`,
   `POST /git/:o/:r/memory/verify`.
   Cross-repo: `GET /memory/recall?q=…` (authenticated, top-level).
+  The brief: `GET /git/:o/:r/memory/sit`.
 - **Client SDK** — `SwarmClient.memoryRemember / memoryFact /
   memorySupersede / memoryLink / memorySetCore / memoryCore /
-  memoryFacts / memoryRecall / memoryRecallAll / memoryContext /
+  memoryFacts / memoryRecall / memoryRecallAll / memoryContext / memorySit /
   memoryStats / memoryVerify`.
 - **CLI** — `swarm.mjs memory remember|fact|supersede|link|core|
-  core-get|facts|recall|context|stats|verify|pubkey --repo <owner>/<repo>`.
+  core-get|facts|recall|context|sit|stats|verify|pubkey --repo <owner>/<repo>`.
+  `sit` is the brief.
   Cross-repo: `swarm.mjs memory recall-all --q <query>` (or
   `memory recall --repo '*'`).
   The CLI calls the library directly (same code path as the API), so

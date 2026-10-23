@@ -301,13 +301,17 @@ budget — storage is unbounded, context is not. Full design:
 ```sh
 node swarm.mjs memory remember --repo auro/auro --title "Decision" \
   --content "We deploy on Tuesdays now." --tags ops
+node swarm.mjs memory core --repo auro/auro --label working \
+  --value "Ship Tuesday deploys"
+node swarm.mjs memory sit --repo auro/auro
 node swarm.mjs memory context --repo auro/auro --q "deploy day" --budget 4000
 node swarm.mjs memory verify  --repo auro/auro
 ```
 
-Also on the HTTP API (`/git/:o/:r/memory/*`, authenticated) and the SDK
-(`client.memoryRemember`, `memoryFact`, `memoryRecall`, `memoryContext`,
-`memoryVerify`, …). Tests: `test/memory.test.mjs` (14).
+Also on the HTTP API (`/git/:o/:r/memory/*`, authenticated, including
+`GET /memory/sit`) and the SDK (`client.memoryRemember`, `memoryFact`,
+`memoryRecall`, `memoryContext`, `memorySit`, `memoryVerify`, …).
+Agents read `../MEMORY.md` first, then sit. Tests: `test/memory.test.mjs`.
 
 ## Sites — the whole product as one record
 

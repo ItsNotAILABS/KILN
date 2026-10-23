@@ -81,7 +81,7 @@ import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
-  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory,
+  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory, agentAwareness,
 } from "./memory.mjs";
 import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
 import {
@@ -377,6 +377,14 @@ export function startApiServer(dir, cfg) {
               asOf: url.searchParams.get("asOf") || undefined,
             });
             return send(res, 200, pack);
+          }
+          if (req.method === "GET" && rest === "/memory/sit") {
+            const brief = agentAwareness(dir, owner, repo, {
+              query: url.searchParams.get("q") || undefined,
+              budgetTokens: parseInt(url.searchParams.get("budget") || "1200", 10) || 1200,
+              asOf: url.searchParams.get("asOf") || undefined,
+            });
+            return send(res, 200, brief);
           }
           if (req.method === "POST" && rest === "/memory/propose") {
             const b = await readBody(req);

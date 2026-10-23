@@ -48,7 +48,7 @@ import {
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
-  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory,
+  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory, agentAwareness,
 } from "./lib/memory.mjs";
 import { memorySigningPubkey, signatureSummary } from "./lib/memory-signing.mjs";
 import { tickJsonPath } from "./lib/tickwatch.mjs";
@@ -659,6 +659,12 @@ async function cmdMemory(args) {
     });
     console.log(pack.text);
     console.error(`[memory: ${pack.usedTokens}/${pack.budgetTokens} tokens${pack.overBudget ? " OVER BUDGET (core alone exceeds it)" : ""}]`);
+  } else if (sub === "sit") {
+    const brief = agentAwareness(dir, owner, repo, {
+      query: args.q ? String(args.q) : undefined,
+      budgetTokens: args.budget ? Number(args.budget) : 1200,
+    });
+    console.log(brief.text);
   } else if (sub === "propose-fact") {
     const r = proposeMemory(dir, owner, repo, {
       kind: "fact",
@@ -720,7 +726,7 @@ async function cmdMemory(args) {
     const st = loadMemory(dir, owner, repo);
     console.log(JSON.stringify({ ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) }, null, 2));
   } else {
-    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|stats|verify|pubkey|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]  ·  memory recall-all --q <query> [--limit N] [--json] (cross-repo, phase 6)");
+    console.error("usage: memory remember|fact|supersede|link|core|core-get|facts|recall|context|sit|stats|verify|pubkey|propose-fact|propose-link|propose-core|proposals|ratify|reject --repo <owner>/<repo> [...]  ·  memory recall-all --q <query> [--limit N] [--json] (cross-repo, phase 6)");
     process.exit(2);
   }
 }
