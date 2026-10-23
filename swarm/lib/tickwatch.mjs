@@ -41,16 +41,26 @@ export function resolveTickStallMs(cfg) {
  * Pure stall predicate. Stall = the last completed tick is older than the
  * threshold AND the daemon has been up longer than the threshold.
  *
- * Grace rules (both conservative by design):
- *  - lastTickEndMs null (no tick has completed yet) → never stalled.
+ * Grace rules (conservative by design):
  *  - uptime shorter than the threshold → never stalled, even if the first
  *    tick is slow.
+ *  - lastTickEndMs null (no tick has completed yet) → stalled ONLY once
+ *    uptime exceeds the threshold. The original rule (null → never
+ *    stalled) left a blind spot exactly where it hurt: a daemon whose
+ *    boot path wedged before the tick loop got going sat alive forever
+ *    with the watchdog politely looking away (2026-10-23, deaths
+ *    #174/#175 — zero ticks in 58m / 2h22m of uptime). A legitimate
+ *    first tick completes within ~one tick interval (2s default) of
+ *    the timer starting; the default threshold is 300× that. A daemon
+ *    up longer than the threshold without ONE completed tick is wedged
+ *    by definition.
  * Boundary is strict: exactly thresholdMs is NOT a stall.
  */
 export function tickStalled({ lastTickEndMs, bootMs, nowMs, thresholdMs }) {
   if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) return false;
-  if (lastTickEndMs == null) return false; // no completed tick yet
-  if (!Number.isFinite(lastTickEndMs) || !Number.isFinite(bootMs) || !Number.isFinite(nowMs)) return false;
+  if (!Number.isFinite(bootMs) || !Number.isFinite(nowMs)) return false;
+  if (lastTickEndMs == null) return nowMs - bootMs > thresholdMs;
+  if (!Number.isFinite(lastTickEndMs)) return false;
   return nowMs - lastTickEndMs > thresholdMs && nowMs - bootMs > thresholdMs;
 }
 
@@ -60,6 +70,7 @@ export function newTickStats() {
     tickCount: 0,
     totalMs: 0,
     maxTickMs: 0,
+    lastTickMs: null,
     lastTickStartMs: null,
     lastTickEndMs: null,
     writeFailures: 0,

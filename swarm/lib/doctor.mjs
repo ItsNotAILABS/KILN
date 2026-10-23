@@ -23,12 +23,13 @@
  */
 import { spawn } from "node:child_process";
 import {
-  openSync, closeSync, readFileSync, writeFileSync, unlinkSync,
+  openSync, closeSync, readFileSync, unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   pidAlive, pidIsDaemon, procCmdline, heartbeatAgeMs, listNodeIds, loadNode, loadApiToken,
+  writeFileAtomicSync,
 } from "./state.mjs";
 import { Supervisor } from "./doctor-core/supervisor.mjs";
 import { diagnose } from "./doctor-core/detective.mjs";
@@ -324,7 +325,7 @@ class KilnSupervisor extends Supervisor {
     });
     child.unref();
     closeSync(out);
-    writeFileSync(doctorJsonPath(this.dir), JSON.stringify({
+    writeFileAtomicSync(doctorJsonPath(this.dir), JSON.stringify({
       pid: child.pid,
       startedAt: new Date().toISOString(),
     }) + "\n");
@@ -426,7 +427,7 @@ export function captureDeathBundle(dir, death) {
   const fname = ev.ts.replace(/[:.]/g, "-") + ".json";
   const path = join(deathsDir(dir), fname);
   bundle.death.bundle = path;
-  writeFileSync(path, JSON.stringify(bundle, null, 2) + "\n");
+  writeFileAtomicSync(path, JSON.stringify(bundle, null, 2) + "\n");
   // NOTE: unlike the generic core's coroner, this does NOT journal the death
   // event — the old KILN contract journals in the tick path (doctorTick),
   // and callers (including tests) journal explicitly when they need to.

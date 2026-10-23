@@ -37,13 +37,13 @@
  * so invoke() does not widen the trust boundary; it just makes it ergonomic.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import os from "node:os";
 import { createConnection } from "node:net";
 import { appendEvent, newJobId, replay, readEvents } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
-import { nodeDir, loadNode, saveNode, listNodeIds } from "./state.mjs";
+import { nodeDir, loadNode, saveNode, listNodeIds, writeFileAtomicSync } from "./state.mjs";
 import { nowSec } from "./grant.mjs";
 import { checkShellArgs } from "./tools.mjs";
 
@@ -206,12 +206,9 @@ function loadStore(dir) {
   }
 }
 
-/** Atomic store write (tmp + rename). */
+/** Atomic store write (tmp + fsync + rename, via the shared helper). */
 function saveStore(dir, store) {
-  const p = computePath(dir);
-  const tmp = p + ".tmp";
-  writeFileSync(tmp, JSON.stringify(store, null, 2) + "\n");
-  renameSync(tmp, p);
+  writeFileAtomicSync(computePath(dir), JSON.stringify(store, null, 2) + "\n");
 }
 
 // Exported for lib/preview.mjs (single store, no duplication).
@@ -895,8 +892,7 @@ export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, 
     memoryMB: needAppMemoryMB(memoryMB),
     deployedAt: new Date().toISOString(),
   };
-  writeFileSync(join(nodeDir(dir, node.id), "app.json"), JSON.stringify(appCfg, null, 2) + "\n", { mode: 0o600 });
-  try { chmodSync(join(nodeDir(dir, node.id), "app.json"), 0o600); } catch { /* best effort */ }
+  writeFileAtomicSync(join(nodeDir(dir, node.id), "app.json"), JSON.stringify(appCfg, null, 2) + "\n", { mode: 0o600 });
   return { appId: node.id, name, status: "deploying" };
 }
 

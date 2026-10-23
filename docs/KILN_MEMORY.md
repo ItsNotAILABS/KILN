@@ -333,6 +333,19 @@ library, and with a hash-intact but signature-stale event).
    min related 0.592 > max unrelated 0.196). Fused results and
    `memoryStats` label it `neural · all-MiniLM-L6-v2 (local ONNX)`
    — the word "neural" is only ever attached to the real model.
+   **Selecting it for the daemon, persistently:** a shell export of
+   `KILN_MEMORY_EMBEDDER` does not survive the daemon's restart paths
+   (watchdog / Doctor medic each spawn with their own ambient env),
+   so the supported path is the state-dir daemon config,
+   `<stateDir>/daemon.env`, containing the single line
+   `KILN_MEMORY_EMBEDDER=minilm-l6-v2` (see `swarm/lib/daemon-env.mjs`
+   and the swarm README). `daemonStart()` applies it to the daemon
+   child only, under any explicit process env, on every boot path.
+   Writing the file does not restart anything: the running daemon
+   keeps its current embedder and the selection activates at the
+   next natural Doctor/watchdog boot. Daemon boot never touches the
+   tier (recall loads it lazily), so a selected-but-missing runtime
+   cannot crash a boot — it degrades recall to lexical, as above.
 4. **Consolidation proposals** — ✅ BUILT 2026-10-17. A consolidation
    pass reads new episodes and *proposes* facts/links/core edits; a
    human or the acting agent ratifies. Proposals are events too

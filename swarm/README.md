@@ -219,6 +219,35 @@ Workers inherit the daemon's environment, so the URL must be set **before**
 `daemon start`. Without a real `KILN_MIND_URL` the http mind **refuses
 loudly** — the plumbing is real, the model is yours to plug in.
 
+## Persistent daemon config — `<stateDir>/daemon.env`
+
+The daemon is restarted by different processes at different times (a shell,
+`daemon watchdog`, the Doctor's medic), each with its own ambient
+environment — so daemon settings that must survive cannot live only in a
+shell export. Put them in `<stateDir>/daemon.env` instead:
+
+```sh
+# ~/.kiln-swarm/daemon.env — selects the real neural memory embedder
+KILN_MEMORY_EMBEDDER=minilm-l6-v2
+```
+
+`daemonStart()` (the one spawn path behind `daemon start`, the watchdog,
+and Doctor recovery) builds the daemon child's env through
+`lib/daemon-env.mjs`: the file supplies any variable the starting process
+did not specify; **an explicit process variable always wins over the
+file** (even when set empty), and `KILN_SWARM_DIR` is always forced to
+the state dir being started. The file applies only to the daemon child
+(and, by inheritance, its workers) — never to the CLI, watchdog, or
+Doctor process that started it.
+
+Format: one `KEY=VALUE` per line; blank lines and `#` comment lines are
+ignored; an optional `export ` prefix and matching surrounding quotes are
+accepted. It is **not** a shell fragment — values are literal (no `$`
+expansion, no command substitution), keys must be valid variable names,
+and malformed lines are warned about and skipped, never fatal to a boot.
+Changing the file does not affect a running daemon; it takes effect on
+the next boot, whenever that naturally happens.
+
 ## Honesty notes
 
 - Tool calls really execute: real file writes, real `git`, real subprocesses.

@@ -10,8 +10,9 @@
  *   - repo list, info/refs, upload-pack (clone/fetch): public
  */
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { writeFileAtomicSync } from "./state.mjs";
 
 export const GIT_BACKEND = "/usr/lib/git-core/git-http-backend";
 
@@ -54,7 +55,7 @@ export function createRepo(dir, owner, repo) {
   // http.receivepack is true; KILN enforces its own auth before the
   // backend ever runs, so enabling it here is safe.
   execFileSync("git", ["--git-dir", p, "config", "http.receivepack", "true"], { stdio: "ignore" });
-  writeFileSync(
+  writeFileAtomicSync(
     join(p, "kiln.json"),
     JSON.stringify({ schema: "kiln.git-repo.v1", owner, repo, createdAt: new Date().toISOString() }) + "\n"
   );

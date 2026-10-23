@@ -57,12 +57,20 @@
 //   KILN_SWARM_DIR — the daemon state dir (default ~/.kiln-swarm)
 //   VIVAX_HOME     — log/state home (default <state-dir>/vivax)
 
-import { readFileSync, writeFileSync, appendFileSync, copyFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, appendFileSync, copyFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
-import { pidIsDaemon } from './lib/state.mjs';
+import { pidIsDaemon, writeFileAtomicSync } from './lib/state.mjs';
+
+/** Persist vivax-state.json atomically (tmp + fsync + rename): a torn
+ *  in-place write would silently reset the dedupe record of recovery
+ *  actions already taken — the 0-byte state-file family this replaces. */
+function saveVstate(vstate) {
+  mkdirSync(HOME_DIR, { recursive: true });
+  writeFileAtomicSync(VSTATE, JSON.stringify(vstate, null, 2) + '\n');
+}
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const KILN = process.env.KILN_SWARM_DIR || join(homedir(), '.kiln-swarm');
@@ -233,9 +241,7 @@ async function act({ dedupeKey, deathId, mode, foreignBootId }) {
   // it onto the verified live Daemon — see the header's hand-back note).
   const cleared = planLatchClear(medicus, mode, liveIdentity);
   try {
-    const tmp = `${MEDICUS_STATE}.vivax-tmp`;
-    writeFileSync(tmp, JSON.stringify(cleared, null, 2) + '\n');
-    renameSync(tmp, MEDICUS_STATE);
+    writeFileAtomicSync(MEDICUS_STATE, JSON.stringify(cleared, null, 2) + '\n');
     log(mode === 'fence'
       ? `Latch cleared + fence re-stamped: recoveryExhausted=false recoveryAttempts=0 nextRecoveryRetryTs=0 expectedBootId=${cleared.expectedBootId} expectedStartId=${cleared.expectedStartId}`
       : 'Latch cleared: recoveryExhausted=false recoveryAttempts=0 nextRecoveryRetryTs=0 expectedBootId=null expectedStartId=null');
@@ -246,13 +252,13 @@ async function act({ dedupeKey, deathId, mode, foreignBootId }) {
 
   // Record the act BEFORE verification — dedupe holds whatever happens next.
   vstate.actions[dedupeKey] = { at: nowIso(), outcome: 'acted-unverified', backup, mode };
-  try { mkdirSync(HOME_DIR, { recursive: true }); writeFileSync(VSTATE, JSON.stringify(vstate, null, 2) + '\n'); } catch (e) { log(`vivax-state write failed: ${e.message}`); }
+  try { mkdirSync(HOME_DIR, { recursive: true }); saveVstate(vstate); } catch (e) { log(`vivax-state write failed: ${e.message}`); }
 
   // d · Medicus start — its Sanator/recovery authority handles the Daemon.
   const start = await runSwarm(['doctor', 'start', '--dir', KILN]);
   if (start.err) {
     vstate.actions[dedupeKey].outcome = 'acted-failed-doctor-start';
-    try { writeFileSync(VSTATE, JSON.stringify(vstate, null, 2) + '\n'); } catch { /* logged below */ }
+    try { saveVstate(vstate); } catch { /* logged below */ }
     log(`‼ FAILED death=${deathId} reason=doctor-start-failed ${start.err.message} stderr=${start.stderr.trim().slice(-300)}`);
     emit(`VIVAX FAILED death=${deathId} reason=doctor-start-failed`, 2);
   }
@@ -274,11 +280,11 @@ async function act({ dedupeKey, deathId, mode, foreignBootId }) {
     if (h && ms?.expectedBootId && dj?.bootId && ms.expectedBootId === dj.bootId && p8901 > 0) {
       vstate.actions[dedupeKey].outcome = 'acted-verified';
       vstate.actions[dedupeKey].newBootId = dj.bootId;
-      try { writeFileSync(VSTATE, JSON.stringify(vstate, null, 2) + '\n'); } catch { /* non-fatal */ }
+      try { saveVstate(vstate); } catch { /* non-fatal */ }
       if (mode === 'fence') {
         const how = dj.bootId === foreignBootId ? 'adopted' : 'restarted';
         vstate.actions[dedupeKey].handback = how;
-        try { writeFileSync(VSTATE, JSON.stringify(vstate, null, 2) + '\n'); } catch { /* non-fatal */ }
+        try { saveVstate(vstate); } catch { /* non-fatal */ }
         log(`✓ HANDBACK death=${deathId} — foreign boot ${foreignBootId} ${how === 'adopted' ? 'adopted by' : 'restarted under'} Medicus. ${lastFacts}`);
         emit(`VIVAX ACTED death=${deathId} reason=fence-handback mode=${how} bootId=${dj.bootId} health=ok port8901=${p8901}`, 0);
       }
@@ -287,7 +293,7 @@ async function act({ dedupeKey, deathId, mode, foreignBootId }) {
     }
   }
   vstate.actions[dedupeKey].outcome = 'acted-failed-verify';
-  try { writeFileSync(VSTATE, JSON.stringify(vstate, null, 2) + '\n'); } catch { /* non-fatal */ }
+  try { saveVstate(vstate); } catch { /* non-fatal */ }
   log(`‼ FAILED death=${deathId} reason=verify-timeout ${lastFacts} — VIVAX does not retry. Manual attention required.`);
   emit(`VIVAX FAILED death=${deathId} reason=verify-timeout ${lastFacts}`, 2);
 }

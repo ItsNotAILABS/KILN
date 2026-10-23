@@ -14,13 +14,17 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { makeStateDir } from "./helpers.mjs";
 import { loadApiToken } from "../lib/state.mjs";
 import { startApiServer } from "../lib/httpapi.mjs";
-import { snapshotRefs, readLatest } from "../lib/ci.mjs";
+import {
+  snapshotRefs, readLatest, readResult, readQueueJobs, reconcileCiQueue,
+  kickRunner, runnerLockLive, runnerLockPath,
+} from "../lib/ci.mjs";
+import { repoPath } from "../lib/git.mjs";
 
 const dir = makeStateDir();
 const token = loadApiToken(dir);
@@ -70,10 +74,15 @@ describe("kiln CI", () => {
     });
     assert.equal(res.status, 201);
 
-    // Enroll it in CI with a fast always-pass command.
+    // Enroll it in CI with a fast always-pass command that emits more
+    // lines than the 120-line logTail (proving FULL log retention) plus
+    // two SUITE_RESULT verdict lines (proving per-suite persistence).
     mkdirSync(join(dir, "ci"), { recursive: true });
     writeFileSync(join(dir, "ci", "repos.json"), JSON.stringify({
-      "auro/ci-probe": { command: "node -e \"process.exit(0)\"", timeoutMs: 30000 },
+      "auro/ci-probe": {
+        command: "node -e \"for(let i=1;i<=150;i++) console.log('line '+i); console.log('SUITE_RESULT\\talpha\\tpass\\t12'); console.log('SUITE_RESULT\\tbeta suite\\tpass\\t34')\"",
+        timeoutMs: 30000,
+      },
     }));
 
     // Push a real commit through smart HTTP (async — see NOTE above).
@@ -95,6 +104,23 @@ describe("kiln CI", () => {
     const doc = readLatest(dir, "auro", "ci-probe", "main");
     assert.equal(doc.status, "pass");
     assert.equal(doc.sha, sha);
+
+    // Full-log retention: the doc points at the stored <sha>.log and the
+    // stored log holds the WHOLE run (line 1 and line 150), not a tail.
+    assert.equal(doc.log.file, `${sha}.log`);
+    assert.equal(doc.log.truncated, false);
+    assert.ok(doc.log.bytes > 1000);
+    const storedLog = readFileSync(
+      join(dir, "ci", "results", "auro", "ci-probe", doc.log.file), "utf8"
+    );
+    assert.match(storedLog, /^line 1$/m);
+    assert.match(storedLog, /^line 150$/m);
+
+    // Per-suite verdicts persisted on the result doc.
+    assert.deepEqual(doc.suites, [
+      { name: "alpha", status: "pass", durationMs: 12 },
+      { name: "beta suite", status: "pass", durationMs: 34 },
+    ]);
 
     // Public status endpoints.
     const s1 = await apiGet(`/git/auro/ci-probe/ci/status/${sha}`);
@@ -130,6 +156,128 @@ describe("kiln CI", () => {
     const refs = snapshotRefs(dir, "auro", "ci-probe");
     assert.ok(refs["refs/heads/main"], "main ref present");
     assert.match(refs["refs/heads/main"], /^[0-9a-f]{40}$/);
+  });
+});
+
+/**
+ * CI resilience: draining must survive daemon/runner death.
+ *
+ * The 2026-10-23 incident: a runner died with the daemon leaving its
+ * lock behind; the lock's mere existence vetoed the next push's kick,
+ * the recovered daemon never scanned the queue, and a queued job sat
+ * undrained forever. A second job was dequeued-then-lost mid-run and
+ * no reconciliation ever noticed. These tests pin the recovery paths:
+ * reconcileCiQueue is the daemon's boot/tick entry point.
+ */
+describe("kiln CI reconciliation", () => {
+  const rdir = makeStateDir();
+  const bare = repoPath(rdir, "auro", "ci-recon");
+  let sha1 = null;
+  let sha2 = null;
+  let work = null;
+
+  async function deadPid() {
+    const child = spawn(process.execPath, ["-e", ""]);
+    await new Promise((r) => child.on("close", r));
+    return child.pid;
+  }
+
+  it("setup: bare repo with one commit, enrolled in CI", async () => {
+    mkdirSync(dirname(bare), { recursive: true });
+    await git(rdir, ["init", "--bare", "-q", "-b", "main", bare]);
+    mkdirSync(join(rdir, "ci"), { recursive: true });
+    writeFileSync(join(rdir, "ci", "repos.json"), JSON.stringify({
+      "auro/ci-recon": { command: "node -e \"console.log('recon ok')\"", timeoutMs: 30000 },
+    }));
+    work = mkdtempSync(join(tmpdir(), "kiln-ci-recon-"));
+    await git(work, ["init", "-q", "-b", "main", "src"]);
+    writeFileSync(join(work, "src", "A.md"), "a\n");
+    await git(join(work, "src"), ["add", "."]);
+    await git(join(work, "src"), ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "one"]);
+    sha1 = await git(join(work, "src"), ["rev-parse", "HEAD"]);
+    await git(join(work, "src"), ["push", "-q", bare, "main"]);
+    assert.ok(sha1);
+  });
+
+  it("queued job stranded behind a dead runner's lock drains on reconcile", async () => {
+    // The incident state: job in the queue, lock held by a DEAD pid.
+    const job = {
+      id: "recon-job-1", owner: "auro", repo: "ci-recon",
+      ref: "refs/heads/main", sha: sha1, queuedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(rdir, "ci", "queue.jsonl"), JSON.stringify(job) + "\n");
+    writeFileSync(runnerLockPath(rdir), JSON.stringify({
+      pid: await deadPid(), startedAt: new Date().toISOString(),
+    }));
+    assert.equal(runnerLockLive(rdir), false); // dead pid: NOT live
+
+    // What the daemon now runs on boot (and every minute).
+    const r = reconcileCiQueue(rdir, { graceMs: 0 });
+    assert.equal(r.kicked, true);
+    assert.equal(r.enqueued.length, 0); // already queued — no duplicate
+
+    await waitFor(() => readResult(rdir, "auro", "ci-recon", sha1), 60000, "recon result");
+    const doc = readResult(rdir, "auro", "ci-recon", sha1);
+    assert.equal(doc.status, "pass");
+    assert.equal(readQueueJobs(rdir).length, 0);
+    assert.equal(existsSync(runnerLockPath(rdir)), false); // runner cleaned up
+  });
+
+  it("kickRunner refuses while a LIVE runner holds the lock", async () => {
+    writeFileSync(runnerLockPath(rdir), JSON.stringify({
+      pid: process.pid, startedAt: new Date().toISOString(),
+    }));
+    try {
+      assert.equal(runnerLockLive(rdir), true);
+      assert.equal(kickRunner(rdir), false);
+      const r = reconcileCiQueue(rdir, { graceMs: 0 });
+      assert.equal(r.runnerLive, true); // reconcile yields to the live drain
+      assert.equal(r.kicked, false);
+    } finally {
+      try { unlinkSync(runnerLockPath(rdir)); } catch {}
+    }
+  });
+
+  it("consumed-but-unwritten job is re-queued by tip reconciliation", async () => {
+    // A second commit lands on the branch with NO queue entry and NO
+    // result — exactly what a runner dying mid-run leaves behind.
+    writeFileSync(join(work, "src", "B.md"), "b\n");
+    await git(join(work, "src"), ["add", "."]);
+    await git(join(work, "src"), ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two"]);
+    sha2 = await git(join(work, "src"), ["rev-parse", "HEAD"]);
+    await git(join(work, "src"), ["push", "-q", bare, "main"]);
+    assert.equal(readResult(rdir, "auro", "ci-recon", sha2), null);
+    assert.equal(readQueueJobs(rdir).length, 0);
+
+    const r = reconcileCiQueue(rdir, { graceMs: 0 });
+    assert.equal(r.enqueued.length, 1);
+    const queued = readQueueJobs(rdir);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].sha, sha2);
+    assert.equal(queued[0].reconciled, true);
+    assert.equal(r.kicked, true);
+
+    await waitFor(() => readResult(rdir, "auro", "ci-recon", sha2), 60000, "re-queued result");
+    assert.equal(readResult(rdir, "auro", "ci-recon", sha2).status, "pass");
+  });
+
+  it("already-recorded SHA is dropped from the queue, never re-run", async () => {
+    const before = readResult(rdir, "auro", "ci-recon", sha2);
+    assert.ok(before);
+    // A duplicate enqueue for the recorded SHA (e.g. push kick racing a
+    // reconcile) must be a no-op.
+    const dup = {
+      id: "recon-job-dup", owner: "auro", repo: "ci-recon",
+      ref: "refs/heads/main", sha: sha2, queuedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(rdir, "ci", "queue.jsonl"), JSON.stringify(dup) + "\n");
+    const r = reconcileCiQueue(rdir, { graceMs: 0 });
+    assert.deepEqual(r.droppedRecorded, ["recon-job-dup"]);
+    assert.equal(r.enqueued.length, 0);
+    assert.equal(r.kicked, false); // nothing left to drain
+    assert.equal(readQueueJobs(rdir).length, 0);
+    const afterDoc = readResult(rdir, "auro", "ci-recon", sha2);
+    assert.equal(afterDoc.recordedAt, before.recordedAt); // untouched: not re-run
   });
 });
 
