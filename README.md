@@ -6,8 +6,7 @@ It coordinates projects, workspaces, agents, memory, MCP tools, diffs, approvals
 
 ## Linked projects
 
-- [POCKET](https://github.com/ItsNotAILABS/pocket) — Native Agent OS (PhoneAI, MCP, screen, registry). An on-device relay may listen on `http://127.0.0.1:8787`. That is not the forge. Muse uses the live Kiln app. See [docs/MUSE.md](docs/MUSE.md).
-- [kiln-workspace](https://github.com/ItsNotAILABS/kiln-workspace) — the live app. Not a third product. Do not fork a new Kiln repo.
+- [POCKET](https://github.com/ItsNotAILABS/pocket) — Native Agent OS (PhoneAI, MCP, screen, registry). Ships in the KILN ecosystem by default. Host MCP `http://127.0.0.1:8787`.
 - [CapsulaBuilder](https://github.com/ItsNotAILABS/CapsulaBuilder) — MonadBuilder+ and THESIS Agent Desktop.
 - [sovereign-engine](https://github.com/FreddyCreates/sovereign-engine) — Sovereign Engine OS and Sovereign Books substrate.
 - [NeurospaceAI](https://github.com/ItsNotAILABS/Neurospaceai) — NeuroEmergence Core deep lab.
@@ -20,7 +19,6 @@ KILN is a destination and control plane. Product source remains in each linked r
 
 See Working in KILN, the project registry, and the MCP tool contract.
 
-Agents opening this repo read [MEMORY.md](MEMORY.md) before they write, then `swarm/swarm.mjs memory sit`.
 
 ## Field notes — the features that earned their keep
 
@@ -77,9 +75,11 @@ rebuilt — each one proved itself on live work, not in a design doc.*
 
 See [KILN L1: Code Ownership and Provenance](docs/KILN_L1_OWNERSHIP.md) for the account, code-commit anchoring, license, agent-capability, and receipt model.
 
+
 ## L1 implementation
 
 The first executable primitive is [`KilnOwnershipRegistry`](contracts/KilnOwnershipRegistry.sol). It anchors Git commit/tree digests, records explicit licenses, scopes agent capabilities, and uses two-step project transfers. It is an initial contract surface and requires chain-specific tests and an independent security audit before production deployment.
+
 
 ## Build the ownership contract
 
@@ -96,6 +96,7 @@ forge test
 - [Ownership registry tests](test/KilnOwnershipRegistry.t.sol)
 
 Deployments must use a dedicated deployer key supplied through the environment and require explicit network approval.
+
 
 ## Public verification and sovereign network
 
