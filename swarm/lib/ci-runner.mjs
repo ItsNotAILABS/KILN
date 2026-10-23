@@ -10,8 +10,10 @@
  * run's FULL output streams to a transcript file that lib/ci.mjs stores
  * beside the result (the result JSON still carries a 120-line tail for
  * quick display). Removes the runner lock when the queue is empty.
- * Stale locks (>30 min) are reaped — a crashed runner must not wedge
- * CI forever.
+ * The lock is claimed by PID LIVENESS, not age: a lock whose recorded
+ * pid is dead is reaped immediately (a runner killed with the daemon
+ * must never wedge CI), and a lock held by a live pid means another
+ * runner owns the drain — this one yields.
  *
  * Runs detached from the API server so a slow test suite can never block
  * pushes or the daemon tick.
@@ -19,12 +21,16 @@
 import { spawn } from "node:child_process";
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync,
-  mkdtempSync, rmSync, statSync, createWriteStream,
+  mkdtempSync, rmSync, statSync, createWriteStream, openSync, closeSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { ciDir, loadRepoConfig, parseSuiteResults, writeResult } from "./ci.mjs";
+import {
+  ciDir, loadRepoConfig, parseSuiteResults, writeResult, readResult,
+  readRunnerLock, runnerLockPath,
+} from "./ci.mjs";
+import { pidAlive } from "./state.mjs";
 import { repoPath } from "./git.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -35,17 +41,44 @@ function log(...a) {
   console.log(`[ci-runner ${new Date().toISOString()}]`, ...a);
 }
 
-function reapStaleLock(dir) {
-  const lock = join(ciDir(dir), "runner.lock");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Claim the runner lock for THIS process, or yield (return false) when
+ * a live runner already holds it. Liveness decides: a lock naming a
+ * dead pid is reaped whatever its age; a lock naming a live pid that
+ * isn't us means another runner owns the drain. When kickRunner spawns
+ * us it creates the lock file a moment before writing our pid into it,
+ * so an unreadable-but-young lock gets a short grace of re-reads before
+ * the age fallback applies.
+ */
+async function claimLock(dir) {
+  const lock = runnerLockPath(dir);
+  let existing = readRunnerLock(dir);
+  for (let i = 0; !existing && existsSync(lock) && i < 20; i++) {
+    await sleep(100); // the spawner may still be writing our pid in
+    existing = readRunnerLock(dir);
+  }
+  if (existing) {
+    if (existing.pid === process.pid) return true; // kickRunner's lock, for us
+    if (pidAlive(existing.pid)) return false; // another live runner owns it
+    log(`reaping dead runner's lock (pid ${existing.pid})`);
+    try { unlinkSync(lock); } catch {}
+  } else if (existsSync(lock)) {
+    try {
+      if (Date.now() - statSync(lock).mtimeMs <= STALE_LOCK_MS) return false;
+      unlinkSync(lock); // unreadable AND old — garbage, reap by age
+    } catch { return false; }
+  }
   try {
-    const st = statSync(lock);
-    if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
-      log("reaping stale runner lock");
-      unlinkSync(lock);
-      return true;
-    }
-  } catch { /* no lock or unreadable */ }
-  return false;
+    const fd = openSync(lock, "wx");
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code === "EEXIST") return false; // another kick won the race
+    throw e;
+  }
 }
 
 function readQueue(dir) {
@@ -179,13 +212,27 @@ async function runJob(dir, job) {
 async function main() {
   const dir = process.argv[2];
   if (!dir) { console.error("ci-runner: missing <stateDir>"); process.exit(2); }
-  const lock = join(ciDir(dir), "runner.lock");
+  const lock = runnerLockPath(dir);
+  if (!(await claimLock(dir))) {
+    log("another live runner holds the lock — not draining");
+    return;
+  }
   log(`draining queue for ${dir}`);
   for (;;) {
     const jobs = readQueue(dir);
     if (!jobs.length) break;
     const job = jobs[0];
-    writeQueue(dir, jobs.slice(1)); // dequeue first: a crash re-runs nothing twice
+    // Dequeue first: if this runner dies mid-job, the job is gone from
+    // the queue — but lib/ci.mjs reconcileCiQueue (daemon boot + tick)
+    // re-queues any branch tip whose verdict never landed, so a crash
+    // delays a verdict instead of erasing it.
+    writeQueue(dir, jobs.slice(1));
+    // Idempotent by SHA: a verdict that already exists is never re-run,
+    // so a duplicated enqueue (push kick racing a reconcile) is a no-op.
+    if (readResult(dir, job.owner, job.repo, job.sha)) {
+      log(`job ${job.id}: ${job.sha.slice(0, 12)} already recorded — skipping`);
+      continue;
+    }
     log(`job ${job.id}: ${job.owner}/${job.repo}@${job.sha.slice(0, 12)} (${job.ref})`);
     let result;
     try {

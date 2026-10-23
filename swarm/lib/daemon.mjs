@@ -23,6 +23,7 @@ import {
 } from "./state.mjs";
 import { appendEvent, pendingJobs } from "./queue.mjs";
 import { createNode, budgetRestoreDue, restoreBudget } from "./nodes.mjs";
+import { reconcileCiQueue } from "./ci.mjs";
 import { nowSec } from "./grant.mjs";
 import { startApiServer } from "./httpapi.mjs";
 import { settleComputeJobs } from "./compute.mjs";
@@ -397,12 +398,14 @@ async function main() {
     `config tickStallAbortMs / env KILN_TICK_STALL_MS)`);
 
   let stopping = false;
+  let ciTimer = null;
   const onStop = () => {
     if (stopping) return;
     stopping = true;
     log("stopping (workers left running — they are persistent)");
     clearInterval(timer);
     clearInterval(stallWatch);
+    if (ciTimer) clearInterval(ciTimer);
     try { api.server.close(); } catch {}
     try { unlinkSync(lockPath(dir)); } catch {}
     process.exit(0);
@@ -432,6 +435,23 @@ async function main() {
   process.on("unhandledRejection", (reason) => {
     try { log(`FATAL unhandledRejection (staying alive): ${reason && reason.stack ? reason.stack : reason}`); } catch {}
   });
+
+  // CI reconciliation: CI draining is push-triggered, so a CI runner that
+  // dies with (or before) the daemon strands queued jobs, and a job it
+  // dequeued mid-run vanishes with no verdict. Nothing in the old boot
+  // path ever looked at the CI queue — a Doctor-recovered daemon served
+  // pushes happily while a queued job sat undrained forever (2026-10-23:
+  // auro/minutely b6f9100, queued 10:57:54Z, never drained). Scan on boot
+  // and every minute: drop already-recorded queue entries, re-queue
+  // branch tips whose verdicts never landed, kick the drainer when a
+  // live one isn't already running. Guarded — CI must never break the
+  // daemon.
+  const ciReconcile = () => {
+    try { reconcileCiQueue(dir); } catch (e) { log("ci reconcile error:", e.message); }
+  };
+  ciReconcile();
+  ciTimer = setInterval(ciReconcile, 60 * 1000);
+  ciTimer.unref();
 
   reconcile(dir, cfg); // boot reconcile: adopt live, respawn dead per policy
   const timer = setInterval(() => {
