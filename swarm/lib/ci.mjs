@@ -6,7 +6,9 @@
  * enqueued. A detached runner (lib/ci-runner.mjs) drains the queue: it
  * clones the pushed SHA into a temp dir, runs the repo's configured test
  * command, and writes a result JSON. Results are served publicly, GitHub
- * commit-status style.
+ * commit-status style. Each run's FULL output is retained beside its
+ * result JSON (<sha>.log, served at /ci/log/:sha) under the
+ * ciLogMaxBytes() cap — the result's logTail is only a display tail.
  *
  * Trust model: test commands come ONLY from <stateDir>/ci/repos.json, which
  * is operator-written. A pushed repo can never inject its own CI command —
@@ -110,15 +112,23 @@ export function writeResult(dir, job, result) {
   ensureCiDir(dir);
   const rdir = join(ciDir(dir), "results", job.owner, job.repo);
   mkdirSync(rdir, { recursive: true });
+  // A run's full log streams to a temp file (result.logFile); it is
+  // stored beside the result JSON and referenced from doc.log. The
+  // temp path itself never reaches the stored doc.
+  const { logFile, ...rest } = result;
   const doc = {
     schema: "kiln.ci-result.v1",
-    ...result,
+    ...rest,
     owner: job.owner,
     repo: job.repo,
     ref: job.ref,
     sha: job.sha,
     recordedAt: new Date().toISOString(),
   };
+  if (logFile) {
+    const log = storeLogFile(dir, job, logFile);
+    if (log) doc.log = log;
+  }
   writeFileSync(join(rdir, `${job.sha}.json`), JSON.stringify(doc, null, 2) + "\n");
   writeFileSync(join(rdir, "latest.json"), JSON.stringify(doc, null, 2) + "\n");
   // Per-branch pointer: refs/heads/main -> latest for that branch.
@@ -141,6 +151,72 @@ export function readLatest(dir, owner, repo, branch) {
   const name = branch ? `latest-${branch}.json` : "latest.json";
   try {
     return JSON.parse(readFileSync(join(ciDir(dir), "results", owner, repo, name), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// ------------------------------------------------------------------ logs
+
+/**
+ * Full-log retention cap for one CI run, in bytes. Mirrors rotlog's
+ * env-tunable pattern (floor 64KB, default 10MB). The runner streams
+ * a run's whole output (clone, checkout, test command) to a file;
+ * writeResult stores it beside the result JSON, truncated at this
+ * cap with an in-band marker — never silently. Before this, results
+ * kept only a 120-line tail, which made real failures undiagnosable
+ * (a red badge whose cause had scrolled past the tail).
+ */
+export function ciLogMaxBytes() {
+  return Math.max(64 * 1024, Number(process.env.KILN_CI_LOG_MAX_BYTES) || 10 * 1024 * 1024);
+}
+
+export function logPath(dir, owner, repo, sha) {
+  return join(ciDir(dir), "results", owner, repo, `${sha}.log`);
+}
+
+function truncationMarker(dropped, cap) {
+  return `\n[kiln-ci] log truncated: ${dropped} bytes dropped at the ${cap}-byte retention cap (KILN_CI_LOG_MAX_BYTES)\n`;
+}
+
+/**
+ * Store a run's streamed log file beside its result JSON, enforcing
+ * the retention cap. Returns { file, bytes, truncated, droppedBytes,
+ * capBytes } describing the STORED log, or null when there is no
+ * readable source log.
+ */
+export function storeLogFile(dir, job, sourcePath) {
+  try {
+    const cap = ciLogMaxBytes();
+    const data = readFileSync(sourcePath);
+    const rdir = join(ciDir(dir), "results", job.owner, job.repo);
+    mkdirSync(rdir, { recursive: true });
+    let body = data;
+    let droppedBytes = 0;
+    if (data.length > cap) {
+      droppedBytes = data.length - cap;
+      body = Buffer.concat([
+        data.subarray(0, cap),
+        Buffer.from(truncationMarker(droppedBytes, cap)),
+      ]);
+    }
+    writeFileSync(join(rdir, `${job.sha}.log`), body);
+    return {
+      file: `${job.sha}.log`,
+      bytes: body.length,
+      truncated: droppedBytes > 0,
+      droppedBytes,
+      capBytes: cap,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** The stored full log for one run, or null. Public, like status. */
+export function readLog(dir, owner, repo, sha) {
+  try {
+    return readFileSync(logPath(dir, owner, repo, sha), "utf8");
   } catch {
     return null;
   }

@@ -328,3 +328,35 @@ describe("memory-vectors: sync semantics", () => {
     assert.equal(info.vectors, 5);
   });
 });
+
+describe("memory-vectors: minilm-l6-v2 neural embedder (registry + fallback)", () => {
+  it("is registered with its real dimension and a neural signal label", () => {
+    const emb = withEnv({ KILN_MEMORY_EMBEDDER: "minilm-l6-v2" }, () => activeEmbedder());
+    assert.equal(emb.id, "minilm-l6-v2");
+    assert.equal(emb.dim, 384);
+    assert.match(emb.signal, /neural/);
+  });
+
+  it("absent runtime: sync refuses, sidecar keeps hashing vectors, recall stays lexical", () => {
+    const { dir } = seeded();
+    const s1 = syncMemoryVectors(dir, ...R); // hashing baseline
+    assert.equal(s1.embedder, "hashing-v1");
+    // An embedder home with nothing installed — the suite must prove
+    // the fallback without a model or network, deterministically.
+    const emptyHome = mkdtempSync(join(tmpdir(), "kiln-embedder-empty-"));
+    const broken = { KILN_MEMORY_EMBEDDER: "minilm-l6-v2", KILN_MEMORY_EMBEDDER_HOME: emptyHome };
+    assert.throws(
+      () => withEnv(broken, () => syncMemoryVectors(dir, ...R)),
+      /unavailable.*setup-embedder/,
+    );
+    // The throw rolled the sync transaction back: the sidecar still
+    // reports the hashing tier, every vector intact.
+    const info = memoryVectorsInfo(dir, ...R);
+    assert.equal(info.embedder, "hashing-v1");
+    assert.equal(info.vectors, s1.docs);
+    // And recall under the broken selection serves the lexical result.
+    const r = withEnv(broken, () => recall(dir, ...R, "invoice", {}));
+    assert.ok(r.results.length > 0);
+    assert.equal(r.fusion, undefined);
+  });
+});
