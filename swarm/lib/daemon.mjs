@@ -346,8 +346,8 @@ function tickLoopWedged(stats) {
  * One tick invocation: times tick(), accumulates stats, and writes
  * <stateDir>/tick.json — the contract the external supervisor reads.
  *
- * Contract shape: {"lastTickStartMs","lastTickEndMs","tickCount",
- * "avgTickMs","maxTickMs","updatedAt"}. One atomic (tmp+rename) write
+ * Contract shape: {"lastTickStartMs","lastTickEndMs","lastTickMs",
+ * "tickCount","avgTickMs","maxTickMs","updatedAt"}. One atomic (tmp+rename) write
  * per tick, so a reader never sees a torn tick.json and a faulted write
  * leaves the previous complete file in place; a write failure can never
  * break the tick — it is logged once per daemon lifetime and then
@@ -364,11 +364,13 @@ function runTick(dir, cfg, stats) {
     stats.tickCount += 1;
     stats.totalMs += durMs;
     if (durMs > stats.maxTickMs) stats.maxTickMs = durMs;
+    stats.lastTickMs = durMs;
     stats.lastTickEndMs = endMs;
     try {
       writeFileAtomicSync(tickJsonPath(dir), JSON.stringify({
         lastTickStartMs: stats.lastTickStartMs,
         lastTickEndMs: stats.lastTickEndMs,
+        lastTickMs: stats.lastTickMs,
         tickCount: stats.tickCount,
         avgTickMs: stats.totalMs / stats.tickCount,
         maxTickMs: stats.maxTickMs,
@@ -398,7 +400,8 @@ function runTick(dir, cfg, stats) {
 function checkTickStall(stats, bootMs, thresholdMs) {
   const nowMs = Date.now();
   if (!tickStalled({ lastTickEndMs: stats.lastTickEndMs, bootMs, nowMs, thresholdMs })) return;
-  const ageMs = nowMs - stats.lastTickEndMs;
+  // With no completed tick ever, the honest age is the daemon's uptime.
+  const ageMs = stats.lastTickEndMs == null ? nowMs - bootMs : nowMs - stats.lastTickEndMs;
   const avgTickMs = stats.tickCount > 0 ? stats.totalMs / stats.tickCount : 0;
   const lastTickEnd = stats.lastTickEndMs != null ? new Date(stats.lastTickEndMs).toISOString() : "never";
   // Synchronous write: process.exit(1) immediately after can truncate an
