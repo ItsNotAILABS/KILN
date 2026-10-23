@@ -27,12 +27,13 @@
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, appendFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { readFileSync, appendFileSync, existsSync, openSync, closeSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stateDir as defaultStateDir, ensureStateDir, listNodeIds, loadNode, saveNode,
   resolveNode, pidAlive, pidIsDaemon, heartbeatAgeMs, nodeDir, loadApiToken,
+  writeFileAtomicSync,
 } from "./lib/state.mjs";
 import { createNode, reviveNode } from "./lib/nodes.mjs";
 import { loadKeypair } from "./lib/keys.mjs";
@@ -167,7 +168,7 @@ async function daemonWatchdog(dir) {
   const st2 = await daemonStatus(dir);
   if (st2.up) {
     state.restarts.push(Date.now());
-    try { writeFileSync(statePath, JSON.stringify(state) + "\n"); } catch { /* best effort */ }
+    try { writeFileAtomicSync(statePath, JSON.stringify(state) + "\n"); } catch { /* best effort */ }
     watchdogLog(dir, `restarted ok pid=${st2.pid}`);
     console.log(`daemon restarted pid=${st2.pid}`);
   } else {

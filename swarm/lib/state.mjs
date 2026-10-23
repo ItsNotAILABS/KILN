@@ -16,9 +16,62 @@
  *   <dir>/nodes/<nodeId>/receipts.jsonl
  */
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, chmodSync, unlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
+import {
+  existsSync, mkdirSync, readFileSync, readdirSync, chmodSync, unlinkSync,
+  openSync, closeSync, writeSync, fsyncSync, renameSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
+
+/**
+ * Atomic file replacement: write the full payload to a temp file in the
+ * SAME directory, fsync it, rename over the target, then fsync the
+ * directory (best effort) so the rename itself is durable.
+ *
+ * This is the ONLY way swarm state files may be written. A plain
+ * writeFileSync truncates the target in place: a host write fault (or a
+ * kill) mid-write leaves a 0-byte / torn file behind — and a torn state
+ * file is not a cosmetic problem here. On 2026-10-23 exactly that zeroed
+ * nodes/<wing-research>/node.json, the daemon's boot reconcile threw on
+ * JSON.parse(""), and node supervision silently never started while the
+ * API kept serving. With tmp+rename a faulted write leaves either the
+ * old complete file or the new complete file — never a truncated one.
+ *
+ * opts.mode: applied at tmp creation AND chmod'd after the rename
+ * (creation mode is umask-filtered; the chmod makes it exact, matching
+ * the writeKeyFile idiom this replaces).
+ *
+ * TEST-ONLY fault hook: KILN_ATOMIC_WRITE_FAULT=1 writes half the payload
+ * to the temp file and then throws, simulating the host write fault
+ * mid-save. Never set in production; exists solely so tests can prove
+ * the target survives a faulted save byte-intact.
+ */
+export function writeFileAtomicSync(path, data, opts = {}) {
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  try {
+    const fd = openSync(tmp, "w", opts.mode ?? 0o666);
+    try {
+      if (process.env.KILN_ATOMIC_WRITE_FAULT === "1") {
+        const half = typeof data === "string" ? data.slice(0, Math.ceil(data.length / 2)) : data.subarray(0, Math.ceil(data.length / 2));
+        writeSync(fd, half);
+        throw new Error("simulated host write fault mid-save (KILN_ATOMIC_WRITE_FAULT)");
+      }
+      writeSync(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, path);
+    if (opts.mode) { try { chmodSync(path, opts.mode); } catch { /* best effort */ } }
+    try {
+      const dfd = openSync(dirname(path), "r");
+      try { fsyncSync(dfd); } finally { closeSync(dfd); }
+    } catch { /* directory fsync unsupported here — rename still atomic */ }
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* already renamed or never created */ }
+    throw e;
+  }
+}
 
 export function stateDir() {
   return process.env.KILN_SWARM_DIR || join(homedir(), ".kiln-swarm");
@@ -29,7 +82,7 @@ export function ensureStateDir(dir) {
   mkdirSync(join(dir, "nodes"), { recursive: true });
   const cfg = join(dir, "config.json");
   if (!existsSync(cfg)) {
-    writeFileSync(
+    writeFileAtomicSync(
       cfg,
       JSON.stringify(
         {
@@ -56,8 +109,7 @@ export function ensureStateDir(dir) {
   // Local API bearer token (0600). Minimal honest auth: local-only bind + token.
   const tok = join(dir, "api.token");
   if (!existsSync(tok)) {
-    writeFileSync(tok, randomBytes(32).toString("hex") + "\n", { mode: 0o600 });
-    try { chmodSync(tok, 0o600); } catch { /* best effort */ }
+    writeFileAtomicSync(tok, randomBytes(32).toString("hex") + "\n", { mode: 0o600 });
   }
   return dir;
 }
@@ -83,7 +135,7 @@ export function loadNode(dir, id) {
 }
 
 export function saveNode(dir, record) {
-  writeFileSync(nodeJsonPath(dir, record.id), JSON.stringify(record, null, 2) + "\n");
+  writeFileAtomicSync(nodeJsonPath(dir, record.id), JSON.stringify(record, null, 2) + "\n");
 }
 
 export function listNodeIds(dir) {
@@ -111,8 +163,7 @@ export function resolveNode(dir, idOrName) {
 
 export function writeKeyFile(dir, id, stored) {
   const p = join(nodeDir(dir, id), "key.json");
-  writeFileSync(p, JSON.stringify(stored, null, 2) + "\n", { mode: 0o600 });
-  try { chmodSync(p, 0o600); } catch { /* best effort */ }
+  writeFileAtomicSync(p, JSON.stringify(stored, null, 2) + "\n", { mode: 0o600 });
 }
 
 export function loadKeyFile(dir, id) {
@@ -120,7 +171,9 @@ export function loadKeyFile(dir, id) {
 }
 
 export function touchHeartbeat(dir, id) {
-  writeFileSync(join(nodeDir(dir, id), "heartbeat"), String(Date.now()));
+  // Atomic even here: a torn heartbeat reads as "stale since forever"
+  // (heartbeatAgeMs → Infinity) and gets a healthy worker respawned.
+  writeFileAtomicSync(join(nodeDir(dir, id), "heartbeat"), String(Date.now()));
 }
 
 export function heartbeatAgeMs(dir, id) {
@@ -257,7 +310,7 @@ export function readJobFile(dir, id) {
 }
 
 export function writeJobFile(dir, id, job) {
-  writeFileSync(join(nodeDir(dir, id), "job.json"), JSON.stringify(job, null, 2) + "\n");
+  writeFileAtomicSync(join(nodeDir(dir, id), "job.json"), JSON.stringify(job, null, 2) + "\n");
 }
 
 export function clearJobFile(dir, id) {

@@ -9,12 +9,12 @@
  * stays alive), 3 grant expired, 1 unexpected crash (restart policy applies).
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createRotatingLog } from "./rotlog.mjs";
 import {
   stateDir, loadNode, loadKeyFile, touchHeartbeat, nodeDir,
-  readJobFile, clearJobFile, heartbeatAgeMs,
+  readJobFile, clearJobFile, heartbeatAgeMs, writeFileAtomicSync,
 } from "./state.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { checkGrant, GrantError } from "./grant.mjs";
@@ -66,7 +66,7 @@ function readAppState(dir, nodeId) {
 
 function writeAppState(dir, nodeId, patch) {
   try {
-    writeFileSync(appStatePath(dir, nodeId), JSON.stringify({ ...readAppState(dir, nodeId), ...patch }));
+    writeFileAtomicSync(appStatePath(dir, nodeId), JSON.stringify({ ...readAppState(dir, nodeId), ...patch }));
   } catch { /* metering must never break supervision */ }
 }
 

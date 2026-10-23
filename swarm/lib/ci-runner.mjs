@@ -30,7 +30,7 @@ import {
   ciDir, loadRepoConfig, parseSuiteResults, writeResult, readResult,
   readRunnerLock, runnerLockPath,
 } from "./ci.mjs";
-import { pidAlive } from "./state.mjs";
+import { pidAlive, writeFileAtomicSync } from "./state.mjs";
 import { repoPath } from "./git.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -129,7 +129,10 @@ function readQueue(dir) {
 }
 
 function writeQueue(dir, jobs) {
-  writeFileSync(join(ciDir(dir), "queue.jsonl"), jobs.map((j) => JSON.stringify(j)).join("\n") + (jobs.length ? "\n" : ""));
+  // Atomic: the runner rewrites the whole queue when it dequeues a job,
+  // and an in-place truncation here would silently drop every other
+  // queued job (the 2026-10-23 consumed-job-vanishes failure family).
+  writeFileAtomicSync(join(ciDir(dir), "queue.jsonl"), jobs.map((j) => JSON.stringify(j)).join("\n") + (jobs.length ? "\n" : ""));
 }
 
 /**

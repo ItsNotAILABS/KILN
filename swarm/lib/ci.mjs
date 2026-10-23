@@ -23,7 +23,7 @@ import {
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { repoPath } from "./git.mjs";
-import { pidAlive } from "./state.mjs";
+import { pidAlive, writeFileAtomicSync } from "./state.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(HERE, "ci-runner.mjs");
@@ -87,7 +87,7 @@ export function readQueueJobs(dir) {
 
 export function writeQueueJobs(dir, jobs) {
   ensureCiDir(dir);
-  writeFileSync(queuePath(dir), jobs.map((j) => JSON.stringify(j)).join("\n") + (jobs.length ? "\n" : ""));
+  writeFileAtomicSync(queuePath(dir), jobs.map((j) => JSON.stringify(j)).join("\n") + (jobs.length ? "\n" : ""));
 }
 
 function appendQueueJob(dir, job) {
@@ -206,12 +206,12 @@ export function writeResult(dir, job, result) {
     const log = storeLogFile(dir, job, logFile);
     if (log) doc.log = log;
   }
-  writeFileSync(join(rdir, `${job.sha}.json`), JSON.stringify(doc, null, 2) + "\n");
-  writeFileSync(join(rdir, "latest.json"), JSON.stringify(doc, null, 2) + "\n");
+  writeFileAtomicSync(join(rdir, `${job.sha}.json`), JSON.stringify(doc, null, 2) + "\n");
+  writeFileAtomicSync(join(rdir, "latest.json"), JSON.stringify(doc, null, 2) + "\n");
   // Per-branch pointer: refs/heads/main -> latest for that branch.
   const branch = job.ref.startsWith("refs/heads/") ? job.ref.slice("refs/heads/".length) : null;
   if (branch && /^[a-zA-Z0-9._-]+$/.test(branch)) {
-    writeFileSync(join(rdir, `latest-${branch}.json`), JSON.stringify(doc, null, 2) + "\n");
+    writeFileAtomicSync(join(rdir, `latest-${branch}.json`), JSON.stringify(doc, null, 2) + "\n");
   }
   return doc;
 }
@@ -379,7 +379,7 @@ export function storeLogFile(dir, job, sourcePath) {
         Buffer.from(truncationMarker(droppedBytes, cap)),
       ]);
     }
-    writeFileSync(join(rdir, `${job.sha}.log`), body);
+    writeFileAtomicSync(join(rdir, `${job.sha}.log`), body);
     return {
       file: `${job.sha}.log`,
       bytes: body.length,
