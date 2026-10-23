@@ -19,25 +19,37 @@
  * validity at asOf via factsAt()) — the vector tier never widens the
  * eligible universe, it only re-ranks and adds within it.
  *
- * THE EMBEDDER — read this before believing the word "semantic":
- * the default embedder (`hashing-v1`) is a deterministic signed
+ * THE EMBEDDERS — read this before believing the word "semantic":
+ * the DEFAULT embedder (`hashing-v1`) is a deterministic signed
  * feature-hashing embedder over the library's own tokens plus
  * character trigrams — the same technique as MatDaemon's
  * `matdaemon_embed_text`. It is a LEXICAL signal: it knows shared
  * words and shared character n-grams (so "invoice" is close to
  * "invoices", "deploy" to "deployment"), and nothing else. It has
  * never seen a training corpus, it knows no synonyms, and a high
- * cosine here does NOT mean two texts mean the same thing. It is a
- * placeholder-tier signal shipped honestly behind the embedder
- * interface below; a real local neural embedder can register under
- * its own id and take over without touching recall. Vectors are
- * stamped with the embedder id that produced them; an id change
- * re-embeds the corpus on the next sync, so vectors from different
- * embedders are never mixed in one ranking.
+ * cosine under hashing-v1 does NOT mean two texts mean the same
+ * thing. Every surface labels it "lexical-hashing (not semantic)".
+ *
+ * A real local neural embedder is also registered: `minilm-l6-v2`
+ * (all-MiniLM-L6-v2 sentence embeddings via ONNX, in a worker
+ * thread — lib/memory-embedder-minilm.mjs). It is genuinely
+ * semantic (paraphrases with no shared words score high; see
+ * scripts/eval-embedders.mjs for measured numbers). It is OPT-IN
+ * (KILN_MEMORY_EMBEDDER=minilm-l6-v2) and its runtime + weights
+ * live OUTSIDE the repo (installed by scripts/setup-embedder.mjs);
+ * when that runtime is absent its embed() throws "unavailable",
+ * the sync transaction rolls back, and recall serves the lexical
+ * result exactly as with any other tier failure — hashing-v1
+ * remains the default and the fallback. Vectors are stamped with
+ * the embedder id that produced them; an id change re-embeds the
+ * corpus on the next sync, so vectors from different embedders
+ * are never mixed in one ranking.
  *
  * Honest boundaries:
- *   - No external calls, no API keys, no new dependencies: the
- *     embedder runs in-process in pure JS (zero-dependency ethos).
+ *   - The default tier needs no external calls, no API keys, no
+ *     dependencies: hashing-v1 runs in-process in pure JS. The
+ *     neural embedder's optional runtime is loaded only when an
+ *     operator selects it; the swarm itself stays zero-dependency.
  *   - Any tier error (no node:sqlite, embedder throw, corrupt
  *     sidecar) → the caller serves the lexical result untouched,
  *     exactly like phase 1's fallback discipline.
@@ -56,6 +68,7 @@ import { join } from "node:path";
 import {
   readEvents, replayMemory, factsAt, tokenize, docText, episodeWhen,
 } from "./memory.mjs";
+import { minilmEmbedder } from "./memory-embedder-minilm.mjs";
 
 let DatabaseSync = null;
 try {
@@ -109,11 +122,15 @@ function hashingEmbed(text) {
 const EMBEDDERS = new Map();
 
 /**
- * The embedder interface: { id, dim, embed(text) -> number[dim] | null }.
+ * The embedder interface:
+ * { id, dim, embed(text) -> number[dim] | null, signal? }.
  * embed() must return an L2-normalized vector (cosine = dot product)
- * or null for "no signal". Registering a new id is the supported way
- * to swap in a real embedder later (e.g. a local neural model); the
- * sidecar re-embeds automatically when the active id changes.
+ * or null for "no signal"; it may throw to declare the whole tier
+ * unavailable (the sync rolls back, recall serves lexical). `signal`
+ * is the embedder's plain-language honesty label, surfaced verbatim
+ * in stats and fusion provenance. Registering a new id is the
+ * supported way to swap embedders; the sidecar re-embeds
+ * automatically when the active id changes.
  */
 export function registerEmbedder(embedder) {
   if (!embedder || typeof embedder.id !== "string" || !embedder.id) {
@@ -133,7 +150,16 @@ export function activeEmbedder() {
   return EMBEDDERS.get(id) || null;
 }
 
-registerEmbedder({ id: "hashing-v1", dim: HASH_DIM, embed: hashingEmbed });
+registerEmbedder({
+  id: "hashing-v1", dim: HASH_DIM, embed: hashingEmbed,
+  signal: "lexical-hashing (not semantic)",
+});
+
+// The real neural embedder (lib/memory-embedder-minilm.mjs). Cheap to
+// register — its worker + model load lazily on first embed, and only
+// when KILN_MEMORY_EMBEDDER selects it. Absent runtime -> throws
+// "unavailable" -> tier falls back, hashing vectors untouched.
+registerEmbedder(minilmEmbedder);
 
 export function memoryVectorsEnabled() {
   return !!DatabaseSync && process.env.KILN_MEMORY_VECTORS !== "off" && !!activeEmbedder();
@@ -260,8 +286,9 @@ export function memoryVectorsInfo(dir, owner, repo) {
       tip: vecMetaGet(db, "tip") || null,
       syncTs: Number(vecMetaGet(db, "syncTs") || 0) || null,
       // Plain-language label, carried into stats so no surface can
-      // present this tier as more than it is.
-      signal: embedder === "hashing-v1" ? "lexical-hashing (not semantic)" : "registered embedder",
+      // present this tier as more than it is. Comes from the
+      // embedder's own registration; unknown ids stay generic.
+      signal: EMBEDDERS.get(embedder)?.signal || "registered embedder",
     };
   } catch {
     return null;
@@ -391,7 +418,7 @@ export function fuseRecallVectors(dir, owner, repo, query, opts = {}, pre, base)
       embedder: emb.id,
       dim: emb.dim,
       weight: W,
-      signal: emb.id === "hashing-v1" ? "lexical-hashing (not semantic)" : "registered embedder",
+      signal: emb.signal || "registered embedder",
       vectorsConsidered: sims.size,
     },
   };

@@ -206,8 +206,10 @@ library, and with a hash-intact but signature-stale event).
   ("invoice" ↔ "invoices"), it does **not** know synonyms or meaning,
   and it is never presented as semantic search — every fused result
   names the embedder and labels the signal. A real local neural
-  embedder remains future work behind the same interface (phase 3
-  notes below); rather an honest hashing tier than fake "AI search".
+  embedder now exists behind the same interface as an opt-in
+  (`minilm-l6-v2`, phase 3 notes below); the default stays hashing
+  because it needs nothing installed — rather an honest hashing
+  default than fake "AI search".
 - **Events are hash-chained and signed** (phase 2, above) — but the
   signature proves *which installation's memory key wrote the
   event*, not which human or agent drove it: `actor` stays a
@@ -310,8 +312,27 @@ library, and with a hash-intact but signature-stale event).
    every fused result say so. The swap path is real, though:
    embedders register by id (`registerEmbedder`), selection is
    `KILN_MEMORY_EMBEDDER=<id>`, vectors are stamped with their
-   embedder id, and an id change re-embeds the corpus — a future
-   local neural embedder takes over without touching recall.
+   embedder id, and an id change re-embeds the corpus.
+   **The neural embedder — ✅ BUILT 2026-10-22**
+   (`lib/memory-embedder-minilm.mjs` + worker): `minilm-l6-v2` is
+   all-MiniLM-L6-v2 (384-dim) running locally via
+   @huggingface/transformers + onnxruntime-node in a worker thread,
+   bridged to the tier's synchronous interface over a
+   SharedArrayBuffer. Its runtime and weights live OUTSIDE the repo
+   (`~/.cache/kiln-memory-embedder`, or `$KILN_MEMORY_EMBEDDER_HOME`;
+   install/fetch via `node swarm/scripts/setup-embedder.mjs`), so
+   the swarm stays zero-dependency and hashing-v1 stays the default
+   and the fallback: if the runtime is absent, embed throws
+   "unavailable", the sync transaction rolls back (stored vectors
+   survive), and recall serves the lexical result untouched.
+   Measured separation (`swarm/scripts/eval-embedders.mjs`, 8
+   paraphrase pairs vs 8 unrelated pairs, mean cosine): hashing-v1
+   related 0.466 / unrelated 0.148 (gap 0.317, distributions overlap
+   — worst paraphrase 0.211 < best unrelated 0.371); minilm-l6-v2
+   related 0.762 / unrelated 0.069 (gap 0.694, clean separation —
+   min related 0.592 > max unrelated 0.196). Fused results and
+   `memoryStats` label it `neural · all-MiniLM-L6-v2 (local ONNX)`
+   — the word "neural" is only ever attached to the real model.
 4. **Consolidation proposals** — ✅ BUILT 2026-10-17. A consolidation
    pass reads new episodes and *proposes* facts/links/core edits; a
    human or the acting agent ratifies. Proposals are events too
