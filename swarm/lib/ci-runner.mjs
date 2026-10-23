@@ -152,23 +152,36 @@ function runCmd(argv, cwd, timeoutMs, logStream = null, env = null) {
     let out = "";
     // SUITE_RESULT verdict lines are collected line-buffered, independent
     // of the 200KB in-memory tail cap, and land in the result doc's
-    // `suites` array (see parseSuiteResults in lib/ci.mjs).
-    let pendingLine = "";
+    // `suites` array (see parseSuiteResults in lib/ci.mjs). Each stream
+    // gets its OWN line buffer: stdout and stderr chunks interleave
+    // arbitrarily, and a shared buffer would glue a partial stdout line
+    // to the next stderr chunk and lose both suite lines.
     const suites = [];
-    const collectSuites = (text, flush = false) => {
-      pendingLine += text;
-      const lines = pendingLine.split("\n");
-      pendingLine = flush ? "" : lines.pop();
-      for (const line of lines) suites.push(...parseSuiteResults(line));
+    const makeCollector = () => {
+      let pending = "";
+      return {
+        feed(text) {
+          pending += text;
+          const lines = pending.split("\n");
+          pending = lines.pop();
+          for (const line of lines) suites.push(...parseSuiteResults(line));
+        },
+        flush() {
+          if (pending) { suites.push(...parseSuiteResults(pending)); pending = ""; }
+        },
+      };
     };
-    const cap = (d) => {
+    const stdoutSuites = makeCollector();
+    const stderrSuites = makeCollector();
+    const flushSuites = () => { stdoutSuites.flush(); stderrSuites.flush(); };
+    const cap = (collector) => (d) => {
       if (logStream) { try { logStream.write(d); } catch { /* log loss must not fail the run */ } }
       const text = d.toString();
-      collectSuites(text);
+      collector.feed(text);
       out += text; if (out.length > 200000) out = out.slice(-200000);
     };
-    child.stdout.on("data", cap);
-    child.stderr.on("data", cap);
+    child.stdout.on("data", cap(stdoutSuites));
+    child.stderr.on("data", cap(stderrSuites));
     let timedOut = false;
     const t = setTimeout(() => {
       timedOut = true;
@@ -176,7 +189,7 @@ function runCmd(argv, cwd, timeoutMs, logStream = null, env = null) {
     }, timeoutMs);
     child.on("close", (code) => {
       clearTimeout(t);
-      collectSuites("", true);
+      flushSuites();
       const lines = out.split("\n");
       resolve({
         exitCode: code ?? 1,
@@ -187,7 +200,7 @@ function runCmd(argv, cwd, timeoutMs, logStream = null, env = null) {
     });
     child.on("error", (e) => {
       clearTimeout(t);
-      collectSuites("", true);
+      flushSuites();
       if (logStream) { try { logStream.write(`spawn failed: ${e.message}\n`); } catch {} }
       resolve({ exitCode: 1, timedOut: false, tail: `spawn failed: ${e.message}`, suites });
     });

@@ -192,7 +192,7 @@ export function writeResult(dir, job, result) {
   // A run's full log streams to a temp file (result.logFile); it is
   // stored beside the result JSON and referenced from doc.log. The
   // temp path itself never reaches the stored doc.
-  const { logFile, ...rest } = result;
+  const { logFile, suites: explicitSuites, ...rest } = result;
   const doc = {
     schema: "kiln.ci-result.v1",
     ...rest,
@@ -205,6 +205,20 @@ export function writeResult(dir, job, result) {
   if (logFile) {
     const log = storeLogFile(dir, job, logFile);
     if (log) doc.log = log;
+  }
+  // Structured per-suite results. Precedence, so nothing is ever
+  // double-counted: an explicit suites array (the runner's streaming
+  // collection — the authoritative source) wins verbatim; only when
+  // the caller supplied none do we fall back to parsing the run's
+  // actual stored log text (never the doc.log metadata), and then the
+  // display tail. No source at all means an honest empty list.
+  if (Array.isArray(explicitSuites)) {
+    doc.suites = normalizeSuites(explicitSuites);
+  } else {
+    doc.suites = doc.log ? parseSuiteResults(readLog(dir, job.owner, job.repo, job.sha) || "") : [];
+    if (!doc.suites.length && typeof rest.logTail === "string") {
+      doc.suites = parseSuiteResults(rest.logTail);
+    }
   }
   writeFileAtomicSync(join(rdir, `${job.sha}.json`), JSON.stringify(doc, null, 2) + "\n");
   writeFileAtomicSync(join(rdir, "latest.json"), JSON.stringify(doc, null, 2) + "\n");
@@ -418,9 +432,37 @@ export function readLog(dir, owner, repo, sha) {
 export function parseSuiteResults(log) {
   if (typeof log !== "string") return [];
   const suites = [];
-  for (const line of log.split("\n")) {
+  for (const raw of log.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     const m = line.match(/^SUITE_RESULT\t([^\t]+)\t(pass|fail)\t(\d+)$/);
-    if (m) suites.push({ name: m[1], status: m[2], durationMs: Number(m[3]) });
+    if (!m || !m[1].trim()) continue;
+    const durationMs = Number(m[3]);
+    if (!Number.isSafeInteger(durationMs)) continue;
+    suites.push({ name: m[1], status: m[2], durationMs });
   }
   return suites;
+}
+
+/**
+ * Keep only well-formed suite entries from an explicit suites array
+ * (same shape parseSuiteResults returns). Anything else is dropped —
+ * a stored result never carries a half-shaped suite.
+ */
+function normalizeSuites(suites) {
+  const out = [];
+  for (const s of suites) {
+    if (!s || typeof s !== "object") continue;
+    const durationMs =
+      typeof s.durationMs === "string" && /^\d+$/.test(s.durationMs)
+        ? Number(s.durationMs)
+        : s.durationMs;
+    if (
+      typeof s.name === "string" && s.name.trim() && !/[\t\r\n]/.test(s.name) &&
+      (s.status === "pass" || s.status === "fail") &&
+      Number.isSafeInteger(durationMs) && durationMs >= 0
+    ) {
+      out.push({ name: s.name, status: s.status, durationMs });
+    }
+  }
+  return out;
 }
