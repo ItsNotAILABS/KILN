@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { newKeypair } from "./keys.mjs";
 import { nowSec } from "./grant.mjs";
 import {
-  nodeDir, saveNode, writeKeyFile, touchHeartbeat,
+  nodeDir, saveNode, writeKeyFile, touchHeartbeat, loadNode, resolveNode,
 } from "./state.mjs";
 
 /**
@@ -19,7 +19,7 @@ import {
  * self-deadlock plus a 120s API freeze for everyone else. Async keeps the
  * loop alive so the clone's own HTTP requests get answered.
  */
-function gitClone(repo, workdir, timeoutMs) {
+export function gitClone(repo, workdir, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn("git", ["clone", repo, workdir], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";
@@ -36,9 +36,61 @@ function gitClone(repo, workdir, timeoutMs) {
       clearTimeout(timer);
       if (code !== 0) {
         reject(new Error(`nodes: git clone failed: ${(err || out).trim().slice(0, 500) || `signal ${signal}`}`));
-      } else resolve();
+      } else {
+        // Best-effort memory fetch (phase 5), awaited before resolve so
+        // callers see the finished state — but it swallows everything
+        // and time-boxes each step, so it can never fail or hang a clone.
+        fetchMemoryRef(workdir).then(() => resolve(), () => resolve());
+      }
     });
   });
+}
+
+/** Async one-shot git in a workdir; resolves { code, out }, never rejects. */
+function gitRun(workdir, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("git", ["-C", workdir, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    } catch { resolve({ code: -1, out: "" }); return; }
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => resolve({ code: -1, out }));
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      resolve({ code: -1, out });
+    }, timeoutMs);
+    if (timer.unref) timer.unref();
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, out }); });
+  });
+}
+
+/**
+ * Best-effort: give a fresh clone the repo's memory chain
+ * (refs/kiln/memory, phase 5). Runs AFTER a successful clone and can
+ * never fail it — every step is best-effort and non-zero exits are
+ * ignored.
+ *
+ * ASYNC for the same reason gitClone is (E3): this runs inside the
+ * daemon when a node clones a repo the daemon itself serves, so a
+ * spawnSync ls-remote would block the event loop against its own HTTP
+ * server and deadlock until the timeout — the exact bug E3 pins.
+ *
+ * The refspec is persisted ONLY when the ref provably exists on the
+ * remote: an exact refspec naming an absent ref makes every later
+ * plain `git fetch` exit 128 (verified), which would poison the
+ * workdir for the node's whole life. So: probe with ls-remote first;
+ * configure + fetch only on a non-empty answer.
+ */
+async function fetchMemoryRef(workdir) {
+  try {
+    const ls = await gitRun(workdir, ["ls-remote", "origin", "refs/kiln/memory"], 15000);
+    if (ls.code !== 0 || !ls.out.trim()) return;
+    await gitRun(workdir, ["config", "--add", "remote.origin.fetch",
+      "+refs/kiln/memory:refs/kiln/memory"], 15000);
+    await gitRun(workdir, ["fetch", "-q", "origin",
+      "+refs/kiln/memory:refs/kiln/memory"], 15000);
+  } catch { /* best effort: a memory fetch must never fail a clone */ }
 }
 
 function gitSync(workdir, args) {
@@ -155,4 +207,52 @@ export async function createNode(dir, opts) {
   writeKeyFile(dir, id, { privPkcs8B64: kp.privPkcs8B64, pubSpkiB64: kp.pubSpkiB64 });
   touchHeartbeat(dir, id);
   return record;
+}
+
+// ---------------------------------------------------------------------------
+// Restart budget: renewal + revival (2026-10-17).
+//
+// A node's restart budget used to be a one-way ratchet: zeroed at
+// creation, incremented per respawn, never restored — so long-lived
+// nodes burned their budget on daemon/host deaths that were not their
+// fault and died permanently at the cap (the auro node sat dead at
+// 100/100 from 2026-10-10). Two principled exits now:
+//
+//  - EARNED RESTORE: a worker that stays alive with a fresh heartbeat
+//    for RESTART_BUDGET_RESTORE_MS has demonstrated sustained health,
+//    so the daemon restores its budget to full. A genuine crash loop
+//    (dies in seconds) never earns a restore — the cap still protects.
+//  - OPERATOR REVIVE: `node revive` resets a terminally-dead node's
+//    budget by hand. Deliberate, logged by the CLI, never automatic —
+//    a node AT the cap is dead, and dead nodes earn nothing.
+
+/** Sustained-health window after which a live node's budget refills. */
+export const RESTART_BUDGET_RESTORE_MS = 3_600_000; // 1h
+
+/** True when `node` has earned a budget restore as of `nowMs`. */
+export function budgetRestoreDue(node, nowMs) {
+  return (node.restarts || 0) > 0
+    && Number.isFinite(node.workerSpawnedAt)
+    && nowMs - node.workerSpawnedAt >= RESTART_BUDGET_RESTORE_MS;
+}
+
+/** Reset a node's restart budget in place. Returns the prior count. */
+export function restoreBudget(node) {
+  const was = node.restarts || 0;
+  node.restarts = 0;
+  return was;
+}
+
+/**
+ * Operator revive: reset a node's restart budget + last exit so the
+ * daemon respawns it on the next tick (autostart + policy permitting).
+ * Returns { node, was } — `was` is the restart count that was cleared.
+ */
+export function reviveNode(dir, idOrName) {
+  const id = resolveNode(dir, idOrName);
+  const node = loadNode(dir, id);
+  const was = restoreBudget(node);
+  node.lastExit = null;
+  saveNode(dir, node);
+  return { node, was };
 }

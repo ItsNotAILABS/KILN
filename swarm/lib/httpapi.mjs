@@ -49,6 +49,18 @@
  *   POST /git/:owner/:repo/memory/core       {label, value, description?}
  *   GET  /git/:owner/:repo/memory/core|facts|recall|context|stats
  *   POST /git/:owner/:repo/memory/verify     -> {ok, events, commits}
+ *   GET  /memory/recall?q=…                  cross-repo recall (phase 6):
+ *                                    fused hits with per-repo provenance;
+ *                                    unverifiable chains excluded + named
+ * Sites (first-class sites: frontend repo + backend repo + artifact + app):
+ *   POST /v1/sites                  {name, frontend:"o/r", backend:"o/r",
+ *                                    artifact?, computeApp?} -> {ok, site}
+ *                                    (also writes linkage core blocks into
+ *                                    both repos' KILN Memory on create)
+ *   GET  /v1/sites                  -> {sites:[...]} (registry records)
+ *   GET  /v1/sites/:id              -> aggregated live status (repo HEADs,
+ *                                    compute app status, memory linkage)
+ *   DELETE /v1/sites/:id            -> {ok:true, id} (registry entry only)
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -68,8 +80,10 @@ import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "
 import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
-  loadMemory, factsAt, recall, buildContext, memoryStats, verifyMemory, agentAwareness,
+  proposeMemory, resolveProposal,
+  loadMemory, factsAt, recall, recallCrossRepo, buildContext, memoryStats, verifyMemory, agentAwareness,
 } from "./memory.mjs";
+import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
 import {
   snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest,
 } from "./ci.mjs";
@@ -82,6 +96,9 @@ import {
   withPreview, enablePreview, disablePreview, teardownPreview,
   startPreviewReconciler,
 } from "./preview.mjs";
+import {
+  SitesError, createSite, listSites, deleteSite, siteStatus,
+} from "./sites.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -279,6 +296,26 @@ export function startApiServer(dir, cfg) {
         return;
       }
 
+      // ---- cross-repo memory recall (phase 6; authenticated) ----
+      // Read-time fan-out over every repo chain in the state dir;
+      // unverifiable chains are excluded and named in the envelope.
+      if (req.method === "GET" && path === "/memory/recall") {
+        try {
+          const r = recallCrossRepo(dir, url.searchParams.get("q") || "", {
+            limit: parseInt(url.searchParams.get("limit") || "10", 10) || 10,
+            kinds: (url.searchParams.get("kinds") || "").split(",").filter(Boolean),
+            tags: (url.searchParams.get("tags") || "").split(",").filter(Boolean),
+            asOf: url.searchParams.get("asOf") || undefined,
+            since: url.searchParams.get("since") || undefined,
+            until: url.searchParams.get("until") || undefined,
+            includeSuperseded: url.searchParams.get("includeSuperseded") === "1",
+          });
+          return send(res, 200, r);
+        } catch (e) {
+          return send(res, 400, { error: e.message });
+        }
+      }
+
       // ---- per-repo memory (authenticated; held from the git block above) ----
       if (memoryRoute) {
         const { owner, repo, rest } = memoryRoute;
@@ -349,11 +386,35 @@ export function startApiServer(dir, cfg) {
             });
             return send(res, 200, brief);
           }
+          if (req.method === "POST" && rest === "/memory/propose") {
+            const b = await readBody(req);
+            const r = proposeMemory(dir, owner, repo, b);
+            return send(res, 201, { ok: true, event: r.event, proposal: r.event, commit: r.commit });
+          }
+          if (req.method === "GET" && rest === "/memory/proposals") {
+            const st = loadMemory(dir, owner, repo);
+            const want = url.searchParams.get("status");
+            const proposals = want ? st.proposals.filter((x) => x.status === want) : st.proposals;
+            return send(res, 200, { proposals });
+          }
+          if (req.method === "POST" && rest === "/memory/proposals/resolve") {
+            const b = await readBody(req);
+            const r = resolveProposal(dir, owner, repo, b);
+            return send(res, 200, { ok: true, proposal: r.proposal, decision: r.decision, materialized: r.materialized, statusEvent: r.statusEvent, commit: r.commit });
+          }
           if (req.method === "GET" && rest === "/memory/stats") {
             return send(res, 200, memoryStats(dir, owner, repo));
           }
           if (req.method === "POST" && rest === "/memory/verify") {
             return send(res, 200, verifyMemory(dir, owner, repo));
+          }
+          if (req.method === "GET" && rest === "/memory/pubkey") {
+            // Phase 2 discovery: the state dir's memory signing key
+            // (public half) + this repo's signature posture. Creates
+            // the key on first use, like a first write would.
+            const pub = memorySigningPubkey(dir, { create: true });
+            const st = loadMemory(dir, owner, repo);
+            return send(res, 200, { ...pub, repo: `${owner}/${repo}`, signatures: signatureSummary(st.events) });
           }
           return send(res, 404, { error: "not found" });
         } catch (e) {
@@ -575,7 +636,7 @@ export function startApiServer(dir, cfg) {
         const b = await readBody(req);
         const r = await deployApp(dir, {
           name: b.name, repo: b.repo, command: b.command,
-          args: b.args, env: b.env, port: b.port,
+          args: b.args, env: b.env, port: b.port, memoryMB: b.memoryMB,
         });
         if (b.public) {
           // Caffeine-style: public:true auto-enables preview on deploy.
@@ -622,6 +683,43 @@ export function startApiServer(dir, cfg) {
         if (req.method === "DELETE" && m) {
           await teardownPreview(dir, cfg, m[1], plog);
           return send(res, 200, undeployApp(dir, m[1]));
+        }
+      }
+
+      // ---- sites: frontend repo + backend repo + artifact + compute app ----
+      if (req.method === "POST" && path === "/v1/sites") {
+        const b = await readBody(req);
+        try {
+          const site = createSite(dir, {
+            name: b.name, frontend: b.frontend, backend: b.backend,
+            artifact: b.artifact, computeApp: b.computeApp, actor: "api",
+          });
+          return send(res, 201, { ok: true, site });
+        } catch (e) {
+          if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
+      if (req.method === "GET" && path === "/v1/sites") {
+        return send(res, 200, { sites: listSites(dir) });
+      }
+      {
+        const m = path.match(/^\/v1\/sites\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "GET" && m) {
+          try {
+            return send(res, 200, await siteStatus(dir, m[1]));
+          } catch (e) {
+            if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+        if (req.method === "DELETE" && m) {
+          try {
+            return send(res, 200, deleteSite(dir, m[1]));
+          } catch (e) {
+            if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
         }
       }
 

@@ -6,7 +6,9 @@
  *  - settlement is exactly-once per attempt (restart-safe via persisted settleKey)
  *  - infra failures resubmit through admission (attempt+1, retriesLeft kept)
  *  - function errors never retry
- *  - map admission is atomic: all N slots or a 429, never partial
+ *  - map acceptance is whole-map: first wave admits immediately, the
+ *    rest queue inside the map and admit as slots free; a 429 only when
+ *    the box is completely full (2026-10-17 wave scheduling)
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -148,20 +150,79 @@ describe("settlement sweep (settleComputeJobs)", () => {
   });
 });
 
-describe("atomic map admission", () => {
-  it("a map that does not fit is refused with 429 and admits nothing", () => {
+describe("map admission (whole-map acceptance, wave scheduling)", () => {
+  it("a map larger than capacity is accepted whole and admits in waves", () => {
     const dir = freshDir();
-    // MAX_CONCURRENT=2: a 3-item map cannot fit.
+    // MAX_CONCURRENT=2, map of 5: wave 1 takes 2 slots, 3 queue in the map.
+    const { mapId, invocationIds } = compute.submitMap(dir, {
+      name: "waves", code: CODE, items: [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }],
+    });
+    assert.equal(invocationIds.length, 2, "first wave admitted");
+    assert.equal(compute.getCapacity().inflight, 2);
+    let store = loadStore(dir);
+    assert.equal(store.maps[mapId].pendingItems.length, 3, "tail queued in the map record");
+
+    // The queued tail is visible as pending results, in item order.
+    let view = compute.getMap(dir, mapId);
+    assert.equal(view.results.length, 5);
+    assert.deepEqual(view.results.slice(2).map((r) => r.queued), [true, true, true]);
+    assert.equal(view.results[4].name, "waves[4]");
+
+    // Complete wave 1 → the sweep admits wave 2 in the same pass.
+    for (const inv of [...store.maps[mapId].invocationIds]) {
+      const rec = store.invocations[inv];
+      appendEvent(dir, "done", { jobId: rec.jobId, result: { ok: true } });
+    }
+    compute.settleComputeJobs(dir);
+    store = loadStore(dir);
+    assert.equal(store.maps[mapId].invocationIds.length, 4, "wave 2 admitted by the sweep");
+    assert.equal(store.maps[mapId].pendingItems.length, 1);
+    assert.equal(compute.getCapacity().inflight, 2);
+
+    // Complete wave 2 → final item admits; submission params are dropped.
+    for (const inv of store.maps[mapId].invocationIds.slice(2)) {
+      const rec = store.invocations[inv];
+      appendEvent(dir, "done", { jobId: rec.jobId, result: { ok: true } });
+    }
+    compute.settleComputeJobs(dir);
+    store = loadStore(dir);
+    assert.equal(store.maps[mapId].invocationIds.length, 5, "all items admitted");
+    assert.equal(store.maps[mapId].pendingItems, undefined, "queue drained");
+    assert.equal(store.maps[mapId].code, undefined, "submission params dropped after final wave");
+    view = compute.getMap(dir, mapId);
+    assert.equal(view.results.length, 5);
+    assert.equal(view.results.filter((r) => r.queued).length, 0);
+
+    // Complete the last item → every slot frees.
+    const last = store.maps[mapId].invocationIds[4];
+    appendEvent(dir, "done", { jobId: store.invocations[last].jobId, result: { ok: true } });
+    compute.settleComputeJobs(dir);
+    assert.equal(compute.getCapacity().inflight, 0);
+  });
+
+  it("a map on a completely full box is refused with 429 and admits nothing", () => {
+    const dir = freshDir();
+    // Fill both slots with plain invocations: zero free slots.
+    compute.submitInvocation(dir, { name: "fill-1", code: CODE, args: { x: 1 } });
+    compute.submitInvocation(dir, { name: "fill-2", code: CODE, args: { x: 2 } });
+    assert.equal(compute.getCapacity().inflight, 2);
     assert.throws(
       () => compute.submitMap(dir, {
-        name: "atomic-nope", code: CODE, items: [{ x: 1 }, { x: 2 }, { x: 3 }],
+        name: "no-room", code: CODE, items: [{ x: 1 }],
       }),
       (e) => e.status === 429 && /capacity/.test(e.message),
     );
     const store = loadStore(dir);
     assert.deepEqual(store.maps, {}, "no map record on refused admission");
-    assert.deepEqual(store.invocations, {}, "no partial invocations admitted");
-    assert.equal(compute.getCapacity().inflight, 0, "no slots leaked");
+    assert.equal(Object.keys(store.invocations).length, 2, "only the two fills exist");
+
+    // Drain the fills so the module-level inflight counter returns to 0
+    // for the tests that follow in this process.
+    for (const rec of Object.values(store.invocations)) {
+      appendEvent(dir, "done", { jobId: rec.jobId, result: { ok: true } });
+    }
+    compute.settleComputeJobs(dir);
+    assert.equal(compute.getCapacity().inflight, 0);
   });
 
   it("a fitting map admits all items atomically and settles each", () => {

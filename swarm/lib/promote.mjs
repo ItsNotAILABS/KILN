@@ -13,6 +13,19 @@
  * not. The rebuild is also what makes --rebase possible: history is
  * replayed commit-by-commit onto the GitHub tip.
  *
+ * Memory (phase 5): the same promote also carries the repo's memory
+ * chain — refs/kiln/memory, a linear chain of `memory: <type> <id>`
+ * commits whose trees accumulate events/<seq>-<id>.json files — to the
+ * same GitHub repo's refs/kiln/memory. KILN SHAs and GitHub SHAs live
+ * in different spaces here exactly like branches (the API re-stamps
+ * the committer), but the event files and the in-event hash chain are
+ * byte-identical, so content verification works unchanged on the
+ * GitHub copy. Replay is create-or-incremental by event-id prefix; a
+ * diverged remote is a loud skip on the receipt, never a force. A
+ * failed memory step never fails the branch promotion — the branch
+ * ref may already have moved, so the failure lands on the receipt
+ * (receipt.memory.status "failed" + a warning) instead.
+ *
  * Destination (never invented): explicit options > the repo's
  * tools/promote.conf (read from the promoted branch's tip) > error.
  *
@@ -36,7 +49,10 @@
  *   { ok, repo, github, branch, sourceBranch, sourceTip,
  *     commitsTotal, commitsPlanned, commits: [{from,to,subject,blobs}],
  *     rebased, forced, remoteTipBefore, newTip, url,
- *     credential: {source} | null, warnings: [], error: {stage,message,status?} | null }
+ *     credential: {source} | null, warnings: [], error: {stage,message,status?} | null,
+ *     memory: null | { status: "skipped"|"absent"|"up-to-date"|"created"|"updated"|
+ *                      "diverged"|"failed", events?, localTip?, remoteTipBefore?,
+ *                      newTip?, replayed?, error? } }
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -44,6 +60,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { repoPath, repoExists } from "./git.mjs";
+import { verifyEventChain } from "./memory-signing.mjs";
 
 const execFileP = promisify(execFile);
 const API = "https://api.github.com";
@@ -171,6 +188,95 @@ export async function diffEntries(bare, parentRef, sha) {
   return entries;
 }
 
+/**
+ * The local memory chain of a bare repo, oldest → newest:
+ * [{ sha, parent (sha|null), id, type, message (full), author {name,
+ * email, date}, contentBlobOid (string|null) }]. [] when the repo has
+ * no refs/kiln/memory. Pure git plumbing — unit-testable without
+ * GitHub. An unparseable commit subject is a LOUD PromoteError: the
+ * chain's subjects are its index, and guessing would corrupt replay.
+ * The parsed events are also fully verified (hash chain + phase-2
+ * signatures) before the list is returned — replay never carries a
+ * chain that does not authenticate.
+ */
+export async function listMemoryCommits(bare) {
+  let tip;
+  try {
+    tip = await gitText(bare, ["rev-parse", "--verify", "refs/kiln/memory"]);
+  } catch {
+    return []; // no memory ref in this repo
+  }
+  const shas = (await gitText(bare, ["rev-list", "--reverse", tip])).split("\n").filter(Boolean);
+  const out = [];
+  const parsedEvents = [];
+  for (const sha of shas) {
+    const parentsLine = await gitText(bare, ["rev-list", "--parents", "-1", sha]);
+    const parts = parentsLine.split(/\s+/).filter(Boolean);
+    const parent = parts.length > 1 ? parts[1] : null;
+    const message = (await git(bare, ["log", "-1", "--format=%B", sha])).toString().trimEnd();
+    const subject = message.split("\n")[0].trim();
+    const m = /^memory: (\S+) (\S+)$/.exec(subject);
+    if (!m) {
+      throw new PromoteError("git", `unparseable memory commit subject in ${sha.slice(0, 12)}: ${JSON.stringify(subject)}`);
+    }
+    const authorLine = await gitText(bare, ["log", "-1", "--format=%an%x1f%ae%x1f%aI", sha]);
+    const [aName, aEmail, aDate] = authorLine.split("\x1f");
+    // The commit's one added file is the event JSON; a large episode's
+    // content lives in a content-addressed blob the event points at.
+    const entries = await diffEntries(bare, parent ?? EMPTY_TREE, sha);
+    const added = entries.find((e) => e.localSha !== null);
+    let contentBlobOid = null;
+    if (added) {
+      const raw = (await git(bare, ["show", `${sha}:${added.path}`])).toString();
+      let ev;
+      try { ev = JSON.parse(raw); } catch {
+        throw new PromoteError("git", `memory event ${added.path} in ${sha.slice(0, 12)} is not valid JSON`);
+      }
+      contentBlobOid = ev.contentBlob?.oid ?? null;
+      parsedEvents.push(ev);
+    }
+    out.push({
+      sha, parent, id: m[2], type: m[1], message,
+      author: { name: aName, email: aEmail, date: aDate },
+      contentBlobOid,
+    });
+  }
+  // Phase 2: never replay a chain that does not authenticate. The
+  // full walk (prev linkage, hash recompute, signature epoch rules)
+  // runs over the parsed events; a tampered event — body edited, hash
+  // recomputed but signature stale, signature stripped after the
+  // epoch — is a LOUD refusal here, before anything is uploaded.
+  // Pre-epoch events are unsigned-legacy and replay as before.
+  try {
+    verifyEventChain(parsedEvents);
+  } catch (e) {
+    throw new PromoteError("memory_verify", `memory chain of ${bare} failed verification: ${e.message}`);
+  }
+  return out;
+}
+
+/**
+ * Decide how the local memory chain maps onto the GitHub one, from the
+ * remote's event ids (oldest → newest) — or null when GitHub has no
+ * refs/kiln/memory yet. Pure function of the two id sequences:
+ *   remoteIds === null            -> create (replay everything)
+ *   remoteIds is a strict prefix  -> incremental (replay the tail)
+ *   remoteIds === local ids       -> up-to-date
+ *   anything else                 -> diverged (never forced)
+ * An empty remoteIds is diverged, not create: a memory ref that exists
+ * but yields no parseable ids is a state to reconcile, not overwrite.
+ */
+export function planMemoryReplay(localCommits, remoteIds) {
+  if (remoteIds === null) return { mode: "create", commits: localCommits };
+  const localIds = localCommits.map((c) => c.id);
+  const isPrefix = remoteIds.length > 0
+    && remoteIds.length <= localIds.length
+    && remoteIds.every((id, i) => id === localIds[i]);
+  if (!isPrefix) return { mode: "diverged", commits: [] };
+  if (remoteIds.length === localIds.length) return { mode: "up-to-date", commits: [] };
+  return { mode: "incremental", commits: localCommits.slice(remoteIds.length) };
+}
+
 // ---------------------------------------------------------------- github api
 
 async function ghApi(token, method, path, payload) {
@@ -202,11 +308,129 @@ async function ghApi(token, method, path, payload) {
   return { status: res.status, body };
 }
 
+// ---------------------------------------------------------------- memory promotion
+
+/**
+ * Upload one local blob to GitHub and ASSERT the returned SHA equals
+ * the local oid. Git blobs are content-addressed, so the SHA spaces
+ * must agree exactly — a mismatch means the bytes changed in transit
+ * and the replayed chain would not verify. Loud, never papered over.
+ */
+async function uploadBlobAssert(bare, token, ghOwner, ghRepo, localSha, pathForError) {
+  const content = await git(bare, ["cat-file", "blob", localSha], { buffer: true });
+  const blob = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/blobs`, {
+    content: Buffer.from(content).toString("base64"),
+    encoding: "base64",
+  });
+  if (blob.body.sha !== localSha) {
+    throw new PromoteError("memory_replay",
+      `blob sha mismatch for ${pathForError}: local ${localSha} != github ${blob.body.sha}`);
+  }
+  return blob.body.sha;
+}
+
+/**
+ * Carry refs/kiln/memory to GitHub. Sets receipt.memory (+ a warning
+ * on divergence). Throws PromoteError on real failures — the caller
+ * catches and records status "failed" so the branch result stands.
+ */
+async function promoteMemory(bare, token, ghOwner, ghRepo, receipt) {
+  const local = await listMemoryCommits(bare);
+  if (!local.length) {
+    receipt.memory = { status: "absent" };
+    return;
+  }
+  const events = local.length;
+  const localTip = local[local.length - 1].sha;
+
+  // ---- remote state: walk the GitHub chain tip -> root, by subject ----
+  let remoteIds = null;
+  let remoteTip = null;
+  let remoteTree = null;
+  const refRes = await ghApi(token, "GET", `/repos/${ghOwner}/${ghRepo}/git/ref/kiln/memory`);
+  if (refRes.status !== 404) {
+    remoteTip = refRes.body.object.sha;
+    const collected = []; // newest -> oldest
+    let cursor = remoteTip;
+    while (cursor) {
+      const c = await ghApi(token, "GET", `/repos/${ghOwner}/${ghRepo}/git/commits/${cursor}`);
+      if (cursor === remoteTip) remoteTree = c.body.tree.sha;
+      const subject = String(c.body.message || "").split("\n")[0].trim();
+      const m = /^memory: (\S+) (\S+)/.exec(subject);
+      // A subject we cannot parse can never match a local id — push a
+      // sentinel so the planner sees divergence, not a clean prefix.
+      collected.push(m ? m[2] : `__unparseable__${cursor}`);
+      if (collected.length > local.length) break; // longer than local: diverged, stop walking
+      const parents = c.body.parents || [];
+      cursor = parents.length ? parents[0].sha : null;
+    }
+    remoteIds = collected.reverse(); // oldest -> newest, for the planner
+  }
+
+  const plan = planMemoryReplay(local, remoteIds);
+  if (plan.mode === "up-to-date") {
+    receipt.memory = { status: "up-to-date", events, localTip, remoteTipBefore: remoteTip, newTip: remoteTip, replayed: 0 };
+    return;
+  }
+  if (plan.mode === "diverged") {
+    receipt.memory = { status: "diverged", events, localTip, remoteTipBefore: remoteTip };
+    receipt.warnings.push("memory promotion skipped: GitHub refs/kiln/memory has diverged from the local chain (no force — reconcile manually)");
+    return;
+  }
+
+  // ---- create / incremental: replay the planned commits ----
+  const state = { sha: remoteTip, tree: remoteTree };
+  for (const c of plan.commits) {
+    const entries = await diffEntries(bare, c.parent ?? EMPTY_TREE, c.sha);
+    const treeEntries = [];
+    for (const e of entries) {
+      if (e.localSha === null) {
+        treeEntries.push({ path: e.path, mode: e.mode, type: "blob", sha: null });
+      } else if (e.type === "commit") {
+        treeEntries.push({ path: e.path, mode: e.mode, type: "commit", sha: e.localSha });
+      } else {
+        const sha = await uploadBlobAssert(bare, token, ghOwner, ghRepo, e.localSha, e.path);
+        treeEntries.push({ path: e.path, mode: e.mode, type: "blob", sha });
+      }
+    }
+    // A large episode's content blob rides along, asserted the same way.
+    if (c.contentBlobOid) {
+      await uploadBlobAssert(bare, token, ghOwner, ghRepo, c.contentBlobOid, "contentBlob");
+    }
+    const treePayload = { tree: treeEntries };
+    if (state.tree) treePayload.base_tree = state.tree;
+    const tree = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/trees`, treePayload);
+    const commit = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/commits`, {
+      message: c.message,
+      author: c.author,
+      tree: tree.body.sha,
+      parents: state.sha ? [state.sha] : [],
+    });
+    state.sha = commit.body.sha;
+    state.tree = tree.body.sha;
+  }
+  if (plan.mode === "create") {
+    await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/refs`, {
+      ref: "refs/kiln/memory", sha: state.sha,
+    });
+  } else {
+    await ghApi(token, "PATCH", `/repos/${ghOwner}/${ghRepo}/git/refs/kiln/memory`, {
+      sha: state.sha, force: false,
+    });
+  }
+  receipt.memory = {
+    status: plan.mode === "create" ? "created" : "updated",
+    events, localTip, remoteTipBefore: remoteTip, newTip: state.sha,
+    replayed: plan.commits.length,
+  };
+}
+
 // ---------------------------------------------------------------- promote
 
 /**
  * Promote KILN repo <owner>/<repo> (in state dir `dir`) to GitHub.
- * opts: { githubOwner, githubRepo, branch, rebase, force }.
+ * opts: { githubOwner, githubRepo, branch, rebase, force, memory }.
+ * opts.memory === false skips the refs/kiln/memory step entirely.
  * Always resolves with a receipt; never rejects for expected failures.
  */
 export async function promoteRepo(dir, owner, repo, opts = {}) {
@@ -227,6 +451,7 @@ export async function promoteRepo(dir, owner, repo, opts = {}) {
     url: null,
     credential: null,
     warnings: [],
+    memory: null,
     error: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
@@ -332,64 +557,80 @@ async function promoteInner(dir, owner, repo, opts, receipt) {
   if (!commits.length) {
     receipt.error = null;
     receipt.note = "already up to date";
-    return;
-  }
-
-  // ---- rebuild history on GitHub ----
-  let newRemoteSha = opts.force ? null : remoteSha;
-  let newRemoteTree = opts.force ? null : remoteTree;
-  for (const sha of commits) {
-    const parentsLine = await gitText(bare, ["rev-list", "--parents", "-1", sha]);
-    const parents = parentsLine.split(/\s+/).filter(Boolean);
-    const isRoot = parents.length === 1;
-    const parentRef = isRoot ? EMPTY_TREE : parents[1];
-
-    const local = await diffEntries(bare, parentRef, sha);
-    const treeEntries = [];
-    let blobCount = 0;
-    for (const e of local) {
-      if (e.localSha === null) {
-        treeEntries.push({ path: e.path, mode: e.mode, type: "blob", sha: null });
-      } else if (e.type === "commit") {
-        treeEntries.push({ path: e.path, mode: e.mode, type: "commit", sha: e.localSha });
-      } else {
-        const content = await git(bare, ["cat-file", "blob", e.localSha], { buffer: true });
-        const blob = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/blobs`, {
-          content: Buffer.from(content).toString("base64"),
-          encoding: "base64",
-        });
-        treeEntries.push({ path: e.path, mode: e.mode, type: "blob", sha: blob.body.sha });
-        blobCount++;
-      }
-    }
-    const treePayload = { tree: treeEntries };
-    if (newRemoteTree) treePayload.base_tree = newRemoteTree;
-    const tree = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/trees`, treePayload);
-
-    const authorLine = await gitText(bare, ["log", "-1", "--format=%an%x1f%ae%x1f%aI", sha]);
-    const [aName, aEmail, aDate] = authorLine.split("\x1f");
-    const message = (await git(bare, ["log", "-1", "--format=%B", sha])).toString().trimEnd();
-    const subject = (await gitText(bare, ["log", "-1", "--format=%s", sha])).slice(0, 80);
-    const commit = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/commits`, {
-      message,
-      author: { name: aName, email: aEmail, date: aDate },
-      tree: tree.body.sha,
-      parents: newRemoteSha ? [newRemoteSha] : [],
-    });
-    newRemoteSha = commit.body.sha;
-    newRemoteTree = tree.body.sha;
-    receipt.commits.push({ from: sha, to: newRemoteSha, subject, blobs: blobCount });
-  }
-
-  // ---- move the ref ----
-  if (remoteSha) {
-    await ghApi(token, "PATCH", `/repos/${ghOwner}/${ghRepo}/git/refs/heads/${branch}`, {
-      sha: newRemoteSha, force: !!opts.force,
-    });
   } else {
-    await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/refs`, {
-      ref: `refs/heads/${branch}`, sha: newRemoteSha,
-    });
+    // ---- rebuild history on GitHub ----
+    let newRemoteSha = opts.force ? null : remoteSha;
+    let newRemoteTree = opts.force ? null : remoteTree;
+    for (const sha of commits) {
+      const parentsLine = await gitText(bare, ["rev-list", "--parents", "-1", sha]);
+      const parents = parentsLine.split(/\s+/).filter(Boolean);
+      const isRoot = parents.length === 1;
+      const parentRef = isRoot ? EMPTY_TREE : parents[1];
+
+      const local = await diffEntries(bare, parentRef, sha);
+      const treeEntries = [];
+      let blobCount = 0;
+      for (const e of local) {
+        if (e.localSha === null) {
+          treeEntries.push({ path: e.path, mode: e.mode, type: "blob", sha: null });
+        } else if (e.type === "commit") {
+          treeEntries.push({ path: e.path, mode: e.mode, type: "commit", sha: e.localSha });
+        } else {
+          const content = await git(bare, ["cat-file", "blob", e.localSha], { buffer: true });
+          const blob = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/blobs`, {
+            content: Buffer.from(content).toString("base64"),
+            encoding: "base64",
+          });
+          treeEntries.push({ path: e.path, mode: e.mode, type: "blob", sha: blob.body.sha });
+          blobCount++;
+        }
+      }
+      const treePayload = { tree: treeEntries };
+      if (newRemoteTree) treePayload.base_tree = newRemoteTree;
+      const tree = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/trees`, treePayload);
+
+      const authorLine = await gitText(bare, ["log", "-1", "--format=%an%x1f%ae%x1f%aI", sha]);
+      const [aName, aEmail, aDate] = authorLine.split("\x1f");
+      const message = (await git(bare, ["log", "-1", "--format=%B", sha])).toString().trimEnd();
+      const subject = (await gitText(bare, ["log", "-1", "--format=%s", sha])).slice(0, 80);
+      const commit = await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/commits`, {
+        message,
+        author: { name: aName, email: aEmail, date: aDate },
+        tree: tree.body.sha,
+        parents: newRemoteSha ? [newRemoteSha] : [],
+      });
+      newRemoteSha = commit.body.sha;
+      newRemoteTree = tree.body.sha;
+      receipt.commits.push({ from: sha, to: newRemoteSha, subject, blobs: blobCount });
+    }
+
+    // ---- move the ref ----
+    if (remoteSha) {
+      await ghApi(token, "PATCH", `/repos/${ghOwner}/${ghRepo}/git/refs/heads/${branch}`, {
+        sha: newRemoteSha, force: !!opts.force,
+      });
+    } else {
+      await ghApi(token, "POST", `/repos/${ghOwner}/${ghRepo}/git/refs`, {
+        ref: `refs/heads/${branch}`, sha: newRemoteSha,
+      });
+    }
+    receipt.newTip = newRemoteSha;
   }
-  receipt.newTip = newRemoteSha;
+
+  // ---- memory: carry refs/kiln/memory to the same GitHub repo ----
+  // Runs on BOTH the rebuilt and the already-up-to-date branch paths: a
+  // branch can be current while the memory chain still needs carrying.
+  // A memory failure never fails the promotion — the branch ref may
+  // already have moved, so failing the receipt would misreport it.
+  if (opts.memory === false) {
+    receipt.memory = { status: "skipped" };
+  } else {
+    try {
+      await promoteMemory(bare, token, ghOwner, ghRepo, receipt);
+    } catch (e) {
+      const msg = e instanceof PromoteError ? e.message : String((e && e.message) || e);
+      receipt.memory = { status: "failed", error: msg };
+      receipt.warnings.push(`memory promotion failed: ${msg}`);
+    }
+  }
 }

@@ -64,6 +64,27 @@ describe("pidIsWorker", () => {
     assert.equal(pidIsWorker(0, dir), false);
     assert.equal(pidIsWorker(undefined, dir), false);
   });
+
+  // Regression (2026-10-22): a dead worker's pid recycled by ANOTHER
+  // node's worker passed the any-worker check — reconcile() adopted the
+  // sibling as this node's live worker and the real app nodes wedged in
+  // "starting" ~25 min. The per-node check requires argv `worker.mjs <id>`.
+  it("with a node id, accepts only the worker carrying that id", async () => {
+    const dir = makeStateDir();
+    const probePath = join(dir, "probe-worker.mjs"); // path contains worker.mjs
+    writeFileSync(probePath, "setInterval(() => {}, 60000);\n");
+    const child = spawn(process.execPath, [probePath, "node-aaa"], {
+      env: { ...process.env, KILN_SWARM_DIR: dir },
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    cleanupPids.push(child.pid);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(pidIsWorker(child.pid, dir, "node-aaa"), true, "own worker must count");
+    assert.equal(pidIsWorker(child.pid, dir, "node-bbb"), false, "a sibling node's worker must NOT count as this node's worker");
+    assert.equal(pidIsWorker(child.pid, dir), true, "no-id callers keep the legacy any-worker behavior");
+  });
 });
 
 describe("daemon does not adopt a pid-reuse stranger", () => {

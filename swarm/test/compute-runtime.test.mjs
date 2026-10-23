@@ -55,6 +55,7 @@ describe("KILN compute runtime (real daemon + real sandbox)", () => {
         KILN_SWARM_DIR: dir,
         KILN_SWARM_API_PORT: "0",
         KILN_COMPUTE_MAX_CONCURRENT: "2",
+        KILN_APP_LOG_MAX_BYTES: "65536",
         KILN_RT_SECRET_MARKER: "should-never-leak",
       },
       stdio: "ignore",
@@ -301,6 +302,71 @@ describe("KILN compute runtime (real daemon + real sandbox)", () => {
     assert.match(log, /MARKER=undefined/, "daemon env must not leak into the app");
     assert.match(log, /KEYS=.*DECLARED/, "declared env is present");
     assert.doesNotMatch(log, /KILN_RT_SECRET_MARKER/, "marker name absent from app env");
+    await kiln.undeployApp(app.appId);
+  });
+
+  it("app memory cap kills a hog, records the breach, and restarts the app", async () => {
+    const repo = makeGitRepo();
+    const NL = String.fromCharCode(10);
+    writeFileSync(
+      join(repo, "hog.mjs"),
+      ["const keep = [];",
+       "setInterval(() => { if (keep.length < 12) keep.push(new Array(2 * 1024 * 1024).fill(7)); }, 250);",
+       "setInterval(() => {}, 1000);", ""].join(NL)
+    );
+    const { execSync } = await import("node:child_process");
+    execSync("git add -A && git commit -qm hog", { cwd: repo });
+    const app = await kiln.deployApp({
+      name: "rt-hog",
+      repo,
+      command: "node",
+      args: ["hog.mjs"],
+      memoryMB: 64,
+    });
+    assert.ok(app.appId);
+    // The hog grows ~16MB/250ms past the 64MB cap; the supervisor's 5s
+    // meter must kill the tree and record the breach in app runtime state.
+    let st = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 90000) {
+      st = await kiln.appStatus(app.appId);
+      if (st.runtime && (st.runtime.capBreaches || 0) >= 1) break;
+      await sleep(1000);
+    }
+    assert.ok(st.runtime, "runtime metering state exists");
+    assert.equal(st.memoryMB, 64);
+    assert.ok((st.runtime.capBreaches || 0) >= 1, `expected a recorded cap breach, got ${JSON.stringify(st.runtime)}`);
+    assert.ok(st.runtime.lastBreachRssBytes > 64 * 1024 * 1024, "breach RSS recorded above the cap");
+    await kiln.undeployApp(app.appId);
+  });
+
+  it("app.log rotates at the configured size instead of growing forever", async () => {
+    const repo = makeGitRepo();
+    const NL = String.fromCharCode(10);
+    writeFileSync(
+      join(repo, "chatty.mjs"),
+      ["const line = \"x\".repeat(1000) + String.fromCharCode(10);",
+       "setInterval(() => process.stdout.write(line), 5);", ""].join(NL)
+    );
+    const { execSync } = await import("node:child_process");
+    execSync("git add -A && git commit -qm chatty", { cwd: repo });
+    const app = await kiln.deployApp({
+      name: "rt-chatty",
+      repo,
+      command: "node",
+      args: ["chatty.mjs"],
+    });
+    assert.ok(app.appId);
+    const { existsSync, statSync } = await import("node:fs");
+    const logPath = join(dir, "nodes", app.appId, "app.log");
+    const t0 = Date.now();
+    let rotated = false;
+    while (Date.now() - t0 < 60000) {
+      if (existsSync(`${logPath}.1`)) { rotated = true; break; }
+      await sleep(500);
+    }
+    assert.ok(rotated, "app.log.1 appeared (rotation happened)");
+    assert.ok(statSync(logPath).size <= 65536 + 8192, "live app.log stays bounded near the threshold");
     await kiln.undeployApp(app.appId);
   });
 

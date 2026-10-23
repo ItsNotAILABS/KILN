@@ -124,7 +124,8 @@ function admit() {
 
 /**
  * Atomic multi-slot admission: all n slots or a 429 — never partial.
- * Used by map so a 64-item fan-out can't strand a half-admitted map.
+ * Used by map for its first wave (the remaining items queue inside the
+ * map record and admit through the settlement sweep, never stranded).
  */
 function admitN(n) {
   if (inflight + n > MAX_CONCURRENT) {
@@ -389,26 +390,18 @@ function readJsonFile(p) {
  * when the box is full the caller gets a 429 (with Retry-After at the
  * HTTP layer) instead of an unbounded queue.
  */
-export function submitInvocation(dir, { name, code, args, timeoutMs, memoryMB, network, retries, kind = "invoke", mapId = null, _admitted = false }) {
+/**
+ * The submission core, split out so callers that already hold the store
+ * (the settlement sweep's map-wave pass) can add invocations without a
+ * load/save cycle that would clobber the sweep's own pending mutations.
+ * Admission is the caller's job, exactly like retryInvocation.
+ */
+function submitInvocationInto(dir, store, { name, code, args, timeoutMs, memoryMB, network, retries, kind = "invoke", mapId = null }) {
   const memMB = needMemoryMB(memoryMB);
   const net = needNetwork(network);
   const maxRetries = needRetries(retries);
-  if (!_admitted) {
-    // Reconcile before deciding: jobs that completed since the last tick
-    // free their slots here, so a submit right after a wait doesn't see
-    // stale capacity. (The tick remains the primary settler; this is a
-    // just-in-time reconciliation, idempotent and poll-free.)
-    settleComputeJobs(dir);
-    admit();
-  }
   const invId = newInvocationId();
-  let plan, t;
-  try {
-    ({ plan, timeoutMs: t } = compileInvokePlan({ invId, code, args, timeoutMs, memoryMB: memMB, network: net }));
-  } catch (e) {
-    if (!_admitted) release();
-    throw e;
-  }
+  const { plan, timeoutMs: t } = compileInvokePlan({ invId, code, args, timeoutMs, memoryMB: memMB, network: net });
   const job = {
     id: newJobId(),
     name: String(name || `invoke-${invId.slice(4, 10)}`),
@@ -417,7 +410,6 @@ export function submitInvocation(dir, { name, code, args, timeoutMs, memoryMB, n
     compute: { invId, kind, timeoutMs: t },
   };
   const submitEv = appendEvent(dir, "submit", { job });
-  const store = loadStore(dir);
   store.invocations[invId] = {
     jobId: job.id,
     name: job.name,
@@ -431,8 +423,27 @@ export function submitInvocation(dir, { name, code, args, timeoutMs, memoryMB, n
     attempt: 1,
     createdAt: Math.floor(Date.now() / 1000),
   };
-  saveStore(dir, store);
   return { invocationId: invId, jobId: job.id };
+}
+
+export function submitInvocation(dir, { name, code, args, timeoutMs, memoryMB, network, retries, kind = "invoke", mapId = null, _admitted = false }) {
+  if (!_admitted) {
+    // Reconcile before deciding: jobs that completed since the last tick
+    // free their slots here, so a submit right after a wait doesn't see
+    // stale capacity. (The tick remains the primary settler; this is a
+    // just-in-time reconciliation, idempotent and poll-free.)
+    settleComputeJobs(dir);
+    admit();
+  }
+  try {
+    const store = loadStore(dir);
+    const out = submitInvocationInto(dir, store, { name, code, args, timeoutMs, memoryMB, network, retries, kind, mapId });
+    saveStore(dir, store);
+    return out;
+  } catch (e) {
+    if (!_admitted) release();
+    throw e;
+  }
 }
 
 /** Errors worth one automatic retry: sandbox infra failed, never the function. */
@@ -564,6 +575,44 @@ export function settleComputeJobs(dir) {
       changed = true;
     }
   }
+  // Map waves: maps are accepted whole (see submitMap) and their queued
+  // items admit here as slots free — same admission discipline as the
+  // deferred retries above. pendingItems is a FIFO of the map's tail, so
+  // invocationIds stays in item order.
+  for (const [mapId, rec] of Object.entries(store.maps)) {
+    if (!rec.pendingItems || !rec.pendingItems.length) continue;
+    while (rec.pendingItems.length) {
+      try { admit(); } catch { break; } // at capacity: a later sweep retries
+      const head = rec.pendingItems[0];
+      try {
+        const { invocationId } = submitInvocationInto(dir, store, {
+          name: `${rec.submitName || "map"}[${head.i}]`,
+          code: rec.code,
+          args: head.args,
+          timeoutMs: rec.timeoutMs,
+          memoryMB: rec.memoryMB,
+          network: rec.network,
+          retries: rec.retries,
+          kind: "map-item",
+          mapId,
+        });
+        rec.pendingItems.shift();
+        rec.invocationIds.push(invocationId);
+        changed = true;
+      } catch {
+        release(); // failed after admission: hand the slot back, retry next sweep
+        break;
+      }
+    }
+    if (!rec.pendingItems.length && rec.code !== undefined) {
+      // Fully submitted: drop the submission params (code can be 256KB)
+      // so the store doesn't carry them for the map's whole lifetime.
+      delete rec.code; delete rec.submitName; delete rec.timeoutMs;
+      delete rec.memoryMB; delete rec.network; delete rec.retries;
+      delete rec.pendingItems;
+      changed = true;
+    }
+  }
   store.settleSeq = maxSeq;
   if (changed || maxSeq !== oldSeq) saveStore(dir, store);
 }
@@ -676,14 +725,27 @@ export function submitMap(dir, { name, code, items, timeoutMs, memoryMB, network
   // Validate EVERY item before admission: a map is all-or-nothing.
   for (const item of items) checkArgs(item);
   // Reconcile before deciding (see submitInvocation): completed jobs free
-  // their slots first so the atomic admission sees real capacity.
+  // their slots first so admission sees real capacity.
   settleComputeJobs(dir);
-  // Atomic admission: all N slots or a 429 — never a partially-admitted map.
-  admitN(items.length);
+  // Whole-map acceptance, wave scheduling (2026-10-17): the map is
+  // accepted as a unit whenever at least one slot is free — the first
+  // wave takes the free slots now, the remaining items queue INSIDE the
+  // map record and are admitted by the settlement sweep as slots free
+  // (see the map-wave pass in settleComputeJobs). A 429 means the box is
+  // completely full. The old rule (all N slots up front or nothing) made
+  // any map larger than MAX_CONCURRENT un-submittable at default
+  // settings, contradicting the advertised MAX_ITEMS.
+  const free = MAX_CONCURRENT - inflight;
+  if (free <= 0) {
+    throw new ComputeError(429,
+      `compute at capacity: ${inflight}/${MAX_CONCURRENT} in flight — retry shortly`);
+  }
+  const wave = Math.min(items.length, free);
+  admitN(wave);
   const mapId = newMapId();
   const invocationIds = [];
   try {
-    for (let i = 0; i < items.length; i++) {
+    for (let i = 0; i < wave; i++) {
       const { invocationId } = submitInvocation(dir, {
         name: `${name || "map"}[${i}]`,
         code,
@@ -694,23 +756,34 @@ export function submitMap(dir, { name, code, items, timeoutMs, memoryMB, network
         retries: maxRetries,
         kind: "map-item",
         mapId,
-        _admitted: true, // slots already taken atomically above
+        _admitted: true, // slots already taken by the wave admission above
       });
       invocationIds.push(invocationId);
     }
   } catch (e) {
     // Mid-loop failure (nearly unreachable after pre-validation): release
-    // only the slots for items never submitted. Submitted items keep their
-    // slots and settle normally; they're traceable via their mapId.
-    releaseN(items.length - invocationIds.length);
+    // only the wave slots for items never submitted. Submitted items keep
+    // their slots and settle normally; they're traceable via their mapId.
+    releaseN(wave - invocationIds.length);
     throw e;
   }
   const store = loadStore(dir);
-  store.maps[mapId] = {
+  const rec = {
     name: String(name || `map-${mapId.slice(4, 10)}`),
     invocationIds,
     createdAt: Math.floor(Date.now() / 1000),
   };
+  if (wave < items.length) {
+    // The queued tail + everything the wave pass needs to submit it.
+    rec.submitName = String(name || "map");
+    rec.code = code;
+    rec.timeoutMs = t;
+    rec.memoryMB = memMB;
+    rec.network = net;
+    rec.retries = maxRetries;
+    rec.pendingItems = items.slice(wave).map((args, k) => ({ i: wave + k, args }));
+  }
+  store.maps[mapId] = rec;
   saveStore(dir, store);
   return { mapId, invocationIds };
 }
@@ -726,6 +799,19 @@ export function getMap(dir, mapId) {
       return { invocationId: id, status: "error", error: e.message };
     }
   });
+  // Queued items (accepted with the map, not yet wave-admitted) report
+  // as pending: they are always the map's tail, so appending preserves
+  // item order, and waiters see pending > 0 until every item is in.
+  for (const p of rec.pendingItems || []) {
+    results.push({
+      invocationId: null,
+      name: `${rec.submitName || "map"}[${p.i}]`,
+      kind: "map-item",
+      mapId,
+      status: "pending",
+      queued: true,
+    });
+  }
   const counts = {};
   for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1;
   return { mapId, name: rec.name, counts, results };
@@ -760,7 +846,17 @@ function checkAppEnv(env) {
  * Deploy a repo as a persistent supervised service. The worker boots the
  * app's command on (re)start and restarts it on crash; logs go to app.log.
  */
-export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, port }) {
+/** App memory cap: wider than the invocation range — services are long-lived. */
+function needAppMemoryMB(v) {
+  if (v === undefined) return 512;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 64 || n > 16384) {
+    throw new ComputeError(400, "memoryMB must be an integer in 64..16384");
+  }
+  return n;
+}
+
+export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, port, memoryMB }) {
   checkAppName(name);
   if (typeof repo !== "string" || !repo.trim()) throw new ComputeError(400, "repo is required");
   if (typeof command !== "string" || !command.trim()) throw new ComputeError(400, "command is required");
@@ -796,6 +892,7 @@ export async function deployApp(dir, { name, repo, command, args: cmdArgs, env, 
     args: argv,
     env: cleanEnv,
     port: p,
+    memoryMB: needAppMemoryMB(memoryMB),
     deployedAt: new Date().toISOString(),
   };
   writeFileSync(join(nodeDir(dir, node.id), "app.json"), JSON.stringify(appCfg, null, 2) + "\n", { mode: 0o600 });
@@ -835,11 +932,19 @@ export async function appStatus(dir, appId) {
   if (cfg.port && workerAlive) {
     ready = await probeTcp(cfg.port);
   }
+  // Runtime metering written by the worker's app supervisor (may be
+  // absent for apps deployed before metering existed).
+  let runtime = null;
+  try {
+    runtime = JSON.parse(readFileSync(join(nodeDir(dir, appId), "app-state.json"), "utf8"));
+  } catch { /* no state yet */ }
   return {
     appId,
     name: cfg.name,
     command: cfg.command,
     port: cfg.port,
+    memoryMB: cfg.memoryMB ?? null,
+    runtime,
     deployedAt: cfg.deployedAt || null,
     workerAlive,
     // status reflects application readiness, not just process liveness:

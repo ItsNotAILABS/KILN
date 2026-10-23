@@ -9,8 +9,9 @@
  * stays alive), 3 grant expired, 1 unexpected crash (restart policy applies).
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, openSync, closeSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { createRotatingLog } from "./rotlog.mjs";
 import {
   stateDir, loadNode, loadKeyFile, touchHeartbeat, nodeDir,
   readJobFile, clearJobFile, heartbeatAgeMs,
@@ -37,6 +38,93 @@ function killApp() {
 
 function appJsonPath(dir, nodeId) {
   return join(nodeDir(dir, nodeId), "app.json");
+}
+
+// ---------------------------------------------------------------------------
+// App runtime metering + memory cap (2026-10-17).
+//
+// Apps used to run with no limits and no telemetry: unbounded app.log,
+// no RSS bound, no usage record. The supervisor now samples the app's
+// process tree from /proc every 5s: RSS is capped when app.json carries
+// memoryMB (a breach kills the whole tree; the normal restart/backoff
+// loop applies and the breach is recorded), CPU time is metered only.
+// State lands in app-state.json next to app.json and is surfaced by
+// compute's appStatus/listApps as `runtime`.
+//
+// Honest bounds: enforcement is polling (≤5s lag), not cgroup — this
+// cell mounts /sys/fs/cgroup read-only. No network namespace: apps
+// bind real ports by design. See docs/KILN_COMPUTE.md "App guardrails".
+
+function appStatePath(dir, nodeId) {
+  return join(nodeDir(dir, nodeId), "app-state.json");
+}
+
+function readAppState(dir, nodeId) {
+  try { return JSON.parse(readFileSync(appStatePath(dir, nodeId), "utf8")); }
+  catch { return {}; }
+}
+
+function writeAppState(dir, nodeId, patch) {
+  try {
+    writeFileSync(appStatePath(dir, nodeId), JSON.stringify({ ...readAppState(dir, nodeId), ...patch }));
+  } catch { /* metering must never break supervision */ }
+}
+
+/** pid -> ppid for the whole system, from /proc stat files. */
+function procParents() {
+  const ppid = new Map();
+  let entries = [];
+  try { entries = readdirSync("/proc").filter((e) => /^\d+$/.test(e)); } catch { return ppid; }
+  for (const e of entries) {
+    try {
+      const stat = readFileSync(`/proc/${e}/stat`, "utf8");
+      // comm may contain spaces/parens: ppid follows the LAST ")".
+      const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      ppid.set(Number(e), Number(rest[1]));
+    } catch { /* vanished mid-scan */ }
+  }
+  return ppid;
+}
+
+function treePids(rootPid) {
+  const ppid = procParents();
+  const kids = new Map();
+  for (const [pid, parent] of ppid) {
+    if (!kids.has(parent)) kids.set(parent, []);
+    kids.get(parent).push(pid);
+  }
+  const out = [rootPid];
+  for (let i = 0; i < out.length; i++) {
+    for (const k of kids.get(out[i]) || []) out.push(k);
+  }
+  return out;
+}
+
+function pidRssBytes(pid) {
+  try {
+    const m = readFileSync(`/proc/${pid}/status`, "utf8").match(/^VmRSS:\s+(\d+) kB/m);
+    return m ? Number(m[1]) * 1024 : 0;
+  } catch { return 0; }
+}
+
+function pidCpuMs(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    // rest[0] is state (field 3); utime is field 14 → rest[11], stime 15 → rest[12].
+    // Linux clock ticks are 100/s on the platforms this runs on.
+    return (Number(rest[11]) + Number(rest[12])) * 10;
+  } catch { return 0; }
+}
+
+function treeRssBytes(rootPid) {
+  return treePids(rootPid).reduce((sum, pid) => sum + pidRssBytes(pid), 0);
+}
+
+function killTree(rootPid, signal) {
+  for (const pid of treePids(rootPid).reverse()) {
+    try { process.kill(pid, signal); } catch { /* already gone */ }
+  }
 }
 
 /**
@@ -102,7 +190,9 @@ async function superviseApp(dir, nodeId) {
       backoffMs = Math.min(backoffMs * 2, 30000);
       continue;
     }
-    const logFd = openSync(join(nodeDir(dir, nodeId), "app.log"), "a");
+    // App output pipes through a rotating log (10MB × 3 files): an app
+    // can no longer fill the node's disk by talking forever.
+    const appLog = createRotatingLog(join(nodeDir(dir, nodeId), "app.log"));
     log(`app: starting ${app.command} ${(app.args || []).join(" ")}`);
     // Explicit environment allowlist: the app gets a minimal env plus ONLY
     // its declared env entries. It never inherits the worker's environment
@@ -116,12 +206,47 @@ async function superviseApp(dir, nodeId) {
         ...(app.port ? { PORT: String(app.port) } : {}),
         ...(app.env || {}),
       },
-      stdio: ["ignore", logFd, logFd],
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    closeSync(logFd);
+    child.stdout.on("data", (d) => appLog.write(d));
+    child.stderr.on("data", (d) => appLog.write(d));
     appChild = child;
+    // Metering + memory-cap supervision for this run of the app.
+    const capBytes = Number.isFinite(app.memoryMB) && app.memoryMB > 0
+      ? app.memoryMB * 1024 * 1024 : null;
+    writeAppState(dir, nodeId, {
+      pid: child.pid ?? null, startedAt: Date.now(),
+      rssBytes: 0, cpuMs: 0, logRotations: appLog.rotations,
+    });
+    let breach = false;
+    const meter = setInterval(() => {
+      if (!child.pid) return;
+      const rss = treeRssBytes(child.pid);
+      writeAppState(dir, nodeId, {
+        rssBytes: rss, cpuMs: pidCpuMs(child.pid), logRotations: appLog.rotations,
+      });
+      if (capBytes && rss > capBytes && !breach) {
+        breach = true;
+        const st = readAppState(dir, nodeId);
+        writeAppState(dir, nodeId, {
+          capBreaches: (st.capBreaches || 0) + 1,
+          lastBreachAt: Date.now(), lastBreachRssBytes: rss,
+        });
+        log(`app: MEMORY CAP BREACH — tree RSS ${(rss / 1048576).toFixed(0)}MB > cap ${app.memoryMB}MB — killing tree`);
+        killTree(child.pid, "SIGKILL");
+      }
+    }, 5000);
+    if (meter.unref) meter.unref();
     const code = await new Promise((resolve) => child.on("exit", resolve));
+    clearInterval(meter);
+    appLog.end();
     appChild = null;
+    const prev = readAppState(dir, nodeId);
+    writeAppState(dir, nodeId, {
+      pid: null,
+      lastExit: { code, at: Date.now(), ...(breach ? { breach: true } : {}) },
+      restarts: (prev.restarts || 0) + 1,
+    });
     if (stopping) { log("app: stopped"); return; }
     log(`app: exited (code ${code}) — restarting in ${backoffMs}ms`);
     await sleep(backoffMs);

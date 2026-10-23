@@ -1,8 +1,11 @@
 # KILN Memory — infinite memory per repo
 
-**Status:** on `main` (merged as `ef535bf`). Library, HTTP API, client
-SDK, and CLI. `memory sit` is the brief an agent prints before it
-writes. The live daemon picks new routes up on its next restart.
+**Status:** v1 merged to main (`e45c69f`) and live since 2026-10-14 —
+library + HTTP API + client SDK + CLI. `memory sit` is the brief an
+agent prints before it writes. Phase 1 (FTS5 index sidecar)
+built 2026-10-17; phases 2 (signed events), 3 (vector recall tier)
+and 6 (cross-repo recall) built 2026-10-22. **The phase list is
+complete** — see "Phases after v1" below.
 
 ## The one-sentence version
 
@@ -109,7 +112,25 @@ BM25** (pure JS, no dependencies — the swarm's standing rule), then:
   hit is pulled in with a score bonus and a `via: "link:<relation>:<id>"`
   marker, so every ranking decision is explainable;
 - filters by kind, tags, and time window; facts can be queried as of
-  any date.
+  any date;
+- **fuses the phase-3 vector tier** into the same ranking: each doc's
+  cosine similarity to the query vector is blended with its
+  normalized lexical score (weight 0.35), and eligible docs the
+  lexical pass missed can enter as `via: "vector"` hits. A fused
+  result keeps its lexical `engine` and names the tier in a `fusion`
+  block (embedder id, dimension, weight, signal label); docs carry
+  their raw cosine as `vectorScore`. The tier never widens
+  eligibility — its candidate universe is the same kinds /
+  since / until / tags / `factsAt()` rules, computed from the
+  replayed, signature-verified state.
+- **spans repos on request (phase 6)**: `recallCrossRepo` fans the
+  same per-repo recall out over every chain in the state dir and
+  fuses the results. Each repo is first read through the phase-2
+  signature-verified path; scores are max-normalized per repo
+  before merging (per-repo corpus statistics are not comparable),
+  and every hit carries its repo, its engine/tier, and its chain's
+  signing posture. It is a read-time fan-out — there is no merged
+  global store, and per-repo recall stays the default.
 
 `buildContext({query?, budgetTokens})` assembles the pack an agent
 actually receives: **core blocks first (always), then facts, then
@@ -124,26 +145,36 @@ Every fact cites its episodes; every episode can cite its origin
 (commit, receipt, job). A context pack names the event id and seq of
 everything it includes. `verifyMemory` independently walks the ref:
 commits must be linear, exactly one event per commit, seq gapless,
-hash chain intact, blob sha256s matching. Forgery is detected (tested
-with a hand-forged commit appended outside the library).
+hash chain intact, blob sha256s matching, and — since phase 2 —
+every post-epoch event's Ed25519 signature valid. Forgery is
+detected (tested with a hand-forged commit appended outside the
+library, and with a hash-intact but signature-stale event).
 
 ## Surfaces
 
 - **Library** — `swarm/lib/memory.mjs`:
   `remember`, `assertFact`, `supersedeFact`, `linkMemories`, `setCore`,
   `loadMemory`, `factsAt`, `recall`, `buildContext`, `memoryStats`,
-  `verifyMemory`, `readEvents`.
+  `verifyMemory`, `readEvents`, `agentAwareness` (the `sit` brief).
+  Cross-repo (phase 6):
+  `recallCrossRepo(dir, query, opts)` in `lib/memory-cross.mjs`,
+  also reached as `recall(dir, "*", "*", query, opts)`.
 - **HTTP API** (authenticated, under the repo's namespace):
   `POST /git/:o/:r/memory/episodes|facts|supersede|links|core`,
   `GET  /git/:o/:r/memory/core|facts|recall|context|stats`,
   `POST /git/:o/:r/memory/verify`.
+  Cross-repo: `GET /memory/recall?q=…` (authenticated, top-level).
+  The brief: `GET /git/:o/:r/memory/sit`.
 - **Client SDK** — `SwarmClient.memoryRemember / memoryFact /
   memorySupersede / memoryLink / memorySetCore / memoryCore /
-  memoryFacts / memoryRecall / memoryContext / memoryStats /
-  memoryVerify`.
+  memoryFacts / memoryRecall / memoryRecallAll / memoryContext / memorySit /
+  memoryStats / memoryVerify`.
 - **CLI** — `swarm.mjs memory remember|fact|supersede|link|core|
-  core-get|facts|recall|context|sit|stats|verify --repo <owner>/<repo>`.
-  `sit` is the brief. The CLI calls the library directly (same code path as the API), so
+  core-get|facts|recall|context|sit|stats|verify|pubkey --repo <owner>/<repo>`.
+  `sit` is the brief.
+  Cross-repo: `swarm.mjs memory recall-all --q <query>` (or
+  `memory recall --repo '*'`).
+  The CLI calls the library directly (same code path as the API), so
   memory works with the daemon down.
 
 ## Verification (2026-10-14)
@@ -168,13 +199,33 @@ with a hand-forged commit appended outside the library).
   events per repo; the scale phase adds a rebuildable index sidecar
   (SQLite FTS5 under the state dir, derived from the ref, never the
   source of truth) — the Loom/dakai-`loom` pattern.
-- **Retrieval is lexical**, not semantic. No embeddings yet: rather
-  honest BM25 than fake "AI search". The embedding phase plugs a
-  vector column into the same ranking (Loom's persisted-embedding
-  pattern) behind the same `recall` API.
-- **Events are hash-chained, not node-signed.** When a swarm node
-  writes memory, v2 signs the event with the node's ed25519 key,
-  receipts-style, so "which agent asserted this" is cryptographic.
+- **Retrieval is lexical at its core** — BM25 plus, since phase 3, a
+  persisted-vector tier whose default embedder is deterministic
+  feature hashing (shared tokens + character n-grams). That is a
+  lexical signal wearing a vector's clothes: it bridges morphology
+  ("invoice" ↔ "invoices"), it does **not** know synonyms or meaning,
+  and it is never presented as semantic search — every fused result
+  names the embedder and labels the signal. A real local neural
+  embedder remains future work behind the same interface (phase 3
+  notes below); rather an honest hashing tier than fake "AI search".
+- **Events are hash-chained and signed** (phase 2, above) — but the
+  signature proves *which installation's memory key wrote the
+  event*, not which human or agent drove it: `actor` stays a
+  self-claimed string inside the signed body. A compromised state
+  dir (key + repos together) can forge a fully self-consistent
+  chain; signatures make tampering evident against any *other*
+  copy of the chain (a clone, the GitHub replay), they do not make
+  a single held copy incorruptible.
+- **Cross-repo recall (phase 6) is a fan-out, not an index.** Every
+  cross-repo query pays one verified replay (hash + signature walk,
+  O(events)) per repo with a memory ref, plus that repo's own
+  (sidecar-served) recall. There is no cross-repo index and no
+  posture cache; at today's scale (a handful of repos, ≤ ~10³
+  events each) that is the honest price of never trusting an
+  unverified chain. A repo whose chain fails verification
+  contributes nothing — including its honestly-written events,
+  because once a chain fails, none of it is trustworthy — and is
+  named in the result envelope instead.
 - **No automatic extraction yet.** Facts are asserted explicitly by
   agents/humans today. The consolidation phase (Letta sleep-time /
   Mem0 extraction) proposes facts from episodes *as proposals* —
@@ -185,19 +236,150 @@ with a hand-forged commit appended outside the library).
 
 ## Phases after v1
 
-1. **Index sidecar** — SQLite FTS5 + stats cache, rebuilt from the ref
-   on demand; replay stays the fallback and the auditor.
-2. **Signed events** — node-key signatures on writes; `verifyMemory`
-   checks signatures for events that carry them.
-3. **Embeddings** — optional persisted vectors per event (local model
-   first), fused into recall ranking (semantic + BM25 + graph +
-   temporal, Mem0-style multi-signal fusion).
-4. **Consolidation proposals** — a Doctor-style background pass that
-   reads new episodes and *proposes* facts/links/core edits; a human
-   or the acting agent ratifies. Proposals are events too.
-5. **Fetch/promote refspecs** — daemon serves `refs/kiln/memory` in the
-   default fetch refspec and `promote` carries memory to GitHub.
-6. **Cross-repo memory** — explicitly linked memories across repos
-   (an episode in repo A cited by a fact in repo B), opt-in per link,
-   never a merged global store. Per-repo stays the default and the
-   boundary.
+1. **Index sidecar** — ✅ BUILT 2026-10-17 (`lib/memory-index.mjs`).
+   SQLite FTS5 per repo at `<state-dir>/memory-index/<owner>__<repo>.sqlite`,
+   synced from the ref on every recall (tip-checked: O(1) when fresh,
+   incremental upserts when behind, full rebuild on divergence) and
+   never written back to the ref. Docs are indexed pre-tokenized with
+   the library's own tokenizer, so the candidate universe matches the
+   v1 scan exactly; ranking is FTS5 BM25 fused with the same
+   salience/recency boosts and 1-hop link expansion. Recall results
+   name their engine (`engine: "index" | "scan"`); any sidecar error —
+   or `KILN_MEMORY_INDEX=off` — falls back to the replay scan, which
+   stays the fallback and the auditor. `memoryStats` reports the
+   sidecar's tip/doc count. Equivalence with the scan (hit sets + top
+   hits) is pinned by `test/memory-index.test.mjs`.
+2. **Signed events** — ✅ BUILT 2026-10-22 (`lib/memory-signing.mjs`).
+   Every append through the library is signed at write time with
+   Ed25519 (node:crypto, no new dependencies) by a per-state-dir
+   memory key: generated on first use, stored at
+   `<stateDir>/memory-signing.key` (mode 0600, enforced on load),
+   never in the repo or in git. Each signed event carries `signer`
+   (sha256 of the raw public key), `signerKey` (the SPKI public key,
+   base64) and `sig` — the signature over the event's hash, receipts-
+   style. `signer`/`signerKey` sit inside the hashed body, so the
+   hash chain covers the claimed identity and the signature covers
+   the hash; verification needs no key server and works on any copy
+   of the chain, including the GitHub copy phase 5 replays.
+   Verification is enforced on every read (`readEvents`, hence
+   recall/context/stats/verify and the FTS5 sidecar sync) and on the
+   promote replay path (`listMemoryCommits` runs the full chain +
+   signature walk and refuses a chain that does not authenticate).
+   **The boundary:** history written before phase 2 is unsigned and
+   stays readable forever as *unsigned-legacy*. A chain's signing
+   epoch opens at its first signed event; from there on, a missing
+   signature, an unverifiable one, or a `signerKey` that does not hash
+   to the claimed `signer` is a loud error, never a silent trust.
+   `verifyMemory` and `memoryStats` report the posture
+   (`signed` / `legacy` / `epochStart` / `signers`); the public half
+   is discoverable via CLI `memory pubkey`, HTTP
+   `GET /memory/pubkey`, and SDK `memoryPubkey`. One honest
+   deviation from the original sketch: the signing identity is the
+   state dir's memory key, not per-node worker keys — the memory
+   library writes from the daemon/CLI/API processes, which hold no
+   node key; the event's `actor` field still names the acting agent,
+   and the signer names the writing installation. Pinned by
+   `test/memory-signing.test.mjs` (sign/verify round-trip, key
+   binding, stale-signature tamper with an intact hash chain,
+   post-epoch unsigned rejection, legacy readability + epoch opening,
+   promote replay rejection, loose-key-permissions refusal).
+3. **Embeddings** — ✅ BUILT 2026-10-22 (`lib/memory-vectors.mjs`).
+   Persisted vector per recallable doc in the same sidecar as the
+   FTS5 index (table `vectors`), synced only through the
+   signature-verified read path — a chain phase 2 rejects is never
+   embedded, and eligibility for vector additions mirrors `factsAt()`
+   + the episode filters exactly (pinned by parity tests, including a
+   forged-chain rejection). Fusion is Mem0-style multi-signal: the
+   lexical ranking (BM25 + salience + recency + graph) is blended
+   with cosine similarity at weight 0.35, vector-only hits enter
+   marked `via: "vector"`, and results carry a `fusion` provenance
+   block; `memoryStats` reports the tier under `vectors`.
+   `KILN_MEMORY_VECTORS=off` disables it; any tier error falls back
+   to the untouched lexical result, phase-1 style.
+   **The embedder, honestly:** the spec said "local model first" —
+   there is no local neural embedder in this ecosystem to wire.
+   MatDaemon's `matdaemon_embed_text` was checked first: it is
+   itself a deterministic signed hashing trick (its docs call it
+   lexical), and it lives behind a Python service the
+   zero-dependency swarm runtime cannot take as a dependency. So
+   the default embedder `hashing-v1` implements that same technique
+   in-process — signed feature hashing over the library's tokens +
+   character trigrams, 256-dim, deterministic, no calls, no keys.
+   It is a **placeholder-tier lexical signal, not semantic search**:
+   no synonyms, no meaning, and the code, the stats output, and
+   every fused result say so. The swap path is real, though:
+   embedders register by id (`registerEmbedder`), selection is
+   `KILN_MEMORY_EMBEDDER=<id>`, vectors are stamped with their
+   embedder id, and an id change re-embeds the corpus — a future
+   local neural embedder takes over without touching recall.
+4. **Consolidation proposals** — ✅ BUILT 2026-10-17. A consolidation
+   pass reads new episodes and *proposes* facts/links/core edits; a
+   human or the acting agent ratifies. Proposals are events too
+   (`proposal` / `proposal-status` in the same hash chain): the payload
+   is validated exactly like a direct write (provenance mandatory), a
+   pending proposal is invisible to recall, and ratification
+   materializes the real event marked `viaProposal` — idempotently, so
+   a crash or retry never double-writes. Library
+   (`proposeMemory`/`resolveProposal`), HTTP API
+   (`POST /memory/propose`, `GET /memory/proposals`,
+   `POST /memory/proposals/resolve`), SDK, and CLI
+   (`propose-fact|propose-link|propose-core|proposals|ratify|reject`)
+   all shipped; `memoryStats` reports pending/ratified/rejected
+   counts. Pinned by `test/memory-proposals.test.mjs`. The proposer
+   itself is any agent with read access — the daemon has no LLM and
+   invents nothing.
+5. **Fetch/promote refspecs** — ✅ BUILT 2026-10-17. `promote` carries
+   `refs/kiln/memory` to GitHub in the same run as the branch (skip
+   with `memory: false`): the local chain is replayed commit-by-commit
+   through the Git Data API — created when the GitHub ref is absent,
+   incremental when the remote event ids are a prefix of the local
+   chain, up-to-date when they match. Divergence (unknown ids, a
+   longer remote, a prefix mismatch, an unparseable remote subject) is
+   a loud skip on the receipt (`memory: {status: "diverged"}` +
+   warning), never a force. Every replayed blob — event files and
+   large-episode content blobs alike — is SHA-asserted against its
+   local oid before the ref moves (content-addressed, so the GitHub
+   copy verifies byte-for-byte); a failed memory step is recorded on
+   the receipt without failing the branch promotion. Node checkouts
+   fetch the memory ref too: `gitClone` probes with `ls-remote` and
+   only then persists the `+refs/kiln/memory:refs/kiln/memory` refspec
+   (an exact refspec for an absent ref makes every later fetch exit
+   128). The daemon already serves the ref via git transport.
+   Network-free core pinned by `test/promote.test.mjs`
+   (`listMemoryCommits` / `planMemoryReplay` + clone gating).
+6. **Cross-repo memory** — ✅ BUILT 2026-10-22
+   (`lib/memory-cross.mjs`). `recallCrossRepo(dir, query, opts)` —
+   also `recall(dir, "*", "*", …)`, CLI `memory recall-all` /
+   `memory recall --repo '*'`, HTTP `GET /memory/recall`, SDK
+   `memoryRecallAll` — fans one query out over every repo chain in
+   the state dir and fuses the results. Each repo is gated on the
+   phase-2 signature-verified read (`readEvents`) before it is
+   searched: a chain that fails verification is **excluded and
+   named** in the envelope (`repos[]` with `status: "excluded"` +
+   the error, mirrored in a top-level `excluded` list) — exclusion
+   is a reported fact, never a silent skip, and the CLI prints it
+   to stderr. Every hit carries provenance: `repo`, `engine`
+   ("index" | "scan"), the `fusion` block when the vector tier
+   engaged, its chain's `signing` summary, and `repoScore` (its raw
+   in-repo score). Merging max-normalizes per repo — each repo's
+   top returned score becomes the divisor, the same normalization
+   phase-3 fusion applies to its lexical base — so merged scores
+   read as strength-within-repo in [0, 1] and a big corpus cannot
+   drown a small one on corpus statistics alone. Eligibility is the
+   per-repo recall's own (kinds / since / until / tags /
+   `factsAt()`), so parity holds by construction; global option
+   errors (bad dates) throw once up front instead of masquerading
+   as exclusions. `KILN_MEMORY_CROSSREPO=off` disables the mode
+   loudly; single-repo recall is untouched. **Deviation from the
+   original sketch, stated plainly:** the sketch imagined
+   cross-repo *links* — a fact in repo B citing an episode in
+   repo A at write time. That is **not** built: writes remain
+   strictly per-repo (provenance ids resolve inside their own
+   chain, and that boundary is load-bearing for verification).
+   What shipped is the recall half of the phase — spanning repos
+   at read time, opt-in per query, never a merged global store.
+   Cross-repo citation at write time remains future work if it is
+   ever wanted. Pinned by `test/memory-cross.test.mjs` (fusion +
+   provenance, forged-chain exclusion, eligibility parity,
+   single-repo invariance, kill switch, CLI + daemon SDK
+   round-trip).

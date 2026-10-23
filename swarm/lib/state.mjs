@@ -172,12 +172,25 @@ export function pidIsDaemon(pid, dir) {
 /// the daemon insisted their workers were alive). Mirrors pidIsDaemon,
 /// including its TOCTOU semantics via procCmdline. On non-Linux
 /// (/proc unavailable) falls back to trusting pidAlive.
-export function pidIsWorker(pid, dir) {
+///
+/// When `nodeId` is given, the check is per-node: the process's argv must
+/// be `worker.mjs <nodeId>` exactly. The any-worker check alone is NOT
+/// enough — a dead worker's pid recycled by ANOTHER node's worker passes
+/// it, and reconcile() then adopts the stranger as this node's live worker
+/// while the real one never respawns (seen 2026-10-22: ShopStream +
+/// Launchpad app nodes wedged in "starting" ~25 min behind a
+/// sibling-worker pid). Callers that know the node id MUST pass it.
+export function pidIsWorker(pid, dir, nodeId) {
   if (!pidAlive(pid)) return false;
   const r = procCmdline(pid);
   if (r.status === "vanished") return false; // TOCTOU: died between the checks
   if (r.status === "unreadable") return pidAlive(pid); // non-Linux fallback
   if (!r.cmd.includes("worker.mjs")) return false;
+  if (nodeId) {
+    const tokens = r.cmd.split(/\s+/);
+    const wi = tokens.findIndex((t) => t.endsWith("worker.mjs"));
+    if (wi < 0 || tokens[wi + 1] !== nodeId) return false;
+  }
   // Same script could serve another state dir — check the env marker too.
   try {
     const env = readFileSync(`/proc/${pid}/environ`, "utf8");
