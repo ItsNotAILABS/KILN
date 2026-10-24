@@ -210,6 +210,81 @@ export class SwarmClient {
     return this._req("GET", `${this._memBase(owner, repo)}/pubkey`);
   }
 
+  // ---- Context Fabric (node-bound repository cognition) ----
+  async contextIndex(node, options = {}) {
+    if (!node) throw new Error("contextIndex: node is required");
+    return this._req("POST", `/v1/context/nodes/${encodeURIComponent(node)}/index`, options);
+  }
+  async contextStatus(node) {
+    if (!node) throw new Error("contextStatus: node is required");
+    return this._req("GET", `/v1/context/nodes/${encodeURIComponent(node)}/status`);
+  }
+  async contextQuery(node, query, options = {}) {
+    if (!node) throw new Error("contextQuery: node is required");
+    if (!query || !String(query).trim()) throw new Error("contextQuery: query is required");
+    return this._req("POST", `/v1/context/nodes/${encodeURIComponent(node)}/query`, {
+      query: String(query),
+      ...options,
+    });
+  }
+  async contextDelta(node, query, priorPack, options = {}) {
+    const knownHashes = {};
+    for (const item of priorPack?.items || []) {
+      if (item.path && item.sha256) knownHashes[item.path] = item.sha256;
+    }
+    for (const item of priorPack?.unchanged || []) {
+      if (item.path && item.sha256) knownHashes[item.path] = item.sha256;
+    }
+    return this.contextQuery(node, query, { ...options, knownHashes });
+  }
+  async contextSit(node, query, options = {}) {
+    if (!node) throw new Error("contextSit: node is required");
+    if (!query || !String(query).trim()) throw new Error("contextSit: query is required");
+    return this._req("POST", `/v1/context/nodes/${encodeURIComponent(node)}/sit`, {
+      query: String(query),
+      ...options,
+    });
+  }
+  async contextReceiptsVerify() {
+    return this._req("POST", "/v1/context/receipts/verify", {});
+  }
+  async contextMetrics() {
+    return this._req("GET", "/v1/context/metrics");
+  }
+  async contextGc() {
+    return this._req("POST", "/v1/context/gc", {});
+  }
+
+  // ---- governed promotion (KILN-native repo -> organization GitHub) ----
+  async promote({ repo, github, branch, rebase = false, force = false, contextEvidence } = {}) {
+    if (!repo || !String(repo).includes("/")) throw new Error("promote: repo must be owner/repo");
+    return this._req("POST", "/v1/promote", {
+      repo: String(repo),
+      github: github ? String(github) : undefined,
+      branch: branch ? String(branch) : undefined,
+      rebase: !!rebase,
+      force: !!force,
+      contextEvidence,
+    });
+  }
+  async promoteFromContext({ repo, github, branch, rebase = false, force = false, contextResult, ci } = {}) {
+    const pack = contextResult?.pack;
+    const receipt = contextResult?.receipt;
+    if (!pack || !receipt) throw new Error("promoteFromContext: contextResult with pack + receipt is required");
+    return this.promote({
+      repo, github, branch, rebase, force,
+      contextEvidence: {
+        node: contextResult.node,
+        packDigest: pack.digest,
+        indexDigest: pack.indexDigest,
+        worktreeDigest: pack.worktreeDigest,
+        contextReceiptHash: receipt.hash,
+        revision: pack.revision,
+        ci: ci ? String(ci) : undefined,
+      },
+    });
+  }
+
   // ---- receipts ----
   async verifyReceipts(node) {
     return this._req("POST", "/receipts/verify", node ? { node } : {});
