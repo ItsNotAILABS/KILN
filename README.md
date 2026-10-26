@@ -1,6 +1,10 @@
 # KILN
 
+[![KILN L1](https://github.com/ItsNotAILABS/KILN/actions/workflows/kiln-l1.yml/badge.svg)](https://github.com/ItsNotAILABS/KILN/actions/workflows/kiln-l1.yml)
+
 KILN is the public on-chain GitHub forge and governed workspace destination for the ItsNotAI / Sovereign platform.
+
+How this repo is run in production: [docs/PRODUCTION.md](docs/PRODUCTION.md) · Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) · Security: [SECURITY.md](SECURITY.md) · Changes: [CHANGELOG.md](CHANGELOG.md)
 
 It coordinates projects, workspaces, agents, memory, MCP tools, diffs, approvals, commits, releases, and optional on-chain receipts.
 

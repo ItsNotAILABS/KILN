@@ -1,0 +1,9 @@
+# KILN is owner-operated production infrastructure.
+# Every path requires the owner's review; the sensitive surfaces are
+# called out explicitly so a glance at a PR shows whose call it is.
+
+* @FreddyCreates
+
+/contracts/ @FreddyCreates
+/swarm/ @FreddyCreates
+/.github/workflows/ @FreddyCreates
