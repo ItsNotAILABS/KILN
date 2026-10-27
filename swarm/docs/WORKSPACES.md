@@ -392,7 +392,19 @@ curl -s "$KILN_API/v1/openapi.json" \
 
 **Discover** (above): capabilities, then the spec — and
 `GET /v1/workspaces` if you need to see what already exists before
-creating anything.
+creating anything. **Site ids come from `GET /v1/sites`** — create and
+link calls only *validate* site ids (404 on an unknown one), so list
+sites first whenever you plan to link one:
+
+```bash
+curl -s "$KILN_API/v1/sites" -H "Authorization: Bearer $KILN_TOKEN"
+# → { "sites": [ { "id": "site_…", "name": "…",
+#                  "frontend": "owner/repo", "backend": "owner/repo" } ] }
+```
+
+(A member repo's project details also name its site — `details.site.id`
+— which is a handy cross-check, but `GET /v1/sites` is the discovery
+read.)
 
 **Create** a workspace. Member repos (`"owner/repo"`) and linked sites
 must already exist on the forge. To nest the new workspace under an

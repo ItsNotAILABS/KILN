@@ -545,6 +545,7 @@ export function workspaceStatus(dir, id) {
   }
   const rollup = {
     descendantCount: subtree.length - 1,
+    repoCount: rollupRepos.length,
     repos: rollupRepos,
     siteIds: rollupSiteIds,
   };

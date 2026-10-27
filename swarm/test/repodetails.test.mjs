@@ -107,6 +107,7 @@ describe("repodetails: live derivation", () => {
     assert.equal(d.languages[0].language, "Markdown"); // largest by bytes
 
     assert.equal(d.readme.path, "README.md");
+    assert.equal(d.readme.title, "Widget"); // first ATX H1, "# " stripped
     assert.equal(d.readme.content, FILES["README.md"]);
     assert.equal(d.readme.truncated, false);
 
@@ -299,6 +300,7 @@ describe("repodetails: HTTP API", () => {
     const abilityIds = caps.data.abilities.map((a) => a.id);
     assert.ok(abilityIds.includes("workspaces"));
     assert.ok(abilityIds.includes("project-details"));
+    assert.ok(abilityIds.includes("sites")); // site-id discovery is part of the surface
     assert.equal(caps.data.openapi, "/v1/openapi.json");
 
     const spec = await call("GET", "/v1/openapi.json");
@@ -308,6 +310,9 @@ describe("repodetails: HTTP API", () => {
     assert.ok(spec.data.paths["/v1/workspaces/{id}"].patch);
     assert.ok(spec.data.paths["/v1/repos/{owner}/{repo}/details"].get);
     assert.ok(spec.data.paths["/v1/repos/{owner}/{repo}/details"].patch);
+    assert.ok(spec.data.paths["/v1/sites"].get);
     assert.ok(spec.data.paths["/v1/capabilities"].get);
+    // The spec describes the instance that served it — never a hardcoded port.
+    assert.equal(spec.data.servers[0].url, "/");
   });
 });

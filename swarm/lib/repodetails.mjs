@@ -193,9 +193,14 @@ function readReadme(gd, head) {
     return null;
   }
   const truncated = buf.length > README_MAX_BYTES;
+  const content = buf.subarray(0, README_MAX_BYTES).toString("utf8");
+  // Title = the first ATX H1 ("# …"), the conventional README title; null
+  // when the README has none — never guessed from the filename.
+  const titleMatch = content.match(/^#[ \t]+(.+?)[ \t]*$/m);
   return {
     path: entry.name,
-    content: buf.subarray(0, README_MAX_BYTES).toString("utf8"),
+    title: titleMatch ? titleMatch[1] : null,
+    content,
     truncated,
   };
 }

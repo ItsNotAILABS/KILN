@@ -564,6 +564,7 @@ describe("workspaces: nesting", () => {
     assert.equal(st.parent, null);
     assert.deepEqual(st.children, [{ id: mid.id, owner: "auro", slug: "mid", name: "Mid" }]);
     assert.equal(st.rollup.descendantCount, 2);
+    assert.equal(st.rollup.repoCount, 3); // distinct subtree repos, as a field — not derived by counting
     // Own repos first, then mid's (duplicate skipped), then leaf's.
     assert.deepEqual(st.rollup.repos.map((r) => r.repo),
       ["auro/roll-one", "auro/roll-two", "auro/roll-three"]);

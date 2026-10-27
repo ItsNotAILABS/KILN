@@ -151,10 +151,11 @@ const WORKSPACE_STATUS_SCHEMA = {
       type: "object",
       properties: {
         descendantCount: { type: "integer", minimum: 0 },
+        repoCount: { type: "integer", minimum: 0, description: "Distinct repos across the whole subtree (= repos.length, deduped own-first)" },
         repos: { type: "array", items: { $ref: "#/components/schemas/RepoStatus" } },
         siteIds: { type: "array", items: { type: "string" } },
       },
-      required: ["descendantCount", "repos", "siteIds"],
+      required: ["descendantCount", "repoCount", "repos", "siteIds"],
     },
   },
   required: ["workspace", "repos", "sites", "memory", "parent", "children", "rollup"],
@@ -185,6 +186,7 @@ const REPO_DETAILS_SCHEMA = {
     },
     languages: {
       type: "array", maxItems: 8,
+      description: "Bytes-weighted language breakdown, sorted by bytes descending — languages[0] is the primary language",
       items: {
         type: "object",
         properties: {
@@ -200,10 +202,11 @@ const REPO_DETAILS_SCHEMA = {
       type: ["object", "null"],
       properties: {
         path: { type: "string" },
+        title: { type: ["string", "null"], description: "The README's first ATX H1 heading, without the leading '#'; null when it has none" },
         content: { type: "string", description: "Root README content, capped at 128KB" },
         truncated: { type: "boolean" },
       },
-      required: ["path", "content", "truncated"],
+      required: ["path", "title", "content", "truncated"],
     },
     workspaces: {
       type: "array",
@@ -282,6 +285,15 @@ export function buildCapabilities() {
         ],
         mcpTools: ["kiln_repo_details"],
       },
+      {
+        id: "sites",
+        title: "Sites — first-class frontend+backend repo pairings. Read-only here: list sites to discover the site ids that workspace create/link calls require",
+        endpoints: [
+          "GET /v1/sites",
+          "GET /v1/sites/:id",
+        ],
+        mcpTools: [],
+      },
     ],
     openapi: "/v1/openapi.json",
     docs: "swarm/docs/WORKSPACES.md",
@@ -298,7 +310,11 @@ export function buildOpenApiDocument() {
       description:
         "Discovery surface for the KILN forge daemon: nested workspaces (groupings of repos + sites under one owner) and live per-repo project details. All routes require the daemon bearer token (Authorization: Bearer <token from <stateDir>/api.token>). Errors are {error} objects whose message says what to do next.",
     },
-    servers: [{ url: "http://127.0.0.1:18787" }],
+    // Relative on purpose: this document is served by the instance it
+    // describes, whose port/base is deployment-specific (daemon.json's
+    // apiUrl). A generated client resolves "/" against the URL it fetched
+    // the spec from — a hardcoded port points at the wrong instance.
+    servers: [{ url: "/" }],
     security: [{ bearerAuth: [] }],
     paths: {
       "/v1/workspaces": {
@@ -317,7 +333,7 @@ export function buildOpenApiDocument() {
                     name: { type: "string" },
                     description: { type: "string", maxLength: 1024 },
                     repos: { type: "array", items: { type: "string" }, description: "\"owner/repo\" refs; each must exist (404 otherwise)" },
-                    siteIds: { type: "array", items: { type: "string" }, description: "Site ids; each must exist (404 otherwise)" },
+                    siteIds: { type: "array", items: { type: "string" }, description: "Site ids; each must exist (404 otherwise). Discover ids with GET /v1/sites, or from a member repo's project details (details.site.id)" },
                     parentId: { type: ["string", "null"], description: "Parent workspace id — must exist (404) and share the owner (400)" },
                   },
                   required: ["owner", "slug", "name"],
@@ -386,7 +402,7 @@ export function buildOpenApiDocument() {
                     description: { type: "string", maxLength: 1024 },
                     addRepos: { type: "array", items: { type: "string" } },
                     removeRepos: { type: "array", items: { type: "string" } },
-                    linkSites: { type: "array", items: { type: "string" } },
+                    linkSites: { type: "array", items: { type: "string" }, description: "Site ids to link; each must exist (404 otherwise). Discover ids with GET /v1/sites" },
                     unlinkSites: { type: "array", items: { type: "string" } },
                     setParent: { type: ["string", "null"], description: "New parent workspace id, or null to make this a root workspace" },
                   },
@@ -429,6 +445,51 @@ export function buildOpenApiDocument() {
             "400": errorResponse("confirm missing or not equal to the workspace slug"),
             "404": errorResponse("No such workspace"),
             "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/sites": {
+        get: {
+          operationId: "listSites",
+          summary: "List site registry records — the discovery read for site ids (workspace create/link validates ids; this is where they come from)",
+          responses: {
+            "200": jsonResponse("Site records", {
+              type: "object",
+              properties: {
+                sites: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      id: { type: "string" },
+                      name: { type: "string" },
+                      frontend: { type: "string", description: "\"owner/repo\"" },
+                      backend: { type: "string", description: "\"owner/repo\"" },
+                      artifact: { type: ["string", "null"] },
+                      computeApp: { type: ["string", "null"] },
+                      createdAt: { type: "string", format: "date-time" },
+                    },
+                    required: ["id", "name", "frontend", "backend"],
+                  },
+                },
+              },
+              required: ["sites"],
+            }),
+            "401": errorResponse("Missing or invalid bearer <redacted>"),
+          },
+        },
+      },
+      "/v1/sites/{id}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" }, description: "Site id (site_…)" },
+        ],
+        get: {
+          operationId: "getSiteStatus",
+          summary: "Aggregated live status for one site (repo HEADs, artifact, compute app)",
+          responses: {
+            "200": jsonResponse("Site status", { type: "object" }),
+            "404": errorResponse("No such site"),
+            "401": errorResponse("Missing or invalid bearer <redacted>"),
           },
         },
       },
