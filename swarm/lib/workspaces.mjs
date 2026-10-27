@@ -33,7 +33,11 @@ import { loadStore as loadSiteStore, repoHead } from "./sites.mjs";
 
 const WORKSPACES_FILE = "workspaces.json";
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _.:-]{0,127}$/;
+// Product names are human names: Unicode letters/digits plus the
+// punctuation people actually type — spaces, _ . : + & and the dash
+// family (hyphen, en dash, em dash: "DFW Haul — Marketplace" and
+// "Research + Build" must validate).
+const NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} _.:+&—–-]{0,127}$/u;
 const MAX_DESCRIPTION = 1024;
 const MAX_REPOS = 256;
 
@@ -120,7 +124,7 @@ function validSlug(slug) {
 
 function validName(name) {
   if (typeof name !== "string" || !NAME_RE.test(name)) {
-    throw new WorkspacesError(400, "name must match [A-Za-z0-9][A-Za-z0-9 _.:-]{0,127}");
+    throw new WorkspacesError(400, "name must start with a letter or digit and use only letters, digits, spaces, and _ . : + & - – — (max 128 chars)");
   }
   return name;
 }
@@ -152,6 +156,36 @@ function validSiteList(dir, siteIds, what) {
   for (const id of siteIds) {
     const norm = needSite(dir, id, what);
     if (!out.includes(norm)) out.push(norm);
+  }
+  return out;
+}
+
+/**
+ * Format-only repo list for REMOVALS. A member whose repo has been
+ * deleted from the forge must stay removable — requiring existence
+ * (needRepo) would strand the ghost ref in the workspace forever,
+ * because the only way out is this removal. Malformed refs still 400.
+ */
+function validRepoRefList(refs, what) {
+  if (refs === undefined || refs === null) return [];
+  if (!Array.isArray(refs)) throw new WorkspacesError(400, `${what} must be an array of "owner/repo"`);
+  const out = [];
+  for (const ref of refs) {
+    const [owner, repo] = parseRepoRef(ref, what);
+    const norm = `${owner}/${repo}`;
+    if (!out.includes(norm)) out.push(norm);
+  }
+  return out;
+}
+
+/** Format-only site id list for UNLINKS — same removal rule as repos. */
+function validSiteIdList(ids, what) {
+  if (ids === undefined || ids === null) return [];
+  if (!Array.isArray(ids)) throw new WorkspacesError(400, `${what} must be an array of site ids`);
+  const out = [];
+  for (const id of ids) {
+    if (typeof id !== "string" || !id) throw new WorkspacesError(400, `${what} must be a site id`);
+    if (!out.includes(id)) out.push(id);
   }
   return out;
 }
@@ -241,6 +275,9 @@ export function resolveWorkspace(dir, idOrSlug, { owner } = {}) {
  * written into their memory before the registry entry is saved, same
  * discipline as create. Removals never retract memory (append-only
  * history — supersede there if a link ever needs retracting).
+ * Adds/links must exist on the forge; removals/unlinks are validated
+ * by format only, so a member that was deleted from the forge first
+ * can still be removed from the workspace (never a stranded ghost).
  */
 export function updateWorkspace(dir, id, patch = {}, { actor } = {}) {
   const store = loadStore(dir);
@@ -252,12 +289,12 @@ export function updateWorkspace(dir, id, patch = {}, { actor } = {}) {
   if (patch.description !== undefined) next.description = validDescription(patch.description);
 
   const addedRepos = validRepoList(dir, patch.addRepos, "addRepos");
-  const removedRepos = validRepoList(dir, patch.removeRepos, "removeRepos");
+  const removedRepos = validRepoRefList(patch.removeRepos, "removeRepos");
   for (const ref of addedRepos) if (!next.repos.includes(ref)) next.repos.push(ref);
   if (removedRepos.length) next.repos = next.repos.filter((r) => !removedRepos.includes(r));
 
   const linkedSites = validSiteList(dir, patch.linkSites, "linkSites");
-  const unlinkedSites = validSiteList(dir, patch.unlinkSites, "unlinkSites");
+  const unlinkedSites = validSiteIdList(patch.unlinkSites, "unlinkSites");
   for (const sid of linkedSites) if (!next.siteIds.includes(sid)) next.siteIds.push(sid);
   if (unlinkedSites.length) next.siteIds = next.siteIds.filter((s) => !unlinkedSites.includes(s));
 
@@ -347,7 +384,10 @@ export function workspaceStatus(dir, id) {
   });
 
   const memory = {};
-  let allLinked = workspace.repos.length > 0;
+  // Vacuous truth: with no member repos there is nothing unlinked, so an
+  // empty workspace reports linked — false would claim a broken linkage
+  // that does not exist.
+  let allLinked = true;
   for (const ref of workspace.repos) {
     const m = memoryLinkage(dir, ref);
     memory[ref] = m;

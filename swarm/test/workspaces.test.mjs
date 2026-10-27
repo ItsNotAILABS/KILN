@@ -6,14 +6,14 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { makeStateDir } from "./helpers.mjs";
 import { createRepo, repoPath } from "../lib/git.mjs";
 import { loadMemory } from "../lib/memory.mjs";
-import { createSite } from "../lib/sites.mjs";
+import { createSite, deleteSite } from "../lib/sites.mjs";
 import {
   WorkspacesError, createWorkspace, listWorkspaces, getWorkspace,
   resolveWorkspace, updateWorkspace, deleteWorkspace, workspaceStatus,
@@ -32,13 +32,24 @@ function git(cwd, args, env) {
 /** Push one real commit into an already-created hosted repo. Returns the sha. */
 function pushCommit(dir, owner, repo, subject) {
   const work = mkdtempSync(join(tmpdir(), "kiln-ws-seed-"));
-  git(work, ["init", "-q", "-b", "main"]);
+  const bare = repoPath(dir, owner, repo);
+  // A real client's second push clones the hosted repo and builds on
+  // its HEAD. A fresh init would create unrelated history and the push
+  // would be rejected as non-fast-forward — so clone when the hosted
+  // repo already has a HEAD, init only when it is still empty.
+  let hasHead = true;
+  try { git(work, ["--git-dir", bare, "rev-parse", "-q", "--verify", "HEAD"]); }
+  catch { hasHead = false; }
+  if (hasHead) git(work, ["clone", "-q", bare, "."]);
+  else git(work, ["init", "-q", "-b", "main"]);
   git(work, ["config", "user.email", "test@kiln.local"]);
   git(work, ["config", "user.name", "kiln-test"]);
-  writeFileSync(join(work, "README.md"), `# ${repo}\n`);
+  // The subject line keeps every commit's tree distinct (a second
+  // commit with identical content would have nothing to commit).
+  writeFileSync(join(work, "README.md"), `# ${repo}\n\n${subject}\n`);
   git(work, ["add", "-A"]);
   git(work, ["commit", "-q", "-m", subject]);
-  git(work, ["push", "-q", repoPath(dir, owner, repo), "main"]);
+  git(work, ["push", "-q", bare, "main"]);
   return git(work, ["rev-parse", "HEAD"]);
 }
 
@@ -46,6 +57,20 @@ function pushCommit(dir, owner, repo, subject) {
 function seedRepo(dir, owner, repo, subject) {
   createRepo(dir, owner, repo);
   return pushCommit(dir, owner, repo, subject);
+}
+
+/** Push a follow-up commit that builds on the hosted repo's current HEAD. */
+function pushSecondCommit(dir, owner, repo, subject) {
+  const work = mkdtempSync(join(tmpdir(), "kiln-ws-seed2-"));
+  git(work, ["clone", "-q", repoPath(dir, owner, repo), "clone"]);
+  const clone = join(work, "clone");
+  git(clone, ["config", "user.email", "test@kiln.local"]);
+  git(clone, ["config", "user.name", "kiln-test"]);
+  writeFileSync(join(clone, "SECOND.md"), "second\n");
+  git(clone, ["add", "-A"]);
+  git(clone, ["commit", "-q", "-m", subject]);
+  git(clone, ["push", "-q", "origin", "main"]);
+  return git(clone, ["rev-parse", "HEAD"]);
 }
 
 function coreOf(dir, owner, repo) {
@@ -145,11 +170,11 @@ describe("workspaces: update + guarded delete", () => {
       owner: "auro", slug: "dfw-haul", name: "DFW Haul", repos: ["auro/dfw-service-hub"], actor: "test",
     });
     const next = updateWorkspace(dir, ws.id, {
-      name: "DFW Haul — Marketplace", description: "now with words",
+      name: "DFW Haul - Marketplace", description: "now with words",
       addRepos: ["auro/extra", "auro/dfw-edge"], removeRepos: ["auro/dfw-service-hub"],
       linkSites: [site.id],
     }, { actor: "test" });
-    assert.equal(next.name, "DFW Haul — Marketplace");
+    assert.equal(next.name, "DFW Haul - Marketplace");
     assert.equal(next.description, "now with words");
     assert.deepEqual(next.repos, ["auro/extra", "auro/dfw-edge"]);
     assert.deepEqual(next.siteIds, [site.id]);
@@ -211,7 +236,7 @@ describe("workspaces: aggregated live status", () => {
     for (const ref of DFW_REPOS) assert.equal(st.memory.repos[ref].present, true);
 
     // A new commit moves the status — nothing is cached.
-    const sha2 = pushCommit(dir, "auro", "dfw-edge", "edge: second commit");
+    const sha2 = pushSecondCommit(dir, "auro", "dfw-edge", "edge: second commit");
     const st2 = workspaceStatus(dir, ws.id);
     assert.equal(Object.fromEntries(st2.repos.map((r) => [r.repo, r]))["auro/dfw-edge"].head.sha, sha2);
   });
@@ -229,6 +254,55 @@ describe("workspaces: aggregated live status", () => {
     assert.equal(byRepo["auro/empty-one"].exists, true);
     assert.equal(byRepo["auro/empty-one"].head, null);
     assert.ok(byRepo["auro/full-one"].head.sha);
+  });
+});
+
+describe("workspaces: removing members that no longer exist", () => {
+  it("a repo deleted from the forge stays removable; a deleted site stays unlinkable", () => {
+    const { dir, site } = dfwDir();
+    const ws = createWorkspace(dir, {
+      owner: "auro", slug: "dfw-haul", name: "DFW Haul",
+      repos: DFW_REPOS, siteIds: [site.id], actor: "test",
+    });
+    // The forge moves on first: member repo deleted, site deleted.
+    rmSync(repoPath(dir, "auro", "dfw-harness"), { recursive: true, force: true });
+    deleteSite(dir, site.id);
+
+    const next = updateWorkspace(dir, ws.id, {
+      removeRepos: ["auro/dfw-harness"], unlinkSites: [site.id],
+    }, { actor: "test" });
+    assert.deepEqual(next.repos, ["auro/dfw-service-hub", "auro/dfw-edge", "auro/dfw-workspace"]);
+    assert.deepEqual(next.siteIds, []);
+
+    // Status agrees: no ghost member remains to report on.
+    const st = workspaceStatus(dir, ws.id);
+    assert.deepEqual(st.repos.map((r) => r.repo), next.repos);
+    assert.equal(st.sites.length, 0);
+  });
+
+  it("removals still reject malformed refs (400), and removing a non-member is a no-op", () => {
+    const { dir } = dfwDir();
+    const ws = createWorkspace(dir, {
+      owner: "auro", slug: "dfw-haul", name: "DFW Haul", repos: ["auro/dfw-edge"], actor: "test",
+    });
+    assert.throws(
+      () => updateWorkspace(dir, ws.id, { removeRepos: ["not-a-ref"] }),
+      (e) => e instanceof WorkspacesError && e.status === 400
+    );
+    assert.throws(
+      () => updateWorkspace(dir, ws.id, { unlinkSites: [""] }),
+      (e) => e instanceof WorkspacesError && e.status === 400
+    );
+    const next = updateWorkspace(dir, ws.id, { removeRepos: ["auro/dfw-service-hub"] }, { actor: "test" });
+    assert.deepEqual(next.repos, ["auro/dfw-edge"]);
+  });
+
+  it("an empty workspace reports memory.linked = true (nothing is unlinked)", () => {
+    const dir = makeStateDir();
+    const ws = createWorkspace(dir, { owner: "auro", slug: "empty", name: "Empty", repos: [], actor: "test" });
+    const st = workspaceStatus(dir, ws.id);
+    assert.deepEqual(st.repos, []);
+    assert.equal(st.memory.linked, true);
   });
 });
 
@@ -312,10 +386,10 @@ describe("workspaces: HTTP API", () => {
 
     // Patch: rename + remove a repo + unlink the site.
     const patched = await call("PATCH", `/v1/workspaces/${id}`, {
-      name: "DFW Haul — Marketplace", removeRepos: ["auro/dfw-harness"], unlinkSites: [siteId],
+      name: "DFW Haul - Marketplace", removeRepos: ["auro/dfw-harness"], unlinkSites: [siteId],
     });
     assert.equal(patched.status, 200);
-    assert.equal(patched.data.workspace.name, "DFW Haul — Marketplace");
+    assert.equal(patched.data.workspace.name, "DFW Haul - Marketplace");
     assert.deepEqual(patched.data.workspace.repos, ["auro/dfw-service-hub", "auro/dfw-edge", "auro/dfw-workspace"]);
     assert.deepEqual(patched.data.workspace.siteIds, []);
 
