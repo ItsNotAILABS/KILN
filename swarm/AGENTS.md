@@ -177,7 +177,18 @@ Function results are real: `ok:true` + JSON `result`, or `ok:false` + the
 function's real error. A module without `main()` fails loudly. Limits:
 code ≤ 256KB, `timeoutMs` 100..300000ms, results > 1MB are not returned.
 
-## 7. Rules (non-negotiable)
+## 7. Workspaces, project details, MCP — organization for any agent
+
+Repos group into **workspaces** (member repos + linked sites, nestable via
+`parentId` / `setParent`), and every hosted repo has live **project details**
+(description, topics, commit count, languages, README, CI). Both are open to
+any agent — no per-vendor account, just the forge bearer token. Discover the
+surface with `GET /v1/capabilities`, then `GET /v1/openapi.json` (both
+bearer-gated), use the REST routes, or spawn the zero-dependency MCP server
+at `swarm/mcp-server.mjs` (tools `kiln_workspace_*` + `kiln_repo_details`;
+generic client config in the docs). Full guide: `docs/WORKSPACES.md#ai-access`.
+
+## 8. Rules (non-negotiable)
 
 1. **Real or loud failure.** Every tool executes for real or the job fails
    with the real error. Never invent output, hashes, receipts, or commits.
