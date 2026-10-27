@@ -32,8 +32,13 @@ stores):
 
 `(owner, slug)` is unique (`409` on collision). Member repos must be
 existing KILN-native repos (`404` otherwise); linked sites must exist in
-the sites registry (`404`). Names and descriptions are plain text
-(name: `[A-Za-z0-9][A-Za-z0-9 _.:-]{0,127}`, description ≤ 1024 chars).
+the sites registry (`404`). The same existence rule applies to repos
+**added** and sites **linked** by an update — but removals and unlinks
+are validated by format only, so a member whose repo or site was deleted
+from the forge first can still be removed from the workspace (never a
+stranded ghost). Names are human names: Unicode letters/digits plus
+spaces and `_ . : + & - – —` (max 128 chars — "DFW Haul — Marketplace"
+validates). Descriptions ≤ 1024 chars.
 
 ## Linkage lives in the repos, not just the registry
 
@@ -96,7 +101,9 @@ nothing is cached, so it cannot go stale:
   site deleted after linking reports `found: false` rather than failing.
 - **Memory linkage** replays each member repo's memory and checks the
   `workspace` core block is present; `memory.linked` is true only when
-  **every** member repo carries the link.
+  **every** member repo carries the link. A workspace with no member
+  repos reports `linked: true` — vacuous truth, not a broken-link claim
+  about nothing.
 
 ## CLI
 
