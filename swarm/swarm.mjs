@@ -16,6 +16,9 @@
  *   swarm.mjs receipts verify [--node ID] [--dir PATH]
  *   swarm.mjs repo create --owner O --repo R [--dir PATH]
  *   swarm.mjs repo list [--dir PATH]
+ *   swarm.mjs repo details <owner>/<repo> [--dir PATH]
+ *   swarm.mjs repo describe <owner>/<repo> [--description D]
+ *                        [--topics a,b,c] [--dir PATH]
  *   swarm.mjs promote <owner>/<repo> [--github OWNER/REPO] [--branch B]
  *                        [--rebase] [--force] [--dir PATH]
  *   swarm.mjs sites list [--dir PATH]
@@ -24,12 +27,15 @@
  *                        [--artifact SLUG] [--app NAME|APPID] [--dir PATH]
  *   swarm.mjs sites remove <id|name> [--dir PATH]
  *   swarm.mjs workspaces list [--owner O] [--dir PATH]
+ *   swarm.mjs workspaces tree [--owner O] [--dir PATH]
  *   swarm.mjs workspaces show <id|slug> [--dir PATH]
  *   swarm.mjs workspaces add --owner O --slug S --name N [--description D]
- *                        [--repos O/R,O/R] [--sites ID,ID] [--dir PATH]
+ *                        [--repos O/R,O/R] [--sites ID,ID]
+ *                        [--parent ID|SLUG] [--dir PATH]
  *   swarm.mjs workspaces update <id|slug> [--name N] [--description D]
  *                        [--add-repo O/R] [--remove-repo O/R]
- *                        [--link-site ID] [--unlink-site ID] [--dir PATH]
+ *                        [--link-site ID] [--unlink-site ID]
+ *                        [--parent ID|SLUG] [--no-parent] [--dir PATH]
  *   swarm.mjs workspaces remove <id|slug> --confirm SLUG [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
@@ -55,9 +61,10 @@ import {
   createSite, listSites, resolveSite, deleteSite, siteStatus,
 } from "./lib/sites.mjs";
 import {
-  createWorkspace, listWorkspaces, resolveWorkspace, updateWorkspace,
-  deleteWorkspace, workspaceStatus,
+  createWorkspace, listWorkspaces, workspaceTree, resolveWorkspace,
+  updateWorkspace, deleteWorkspace, workspaceStatus,
 } from "./lib/workspaces.mjs";
+import { repoDetails, updateRepoDetails } from "./lib/repodetails.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
@@ -544,7 +551,20 @@ async function cmdRepo(args) {
       if (repos.length) console.error(daemonDownNote(dir));
       printRepoRows(repos);
     }
-  } else { console.error("usage: repo create|list"); process.exit(2); }
+  } else if (sub === "details") {
+    // Local read, like `workspaces show`: details are derived live from
+    // the hosted bare repo — no daemon needs to be running.
+    if (!args._[2]) { console.error("usage: repo details <owner>/<repo>"); process.exit(2); }
+    const [owner, repo] = splitOwnerRepo(args._[2], "repo details target");
+    console.log(JSON.stringify(repoDetails(dir, owner, repo), null, 2));
+  } else if (sub === "describe") {
+    if (!args._[2]) { console.error("usage: repo describe <owner>/<repo> [--description D] [--topics a,b,c]"); process.exit(2); }
+    const [owner, repo] = splitOwnerRepo(args._[2], "repo describe target");
+    const patch = {};
+    if (args.description !== undefined) patch.description = String(args.description);
+    if (args.topics !== undefined) patch.topics = csv(args.topics);
+    console.log(JSON.stringify(updateRepoDetails(dir, owner, repo, patch), null, 2));
+  } else { console.error("usage: repo create|list|details|describe"); process.exit(2); }
 }
 
 // ---------------------------------------------------------------- promote (KILN -> GitHub)
@@ -810,16 +830,24 @@ async function cmdWorkspaces(args) {
   if (sub === "add") {
     // Works purely on local state (registry + repo memory + git), like
     // `sites add` — no daemon needed. Memory linkage is written on create.
+    const owner = String(need(args, "owner"));
+    // --parent takes an id or slug, resolved within the new workspace's
+    // owner (the lib enforces existence + same-owner on the id).
+    const parent = args.parent
+      ? resolveWorkspace(dir, String(args.parent), { owner })
+      : null;
     const ws = createWorkspace(dir, {
-      owner: String(need(args, "owner")),
+      owner,
       slug: String(need(args, "slug")),
       name: String(need(args, "name")),
       description: args.description ? String(args.description) : undefined,
       repos: csv(args.repos),
       siteIds: csv(args.sites),
+      parentId: parent ? parent.id : undefined,
       actor: "cli",
     });
     console.log(`workspace ${ws.owner}/${ws.slug} (${ws.id}) — ${ws.name}`);
+    if (ws.parentId) console.log(`  parent: ${ws.parentId}`);
     for (const r of ws.repos) console.log(`  repo: ${r}`);
     for (const s of ws.siteIds) console.log(`  site: ${s}`);
     console.log(`  memory linkage written to member repos (workspace core block)`);
@@ -827,32 +855,50 @@ async function cmdWorkspaces(args) {
     const all = listWorkspaces(dir, { owner: args.owner ? String(args.owner) : undefined });
     if (!all.length) { console.log("(no workspaces)"); return; }
     for (const w of all) {
-      console.log(`${w.id.slice(0, 12)}…  ${w.owner}/${w.slug.padEnd(16)} ${w.name}  repos=${w.repos.length} sites=${w.siteIds.length}`);
+      console.log(`${w.id.slice(0, 12)}…  ${w.owner}/${w.slug.padEnd(16)} ${w.name}  repos=${w.repos.length} sites=${w.siteIds.length}${w.parentId ? ` parent=${w.parentId.slice(0, 12)}…` : ""}`);
     }
+  } else if (sub === "tree") {
+    const roots = workspaceTree(dir, { owner: args.owner ? String(args.owner) : undefined });
+    if (!roots.length) { console.log("(no workspaces)"); return; }
+    const printNode = (w, depth) => {
+      console.log(`${"  ".repeat(depth)}${w.owner}/${w.slug} — ${w.name} (${w.id})  repos=${w.repos.length} sites=${w.siteIds.length}`);
+      for (const c of w.children) printNode(c, depth + 1);
+    };
+    for (const r of roots) printNode(r, 0);
   } else if (sub === "show") {
     if (!args._[2]) { console.error("usage: workspaces show <id|slug>"); process.exit(2); }
     const ws = resolveWorkspace(dir, args._[2], { owner: args.owner ? String(args.owner) : undefined });
     console.log(JSON.stringify(workspaceStatus(dir, ws.id), null, 2));
   } else if (sub === "update") {
-    if (!args._[2]) { console.error("usage: workspaces update <id|slug> [--name N] [--description D] [--add-repo O/R] [--remove-repo O/R] [--link-site ID] [--unlink-site ID]"); process.exit(2); }
+    if (!args._[2]) { console.error("usage: workspaces update <id|slug> [--name N] [--description D] [--add-repo O/R] [--remove-repo O/R] [--link-site ID] [--unlink-site ID] [--parent ID|SLUG] [--no-parent]"); process.exit(2); }
+    if (args.parent && args["no-parent"]) { console.error("usage: --parent and --no-parent are mutually exclusive"); process.exit(2); }
     const ws = resolveWorkspace(dir, args._[2], { owner: args.owner ? String(args.owner) : undefined });
-    const next = updateWorkspace(dir, ws.id, {
+    const patch = {
       name: args.name ? String(args.name) : undefined,
       description: args.description !== undefined ? String(args.description) : undefined,
       addRepos: oneOrUndef(args["add-repo"]),
       removeRepos: oneOrUndef(args["remove-repo"]),
       linkSites: oneOrUndef(args["link-site"]),
       unlinkSites: oneOrUndef(args["unlink-site"]),
-    }, { actor: "cli" });
+    };
+    // --parent resolves within the workspace's owner; --no-parent
+    // clears. Neither flag = parent untouched (key stays absent).
+    if (args.parent) {
+      patch.setParent = resolveWorkspace(dir, String(args.parent), { owner: ws.owner }).id;
+    } else if (args["no-parent"]) {
+      patch.setParent = null;
+    }
+    const next = updateWorkspace(dir, ws.id, patch, { actor: "cli" });
     console.log(`workspace ${next.owner}/${next.slug} (${next.id}) updated`);
+    console.log(`  parent: ${next.parentId || "(root)"}`);
     for (const r of next.repos) console.log(`  repo: ${r}`);
     for (const s of next.siteIds) console.log(`  site: ${s}`);
   } else if (sub === "remove") {
     if (!args._[2]) { console.error("usage: workspaces remove <id|slug> --confirm <slug>"); process.exit(2); }
     const ws = resolveWorkspace(dir, args._[2], { owner: args.owner ? String(args.owner) : undefined });
     deleteWorkspace(dir, ws.id, { confirm: args.confirm ? String(args.confirm) : undefined });
-    console.log(`removed workspace ${ws.owner}/${ws.slug} (${ws.id}) — registry entry only; repos, sites, and memory untouched`);
-  } else { console.error("usage: workspaces list|show|add|update|remove"); process.exit(2); }
+    console.log(`removed workspace ${ws.owner}/${ws.slug} (${ws.id}) — registry entry only; repos, sites, and memory untouched; children reparented to its parent`);
+  } else { console.error("usage: workspaces list|tree|show|add|update|remove"); process.exit(2); }
 }
 
 // ---------------------------------------------------------------- compute (serverless)

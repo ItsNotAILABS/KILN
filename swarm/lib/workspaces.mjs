@@ -30,6 +30,7 @@ import { randomBytes } from "node:crypto";
 import { repoPath, repoExists, validRepoName } from "./git.mjs";
 import { setCore, loadMemory } from "./memory.mjs";
 import { loadStore as loadSiteStore, repoHead } from "./sites.mjs";
+import { repoFactsSummary } from "./repodetails.mjs";
 
 const WORKSPACES_FILE = "workspaces.json";
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -72,6 +73,44 @@ function saveStore(dir, store) {
 }
 
 export { loadStore, saveStore };
+
+/**
+ * Records written before nesting existed carry no parentId field. They
+ * read as roots (null) everywhere — no migration write is ever needed.
+ */
+function parentIdOf(workspace) {
+  return workspace.parentId ?? null;
+}
+
+/** Public view of a record: parentId always present (null for roots). */
+function recordView(workspace) {
+  return { ...workspace, parentId: parentIdOf(workspace) };
+}
+
+/** The {id, owner, slug, name} summary used for parent/children links. */
+function workspaceSummary(workspace) {
+  return { id: workspace.id, owner: workspace.owner, slug: workspace.slug, name: workspace.name };
+}
+
+/**
+ * Validate a would-be parent for `owner`: it must exist (404) and share
+ * the owner's namespace (400 — parents must share the workspace's owner,
+ * so pick a parent owned by that owner or omit the parent).
+ */
+function needParent(store, parentId, owner) {
+  if (typeof parentId !== "string" || !parentId) {
+    throw new WorkspacesError(400, "parentId must be a workspace id string or null");
+  }
+  const parent = store.workspaces[parentId];
+  if (!parent) {
+    throw new WorkspacesError(404, `parent workspace not found: ${parentId} — create it first or omit the parent`);
+  }
+  if (parent.owner !== owner) {
+    throw new WorkspacesError(400,
+      `parents must share the workspace's owner: parent ${parent.owner}/${parent.slug} is owned by "${parent.owner}", this workspace is owned by "${owner}" — pick a parent owned by "${owner}" or omit the parent`);
+  }
+  return parent;
+}
 
 export function newWorkspaceId() {
   return "ws_" + randomBytes(6).toString("hex");
@@ -212,7 +251,7 @@ function linkRepoMemory(dir, ref, workspace, actor) {
  * is saved only after the memory writes succeed — a failed create leaves
  * no half-linked workspace behind.
  */
-export function createWorkspace(dir, { owner, slug, name, description, repos, siteIds, actor } = {}) {
+export function createWorkspace(dir, { owner, slug, name, description, repos, siteIds, parentId, actor } = {}) {
   validOwner(owner);
   validSlug(slug);
   validName(name);
@@ -221,6 +260,9 @@ export function createWorkspace(dir, { owner, slug, name, description, repos, si
   const siteIdList = validSiteList(dir, siteIds, "siteIds");
 
   const store = loadStore(dir);
+  const parent = parentId === undefined || parentId === null
+    ? null
+    : needParent(store, parentId, owner);
   if (Object.values(store.workspaces).some((w) => w.owner === owner && w.slug === slug)) {
     throw new WorkspacesError(409, `workspace exists: ${owner}/${slug}`);
   }
@@ -232,6 +274,7 @@ export function createWorkspace(dir, { owner, slug, name, description, repos, si
     description: desc,
     repos: repoRefs,
     siteIds: siteIdList,
+    parentId: parent ? parent.id : null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -246,13 +289,32 @@ export function createWorkspace(dir, { owner, slug, name, description, repos, si
 export function listWorkspaces(dir, { owner } = {}) {
   return Object.values(loadStore(dir).workspaces)
     .filter((w) => owner === undefined || w.owner === owner)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.slug.localeCompare(b.slug));
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.slug.localeCompare(b.slug))
+    .map(recordView);
+}
+
+/**
+ * The workspace forest: root records (parentId null, or pointing outside
+ * the returned set), each with a recursive `children` array of the same
+ * shape. Flat list ordering (createdAt, then slug) is preserved at
+ * every level.
+ */
+export function workspaceTree(dir, { owner } = {}) {
+  const all = listWorkspaces(dir, { owner });
+  const byId = new Map(all.map((w) => [w.id, { ...w, children: [] }]));
+  const roots = [];
+  for (const node of byId.values()) {
+    const parent = node.parentId ? byId.get(node.parentId) : null;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  }
+  return roots;
 }
 
 export function getWorkspace(dir, id) {
   const workspace = loadStore(dir).workspaces[id];
   if (!workspace) throw new WorkspacesError(404, `no such workspace: ${id}`);
-  return workspace;
+  return recordView(workspace);
 }
 
 /** Resolve a workspace by id, id prefix, or exact slug (optionally within an owner). */
@@ -260,18 +322,19 @@ export function resolveWorkspace(dir, idOrSlug, { owner } = {}) {
   const all = Object.values(loadStore(dir).workspaces);
   const pool = owner === undefined ? all : all.filter((w) => w.owner === owner);
   const byId = pool.find((w) => w.id === idOrSlug);
-  if (byId) return byId;
+  if (byId) return recordView(byId);
   const byPrefix = pool.filter((w) => w.id.startsWith(idOrSlug));
-  if (byPrefix.length === 1) return byPrefix[0];
+  if (byPrefix.length === 1) return recordView(byPrefix[0]);
   if (byPrefix.length > 1) throw new WorkspacesError(400, `workspace: ambiguous prefix "${idOrSlug}"`);
   const bySlug = pool.find((w) => w.slug === idOrSlug);
-  if (bySlug) return bySlug;
+  if (bySlug) return recordView(bySlug);
   throw new WorkspacesError(404, `workspace: no such workspace "${idOrSlug}"`);
 }
 
 /**
  * Update a workspace: rename, redescribe, add/remove member repos,
- * link/unlink sites. Repos added here get the `workspace` core block
+ * link/unlink sites, and reparent via `setParent` (present = change,
+ * id string or null; absent = unchanged; cycles refused). Repos added here get the `workspace` core block
  * written into their memory before the registry entry is saved, same
  * discipline as create. Removals never retract memory (append-only
  * history — supersede there if a link ever needs retracting).
@@ -284,9 +347,38 @@ export function updateWorkspace(dir, id, patch = {}, { actor } = {}) {
   const workspace = store.workspaces[id];
   if (!workspace) throw new WorkspacesError(404, `no such workspace: ${id}`);
 
-  const next = { ...workspace, repos: [...workspace.repos], siteIds: [...workspace.siteIds] };
+  const next = {
+    ...workspace, parentId: parentIdOf(workspace),
+    repos: [...workspace.repos], siteIds: [...workspace.siteIds],
+  };
   if (patch.name !== undefined) next.name = validName(patch.name);
   if (patch.description !== undefined) next.description = validDescription(patch.description);
+
+  // setParent: the key being PRESENT is the change signal (an id string
+  // reparents, null clears to root); absent leaves the parent untouched.
+  if (Object.prototype.hasOwnProperty.call(patch, "setParent")) {
+    if (patch.setParent === null) {
+      next.parentId = null;
+    } else {
+      const parent = needParent(store, patch.setParent, workspace.owner);
+      // Cycle protection: walking the new parent's ancestor chain must
+      // never reach this workspace — that one walk covers both the
+      // self-parent case and parenting under a descendant.
+      const seen = new Set();
+      let cursor = parent;
+      while (cursor) {
+        if (cursor.id === id) {
+          throw new WorkspacesError(400,
+            `setParent would create a cycle: a workspace cannot be its own ancestor — walking the new parent's ancestor chain reaches this workspace (${workspace.owner}/${workspace.slug}); pick a parent outside this workspace's subtree`);
+        }
+        if (seen.has(cursor.id)) break; // pre-existing loop in stored data: stop, don't spin
+        seen.add(cursor.id);
+        const pid = parentIdOf(cursor);
+        cursor = pid ? store.workspaces[pid] : null;
+      }
+      next.parentId = parent.id;
+    }
+  }
 
   const addedRepos = validRepoList(dir, patch.addRepos, "addRepos");
   const removedRepos = validRepoRefList(patch.removeRepos, "removeRepos");
@@ -311,7 +403,9 @@ export function updateWorkspace(dir, id, patch = {}, { actor } = {}) {
 /**
  * Remove the registry entry only — guarded: the caller must explicitly
  * confirm the workspace's slug, so a bare id can never delete by
- * accident. Repos, sites, and memory are untouched.
+ * accident. Repos, sites, and memory are untouched. Direct children are
+ * reparented to the deleted workspace's own parent (or root) in the
+ * same write, so the tree never dangles.
  */
 export function deleteWorkspace(dir, id, { confirm } = {}) {
   const store = loadStore(dir);
@@ -320,6 +414,14 @@ export function deleteWorkspace(dir, id, { confirm } = {}) {
   if (confirm !== workspace.slug) {
     throw new WorkspacesError(400,
       `delete is guarded: confirm must equal the workspace slug "${workspace.slug}"`);
+  }
+  const inheritParentId = parentIdOf(workspace);
+  const now = new Date().toISOString();
+  for (const other of Object.values(store.workspaces)) {
+    if (other.id !== id && parentIdOf(other) === id) {
+      other.parentId = inheritParentId;
+      other.updatedAt = now;
+    }
   }
   delete store.workspaces[id];
   saveStore(dir, store);
@@ -346,11 +448,19 @@ export function repoBranch(dir, owner, repo) {
 function repoStatusView(dir, ref) {
   const [owner, repo] = ref.split("/");
   const exists = repoExists(dir, owner, repo);
+  let details = null;
+  if (exists) {
+    // A repo that vanishes (or turns unreadable) between the existence
+    // check and the summary read reports details: null — the status of
+    // the whole workspace must not fail over one member's race.
+    try { details = repoFactsSummary(dir, owner, repo); } catch { details = null; }
+  }
   return {
     repo: ref,
     exists,
     branch: exists ? repoBranch(dir, owner, repo) : null,
     head: exists ? repoHead(dir, owner, repo) : null,
+    details,
   };
 }
 
@@ -368,8 +478,12 @@ function memoryLinkage(dir, ref) {
 
 /**
  * Aggregated live status for one workspace: member repos with live HEADs
- * read from the forge itself, linked sites resolved from the sites
- * registry, and per-repo memory-linkage verification.
+ * read from the forge itself (each with a project-details summary),
+ * linked sites resolved from the sites registry, per-repo memory-linkage
+ * verification, and the nesting view — parent, direct children, and a
+ * rollup over the whole subtree (member repos of this workspace AND all
+ * descendants, deduped by repo ref with own repos first; siteIds
+ * unioned across the subtree).
  */
 export function workspaceStatus(dir, id) {
   const workspace = getWorkspace(dir, id);
@@ -394,5 +508,50 @@ export function workspaceStatus(dir, id) {
     if (!m.present) allLinked = false;
   }
 
-  return { workspace, repos, sites: linkedSites, memory: { repos: memory, linked: allLinked } };
+  // ---- nesting: parent, direct children, subtree rollup ----
+  const all = listWorkspaces(dir); // sorted (createdAt, slug) at every level
+  const byId = new Map(all.map((w) => [w.id, w]));
+  const parentRecord = workspace.parentId ? byId.get(workspace.parentId) : null;
+  const parent = parentRecord ? workspaceSummary(parentRecord) : null;
+  const childRecords = all.filter((w) => parentIdOf(w) === id);
+  const children = childRecords.map(workspaceSummary);
+
+  // Pre-order walk, own workspace first, children in list order:
+  // rollup repos keep first occurrence (own repos win duplicates).
+  const subtree = [];
+  const visited = new Set();
+  const walkSubtree = (wsId) => {
+    if (visited.has(wsId)) return;
+    visited.add(wsId);
+    const record = byId.get(wsId);
+    if (!record) return;
+    subtree.push(record);
+    for (const child of all.filter((w) => parentIdOf(w) === wsId)) walkSubtree(child.id);
+  };
+  walkSubtree(id);
+
+  const rollupRepos = [];
+  const seenRepos = new Set();
+  const rollupSiteIds = [];
+  for (const record of subtree) {
+    for (const ref of record.repos) {
+      if (seenRepos.has(ref)) continue;
+      seenRepos.add(ref);
+      rollupRepos.push(repoStatusView(dir, ref));
+    }
+    for (const sid of record.siteIds) {
+      if (!rollupSiteIds.includes(sid)) rollupSiteIds.push(sid);
+    }
+  }
+  const rollup = {
+    descendantCount: subtree.length - 1,
+    repos: rollupRepos,
+    siteIds: rollupSiteIds,
+  };
+
+  return {
+    workspace, repos, sites: linkedSites,
+    memory: { repos: memory, linked: allLinked },
+    parent, children, rollup,
+  };
 }

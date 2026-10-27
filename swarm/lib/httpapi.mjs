@@ -72,10 +72,22 @@
  *                                    HEADs + branches, linked sites, memory
  *                                    linkage)
  *   PATCH /v1/workspaces/:id        {name?, description?, addRepos?,
- *                                    removeRepos?, linkSites?, unlinkSites?}
- *                                    -> {ok, workspace}
+ *                                    removeRepos?, linkSites?, unlinkSites?,
+ *                                    setParent?:"<id>"|null}
+ *                                    -> {ok, workspace} (setParent present =
+ *                                    reparent; cycles refused with 400)
  *   DELETE /v1/workspaces/:id       {confirm:"<slug>"} -> {ok:true, id}
- *                                    (guarded; registry entry only)
+ *                                    (guarded; registry entry only;
+ *                                    children reparent to its parent)
+ *   GET  /v1/workspaces?tree=1      -> {workspaces:[roots with nested
+ *                                    children]} (see GET list above)
+ * Project details (live per-repo facts + editable description/topics):
+ *   GET  /v1/repos/:owner/:repo/details -> project details object
+ *   PATCH /v1/repos/:owner/:repo/details {description?, topics?}
+ *                                    -> {ok, details}
+ * Discovery (bearer-gated like every /v1 route):
+ *   GET  /v1/capabilities           -> {version, abilities, openapi, docs}
+ *   GET  /v1/openapi.json           -> OpenAPI 3.1 document (lib/openapi.mjs)
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -115,9 +127,13 @@ import {
   SitesError, createSite, listSites, deleteSite, siteStatus,
 } from "./sites.mjs";
 import {
-  WorkspacesError, createWorkspace, listWorkspaces, updateWorkspace,
-  deleteWorkspace, workspaceStatus,
+  WorkspacesError, createWorkspace, listWorkspaces, workspaceTree,
+  updateWorkspace, deleteWorkspace, workspaceStatus,
 } from "./workspaces.mjs";
+import {
+  RepoDetailsError, repoDetails, updateRepoDetails,
+} from "./repodetails.mjs";
+import { buildCapabilities, buildOpenApiDocument } from "./openapi.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -761,6 +777,7 @@ export function startApiServer(dir, cfg) {
           const workspace = createWorkspace(dir, {
             owner: b.owner, slug: b.slug, name: b.name,
             description: b.description, repos: b.repos, siteIds: b.siteIds,
+            parentId: b.parentId,
             actor: "api",
           });
           return send(res, 201, { ok: true, workspace });
@@ -771,6 +788,9 @@ export function startApiServer(dir, cfg) {
       }
       if (req.method === "GET" && path === "/v1/workspaces") {
         const owner = url.searchParams.get("owner") || undefined;
+        if (url.searchParams.get("tree") === "1") {
+          return send(res, 200, { workspaces: workspaceTree(dir, { owner }) });
+        }
         return send(res, 200, { workspaces: listWorkspaces(dir, { owner }) });
       }
       {
@@ -786,11 +806,16 @@ export function startApiServer(dir, cfg) {
         if (req.method === "PATCH" && m) {
           const b = await readBody(req);
           try {
-            const workspace = updateWorkspace(dir, m[1], {
+            const patch = {
               name: b.name, description: b.description,
               addRepos: b.addRepos, removeRepos: b.removeRepos,
               linkSites: b.linkSites, unlinkSites: b.unlinkSites,
-            }, { actor: "api" });
+            };
+            // setParent is presence-sensitive in the lib (absent =
+            // unchanged, null = clear) — only forward it when the body
+            // actually carries the key.
+            if (Object.prototype.hasOwnProperty.call(b, "setParent")) patch.setParent = b.setParent;
+            const workspace = updateWorkspace(dir, m[1], patch, { actor: "api" });
             return send(res, 200, { ok: true, workspace });
           } catch (e) {
             if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
@@ -806,6 +831,39 @@ export function startApiServer(dir, cfg) {
             throw e;
           }
         }
+      }
+
+      // ---- project details: live per-repo facts + editable metadata ----
+      {
+        const m = path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/details$/);
+        if (req.method === "GET" && m) {
+          try {
+            return send(res, 200, repoDetails(dir, m[1], m[2]));
+          } catch (e) {
+            if (e instanceof RepoDetailsError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+        if (req.method === "PATCH" && m) {
+          const b = await readBody(req);
+          try {
+            const details = updateRepoDetails(dir, m[1], m[2], {
+              description: b.description, topics: b.topics,
+            });
+            return send(res, 200, { ok: true, details });
+          } catch (e) {
+            if (e instanceof RepoDetailsError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+      }
+
+      // ---- discovery: capabilities + OpenAPI (bearer-gated, like /v1) ----
+      if (req.method === "GET" && path === "/v1/capabilities") {
+        return send(res, 200, buildCapabilities());
+      }
+      if (req.method === "GET" && path === "/v1/openapi.json") {
+        return send(res, 200, buildOpenApiDocument());
       }
 
       return send(res, 404, { error: "not found" });
