@@ -23,6 +23,14 @@
  *   swarm.mjs sites add --name N --frontend O/R --backend O/R
  *                        [--artifact SLUG] [--app NAME|APPID] [--dir PATH]
  *   swarm.mjs sites remove <id|name> [--dir PATH]
+ *   swarm.mjs workspaces list [--owner O] [--dir PATH]
+ *   swarm.mjs workspaces show <id|slug> [--dir PATH]
+ *   swarm.mjs workspaces add --owner O --slug S --name N [--description D]
+ *                        [--repos O/R,O/R] [--sites ID,ID] [--dir PATH]
+ *   swarm.mjs workspaces update <id|slug> [--name N] [--description D]
+ *                        [--add-repo O/R] [--remove-repo O/R]
+ *                        [--link-site ID] [--unlink-site ID] [--dir PATH]
+ *   swarm.mjs workspaces remove <id|slug> --confirm SLUG [--dir PATH]
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -46,6 +54,10 @@ import { promoteRepo } from "./lib/promote.mjs";
 import {
   createSite, listSites, resolveSite, deleteSite, siteStatus,
 } from "./lib/sites.mjs";
+import {
+  createWorkspace, listWorkspaces, resolveWorkspace, updateWorkspace,
+  deleteWorkspace, workspaceStatus,
+} from "./lib/workspaces.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
@@ -785,6 +797,64 @@ async function cmdSites(args) {
   } else { console.error("usage: sites list|show|add|remove"); process.exit(2); }
 }
 
+// ---------------------------------------------------------------- workspaces (member repos + linked sites, one owner)
+
+function oneOrUndef(v) {
+  return v === undefined ? undefined : [String(v)];
+}
+
+async function cmdWorkspaces(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  if (sub === "add") {
+    // Works purely on local state (registry + repo memory + git), like
+    // `sites add` — no daemon needed. Memory linkage is written on create.
+    const ws = createWorkspace(dir, {
+      owner: String(need(args, "owner")),
+      slug: String(need(args, "slug")),
+      name: String(need(args, "name")),
+      description: args.description ? String(args.description) : undefined,
+      repos: csv(args.repos),
+      siteIds: csv(args.sites),
+      actor: "cli",
+    });
+    console.log(`workspace ${ws.owner}/${ws.slug} (${ws.id}) — ${ws.name}`);
+    for (const r of ws.repos) console.log(`  repo: ${r}`);
+    for (const s of ws.siteIds) console.log(`  site: ${s}`);
+    console.log(`  memory linkage written to member repos (workspace core block)`);
+  } else if (sub === "list") {
+    const all = listWorkspaces(dir, { owner: args.owner ? String(args.owner) : undefined });
+    if (!all.length) { console.log("(no workspaces)"); return; }
+    for (const w of all) {
+      console.log(`${w.id.slice(0, 12)}…  ${w.owner}/${w.slug.padEnd(16)} ${w.name}  repos=${w.repos.length} sites=${w.siteIds.length}`);
+    }
+  } else if (sub === "show") {
+    if (!args._[2]) { console.error("usage: workspaces show <id|slug>"); process.exit(2); }
+    const ws = resolveWorkspace(dir, args._[2], { owner: args.owner ? String(args.owner) : undefined });
+    console.log(JSON.stringify(workspaceStatus(dir, ws.id), null, 2));
+  } else if (sub === "update") {
+    if (!args._[2]) { console.error("usage: workspaces update <id|slug> [--name N] [--description D] [--add-repo O/R] [--remove-repo O/R] [--link-site ID] [--unlink-site ID]"); process.exit(2); }
+    const ws = resolveWorkspace(dir, args._[2], { owner: args.owner ? String(args.owner) : undefined });
+    const next = updateWorkspace(dir, ws.id, {
+      name: args.name ? String(args.name) : undefined,
+      description: args.description !== undefined ? String(args.description) : undefined,
+      addRepos: oneOrUndef(args["add-repo"]),
+      removeRepos: oneOrUndef(args["remove-repo"]),
+      linkSites: oneOrUndef(args["link-site"]),
+      unlinkSites: oneOrUndef(args["unlink-site"]),
+    }, { actor: "cli" });
+    console.log(`workspace ${next.owner}/${next.slug} (${next.id}) updated`);
+    for (const r of next.repos) console.log(`  repo: ${r}`);
+    for (const s of next.siteIds) console.log(`  site: ${s}`);
+  } else if (sub === "remove") {
+    if (!args._[2]) { console.error("usage: workspaces remove <id|slug> --confirm <slug>"); process.exit(2); }
+    const ws = resolveWorkspace(dir, args._[2], { owner: args.owner ? String(args.owner) : undefined });
+    deleteWorkspace(dir, ws.id, { confirm: args.confirm ? String(args.confirm) : undefined });
+    console.log(`removed workspace ${ws.owner}/${ws.slug} (${ws.id}) — registry entry only; repos, sites, and memory untouched`);
+  } else { console.error("usage: workspaces list|show|add|update|remove"); process.exit(2); }
+}
+
 // ---------------------------------------------------------------- compute (serverless)
 
 function readCode(args) {
@@ -923,8 +993,9 @@ try {
   else if (cmd === "promote") await cmdPromote(args);
   else if (cmd === "memory") await cmdMemory(args);
   else if (cmd === "sites") await cmdSites(args);
+  else if (cmd === "workspaces") await cmdWorkspaces(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory|sites");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory|sites|workspaces");
     process.exit(2);
   }
 } catch (e) {

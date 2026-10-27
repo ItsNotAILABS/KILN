@@ -61,6 +61,21 @@
  *   GET  /v1/sites/:id              -> aggregated live status (repo HEADs,
  *                                    compute app status, memory linkage)
  *   DELETE /v1/sites/:id            -> {ok:true, id} (registry entry only)
+ * Workspaces (first-class grouping: member repos + linked sites, one owner):
+ *   POST /v1/workspaces             {owner, slug, name, description?,
+ *                                    repos?:["o/r",…], siteIds?:["site_…"]}
+ *                                    -> 201 {ok, workspace} (also writes a
+ *                                    `workspace` core block into each member
+ *                                    repo's KILN Memory)
+ *   GET  /v1/workspaces?owner=      -> {workspaces:[...]} (registry records)
+ *   GET  /v1/workspaces/:id         -> aggregated live status (member repo
+ *                                    HEADs + branches, linked sites, memory
+ *                                    linkage)
+ *   PATCH /v1/workspaces/:id        {name?, description?, addRepos?,
+ *                                    removeRepos?, linkSites?, unlinkSites?}
+ *                                    -> {ok, workspace}
+ *   DELETE /v1/workspaces/:id       {confirm:"<slug>"} -> {ok:true, id}
+ *                                    (guarded; registry entry only)
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
@@ -99,6 +114,10 @@ import {
 import {
   SitesError, createSite, listSites, deleteSite, siteStatus,
 } from "./sites.mjs";
+import {
+  WorkspacesError, createWorkspace, listWorkspaces, updateWorkspace,
+  deleteWorkspace, workspaceStatus,
+} from "./workspaces.mjs";
 
 const MAX_BODY = 1024 * 1024;
 
@@ -730,6 +749,60 @@ export function startApiServer(dir, cfg) {
             return send(res, 200, deleteSite(dir, m[1]));
           } catch (e) {
             if (e instanceof SitesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+      }
+
+      // ---- workspaces: member repos + linked sites under one owner ----
+      if (req.method === "POST" && path === "/v1/workspaces") {
+        const b = await readBody(req);
+        try {
+          const workspace = createWorkspace(dir, {
+            owner: b.owner, slug: b.slug, name: b.name,
+            description: b.description, repos: b.repos, siteIds: b.siteIds,
+            actor: "api",
+          });
+          return send(res, 201, { ok: true, workspace });
+        } catch (e) {
+          if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
+      if (req.method === "GET" && path === "/v1/workspaces") {
+        const owner = url.searchParams.get("owner") || undefined;
+        return send(res, 200, { workspaces: listWorkspaces(dir, { owner }) });
+      }
+      {
+        const m = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "GET" && m) {
+          try {
+            return send(res, 200, workspaceStatus(dir, m[1]));
+          } catch (e) {
+            if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+        if (req.method === "PATCH" && m) {
+          const b = await readBody(req);
+          try {
+            const workspace = updateWorkspace(dir, m[1], {
+              name: b.name, description: b.description,
+              addRepos: b.addRepos, removeRepos: b.removeRepos,
+              linkSites: b.linkSites, unlinkSites: b.unlinkSites,
+            }, { actor: "api" });
+            return send(res, 200, { ok: true, workspace });
+          } catch (e) {
+            if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+        if (req.method === "DELETE" && m) {
+          const b = await readBody(req);
+          try {
+            return send(res, 200, deleteWorkspace(dir, m[1], { confirm: b.confirm }));
+          } catch (e) {
+            if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
             throw e;
           }
         }
