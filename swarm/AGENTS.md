@@ -188,6 +188,13 @@ bearer-gated), use the REST routes, or spawn the zero-dependency MCP server
 at `swarm/mcp-server.mjs` (tools `kiln_workspace_*` + `kiln_repo_details`;
 generic client config in the docs). Full guide: `docs/WORKSPACES.md#ai-access`.
 
+The forge also has **accounts**: a person signs up (`POST /v1/accounts`),
+logs in (session bearer `kiln_sess_…`), and mints scoped tokens for their
+own agents (`kiln_agt_…`). Account/agent principals are owner-scoped —
+they act only under their account's namespace, on workspaces + project
+details + their own account routes; the operator token remains root.
+Model and boundaries: `docs/ACCOUNTS.md`.
+
 ## 8. Rules (non-negotiable)
 
 1. **Real or loud failure.** Every tool executes for real or the job fails

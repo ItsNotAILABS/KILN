@@ -85,6 +85,18 @@
  *   GET  /v1/repos/:owner/:repo/details -> project details object
  *   PATCH /v1/repos/:owner/:repo/details {description?, topics?}
  *                                    -> {ok, details}
+ * Accounts + agent identities (lib/accounts.mjs). Principals resolve
+ * operator -> account session -> agent token; account/agent principals
+ * are owner-scoped (see the guard after the auth gate):
+ *   POST /v1/accounts               {email, name, owner, password}
+ *                                   -> 201 {ok, account}   (public bootstrap)
+ *   POST /v1/accounts/login         {email, password}
+ *                                   -> {ok, account, sessionToken, expiresAt}
+ *   GET  /v1/accounts/me            -> {ok, account, principal}
+ *   POST /v1/accounts/me/agents     {name, scopes?}  (session only)
+ *                                   -> 201 {ok, agent, token}  (token shown once)
+ *   GET  /v1/accounts/me/agents     -> {agents:[...]}  (session only)
+ *   DELETE /v1/accounts/me/agents/:id -> {ok, agent}   (session only, revoke)
  * Discovery (bearer-gated like every /v1 route):
  *   GET  /v1/capabilities           -> {version, abilities, openapi, docs}
  *   GET  /v1/openapi.json           -> OpenAPI 3.1 document (lib/openapi.mjs)
@@ -128,11 +140,15 @@ import {
 } from "./sites.mjs";
 import {
   WorkspacesError, createWorkspace, listWorkspaces, workspaceTree,
-  updateWorkspace, deleteWorkspace, workspaceStatus,
+  updateWorkspace, deleteWorkspace, workspaceStatus, resolveWorkspace,
 } from "./workspaces.mjs";
 import {
   RepoDetailsError, repoDetails, updateRepoDetails,
 } from "./repodetails.mjs";
+import {
+  AccountsError, accountPublic, agentPublic, createAccount, login,
+  createAgent, listAgents, revokeAgent, resolveAccountToken,
+} from "./accounts.mjs";
 import { buildCapabilities, buildOpenApiDocument } from "./openapi.mjs";
 
 const MAX_BODY = 1024 * 1024;
@@ -314,8 +330,134 @@ export function startApiServer(dir, cfg) {
       }
 
       // ---- auth (everything below here) ----
-      if (!checkAuth(req, token)) {
+      // Principal resolution, in order: the operator token (root,
+      // unchanged), then an account session (kiln_sess_…), then an
+      // agent token (kiln_agt_…) owned by an account. Signup + login
+      // are public bootstrap routes — they authenticate by password.
+      let principal = null;
+      if (checkAuth(req, token)) {
+        principal = { kind: "operator" };
+      } else {
+        const authz = req.headers.authorization || "";
+        if (authz.startsWith("Bearer ")) {
+          const resolved = resolveAccountToken(dir, authz.slice(7));
+          if (resolved) {
+            principal = resolved.kind === "agent"
+              ? { kind: "agent", account: resolved.account, agent: resolved.agent }
+              : { kind: "session", account: resolved.account };
+          }
+        }
+      }
+      const isBootstrap = req.method === "POST" &&
+        (path === "/v1/accounts" || path === "/v1/accounts/login");
+
+      // ---- accounts: public bootstrap (signup + login) ----
+      if (req.method === "POST" && path === "/v1/accounts") {
+        const b = await readBody(req);
+        try {
+          // An unclaimed namespace that already carries forge content
+          // belongs to the operator's world: only an operator-signed
+          // signup may claim it (e.g. the architect claiming his own).
+          if (!principal || principal.kind !== "operator") {
+            const hasContent =
+              listRepos(dir).some((r) => r.owner === b.owner) ||
+              listWorkspaces(dir, { owner: b.owner }).length > 0;
+            if (hasContent) {
+              throw new AccountsError(409,
+                `the owner namespace "${b.owner}" already has forge content and is reserved — pick another owner, or have the operator claim it for you`);
+            }
+          }
+          const account = createAccount(dir, {
+            email: b.email, name: b.name, owner: b.owner, password: b.password,
+          });
+          return send(res, 201, { ok: true, account });
+        } catch (e) {
+          if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
+      if (req.method === "POST" && path === "/v1/accounts/login") {
+        const b = await readBody(req);
+        try {
+          const r = login(dir, { email: b.email, password: b.password });
+          return send(res, 200, {
+            ok: true, account: r.account, sessionToken: r.sessionToken, expiresAt: r.expiresAt,
+          });
+        } catch (e) {
+          if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
+
+      if (!principal) {
         return unauthorized(res);
+      }
+      // Git pushes stay operator-only in this slice: account and agent
+      // tokens are API principals, not git credentials (yet).
+      if (gitReceive && principal.kind !== "operator") {
+        return unauthorized(res);
+      }
+
+      // ---- accounts: self routes ----
+      if (req.method === "GET" && path === "/v1/accounts/me") {
+        if (principal.kind === "operator") {
+          return send(res, 403, { error: "the operator token is not an account — /v1/accounts/me is for account sessions and agent tokens" });
+        }
+        return send(res, 200, {
+          ok: true,
+          account: accountPublic(principal.account),
+          principal: principal.kind === "agent"
+            ? { kind: "agent", agent: agentPublic(principal.agent) }
+            : { kind: "session" },
+        });
+      }
+      if (path === "/v1/accounts/me/agents" || path.startsWith("/v1/accounts/me/agents/")) {
+        if (principal.kind !== "session") {
+          return send(res, 403, { error: "agent identities are managed by the account owner — sign in with the account (a session), not an agent token or the operator token" });
+        }
+        try {
+          if (req.method === "POST" && path === "/v1/accounts/me/agents") {
+            const b = await readBody(req);
+            const r = createAgent(dir, principal.account.id, { name: b.name, scopes: b.scopes });
+            // The raw token is shown exactly once, in this response.
+            return send(res, 201, { ok: true, agent: r.agent, token: r.token });
+          }
+          if (req.method === "GET" && path === "/v1/accounts/me/agents") {
+            return send(res, 200, { agents: listAgents(dir, principal.account.id) });
+          }
+          const am = path.match(/^\/v1\/accounts\/me\/agents\/([A-Za-z0-9_.-]+)$/);
+          if (req.method === "DELETE" && am) {
+            const agent = revokeAgent(dir, principal.account.id, am[1]);
+            return send(res, 200, { ok: true, agent });
+          }
+        } catch (e) {
+          if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+        return send(res, 404, { error: "not found" });
+      }
+
+      // ---- account/agent scope guard ----
+      // Non-operator principals may reach only: discovery, workspaces,
+      // repo project-details, and their own account routes (handled
+      // above). Everything else under the gate is operator-only. Agent
+      // tokens additionally need the matching ability in their scopes.
+      // Owner-level checks live in the route blocks themselves.
+      if (principal.kind !== "operator") {
+        const allowed =
+          path === "/v1/capabilities" || path === "/v1/openapi.json" ||
+          path === "/v1/workspaces" || path.startsWith("/v1/workspaces/") ||
+          /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path);
+        if (!allowed) {
+          return send(res, 403, { error: "this surface is operator-only — account and agent tokens cover workspaces, project details, and their own account routes (see swarm/docs/ACCOUNTS.md)" });
+        }
+        if (principal.kind === "agent") {
+          const ability = path.startsWith("/v1/workspaces") ? "workspaces"
+            : path.startsWith("/v1/repos/") ? "project-details" : null;
+          if (ability && !principal.agent.scopes.includes(ability)) {
+            return send(res, 403, { error: `this agent token lacks the "${ability}" scope` });
+          }
+        }
       }
 
       // Authenticated push path — the token was verified BEFORE the backend
@@ -773,6 +915,11 @@ export function startApiServer(dir, cfg) {
       // ---- workspaces: member repos + linked sites under one owner ----
       if (req.method === "POST" && path === "/v1/workspaces") {
         const b = await readBody(req);
+        // Owner scoping: account/agent principals create only under
+        // their own namespace.
+        if (principal.kind !== "operator" && b.owner !== principal.account.owner) {
+          return send(res, 403, { error: `account principals may only create workspaces under their own owner namespace ("${principal.account.owner}")` });
+        }
         try {
           const workspace = createWorkspace(dir, {
             owner: b.owner, slug: b.slug, name: b.name,
@@ -787,7 +934,10 @@ export function startApiServer(dir, cfg) {
         }
       }
       if (req.method === "GET" && path === "/v1/workspaces") {
-        const owner = url.searchParams.get("owner") || undefined;
+        // Owner scoping: account/agent principals see only their own.
+        const owner = principal.kind === "operator"
+          ? (url.searchParams.get("owner") || undefined)
+          : principal.account.owner;
         if (url.searchParams.get("tree") === "1") {
           return send(res, 200, { workspaces: workspaceTree(dir, { owner }) });
         }
@@ -797,6 +947,10 @@ export function startApiServer(dir, cfg) {
         const m = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "GET" && m) {
           try {
+            if (principal.kind !== "operator" &&
+                resolveWorkspace(dir, m[1]).owner !== principal.account.owner) {
+              return send(res, 403, { error: "this workspace belongs to another account" });
+            }
             return send(res, 200, workspaceStatus(dir, m[1]));
           } catch (e) {
             if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
@@ -806,6 +960,10 @@ export function startApiServer(dir, cfg) {
         if (req.method === "PATCH" && m) {
           const b = await readBody(req);
           try {
+            if (principal.kind !== "operator" &&
+                resolveWorkspace(dir, m[1]).owner !== principal.account.owner) {
+              return send(res, 403, { error: "this workspace belongs to another account" });
+            }
             const patch = {
               name: b.name, description: b.description,
               addRepos: b.addRepos, removeRepos: b.removeRepos,
@@ -825,6 +983,10 @@ export function startApiServer(dir, cfg) {
         if (req.method === "DELETE" && m) {
           const b = await readBody(req);
           try {
+            if (principal.kind !== "operator" &&
+                resolveWorkspace(dir, m[1]).owner !== principal.account.owner) {
+              return send(res, 403, { error: "this workspace belongs to another account" });
+            }
             return send(res, 200, deleteWorkspace(dir, m[1], { confirm: b.confirm }));
           } catch (e) {
             if (e instanceof WorkspacesError) return send(res, e.status, { error: e.message });
@@ -846,6 +1008,10 @@ export function startApiServer(dir, cfg) {
         }
         if (req.method === "PATCH" && m) {
           const b = await readBody(req);
+          // Owner scoping: describing a repo is a write on its namespace.
+          if (principal.kind !== "operator" && m[1] !== principal.account.owner) {
+            return send(res, 403, { error: "account principals may only describe repos under their own owner namespace" });
+          }
           try {
             const details = updateRepoDetails(dir, m[1], m[2], {
               description: b.description, topics: b.topics,

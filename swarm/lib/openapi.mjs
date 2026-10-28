@@ -294,6 +294,19 @@ export function buildCapabilities() {
         ],
         mcpTools: [],
       },
+      {
+        id: "accounts",
+        title: "Accounts + agent identities — people sign up and log in (sessions), and mint scoped tokens for their own agents. Account/agent principals are owner-scoped: they act only under their own owner namespace, on workspaces + project details + their own account routes; everything else stays operator-only. Model: swarm/docs/ACCOUNTS.md",
+        endpoints: [
+          "POST /v1/accounts",
+          "POST /v1/accounts/login",
+          "GET /v1/accounts/me",
+          "POST /v1/accounts/me/agents",
+          "GET /v1/accounts/me/agents",
+          "DELETE /v1/accounts/me/agents/:id",
+        ],
+        mcpTools: [],
+      },
     ],
     openapi: "/v1/openapi.json",
     docs: "swarm/docs/WORKSPACES.md",
@@ -317,6 +330,151 @@ export function buildOpenApiDocument() {
     servers: [{ url: "/" }],
     security: [{ bearerAuth: [] }],
     paths: {
+      "/v1/accounts": {
+        post: {
+          operationId: "createAccount",
+          summary: "Sign up (public bootstrap — authenticates by the new password). The owner is your namespace on the forge; a namespace that already has repos/workspaces is reserved unless an operator-signed signup claims it",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    email: { type: "string", format: "email" },
+                    name: { type: "string", maxLength: 120 },
+                    owner: { type: "string", pattern: "^[a-z0-9][a-z0-9-]{0,63}$" },
+                    password: { type: "string", minLength: 10 },
+                  },
+                  required: ["email", "name", "owner", "password"],
+                },
+              },
+            },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, account: { $ref: "#/components/schemas/Account" } },
+              required: ["ok", "account"],
+            }),
+            "400": errorResponse("Validation failed — the message says what to fix"),
+            "409": errorResponse("Email already registered, or owner namespace already claimed/reserved"),
+          },
+        },
+      },
+      "/v1/accounts/login": {
+        post: {
+          operationId: "login",
+          summary: "Log in with email + password; returns a session bearer token (kiln_sess_…, 30 days)",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    email: { type: "string", format: "email" },
+                    password: { type: "string" },
+                  },
+                  required: ["email", "password"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": jsonResponse("Logged in", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                account: { $ref: "#/components/schemas/Account" },
+                sessionToken: { type: "string" },
+                expiresAt: { type: "string", format: "date-time" },
+              },
+              required: ["ok", "account", "sessionToken", "expiresAt"],
+            }),
+            "401": errorResponse("Invalid email or password (one message for every failure mode)"),
+          },
+        },
+      },
+      "/v1/accounts/me": {
+        get: {
+          operationId: "getMe",
+          summary: "The caller's account + principal kind (session or agent token; the operator token is not an account)",
+          responses: {
+            "200": jsonResponse("The caller's account", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                account: { $ref: "#/components/schemas/Account" },
+                principal: { type: "object" },
+              },
+              required: ["ok", "account", "principal"],
+            }),
+            "403": errorResponse("Operator token is not an account"),
+          },
+        },
+      },
+      "/v1/accounts/me/agents": {
+        post: {
+          operationId: "createAgent",
+          summary: "Mint an agent identity for your account (session required — agent tokens cannot mint agents). The raw token (kiln_agt_…) is returned exactly once; only its sha256 is stored",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string", maxLength: 120 },
+                    scopes: { type: "array", items: { type: "string", enum: ["workspaces", "project-details"] }, description: "Default: both scopes" },
+                  },
+                  required: ["name"],
+                },
+              },
+            },
+          },
+          responses: {
+            "201": jsonResponse("Created — token shown once", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                agent: { $ref: "#/components/schemas/AgentIdentity" },
+                token: { type: "string" },
+              },
+              required: ["ok", "agent", "token"],
+            }),
+            "403": errorResponse("Agent management requires an account session"),
+          },
+        },
+        get: {
+          operationId: "listAgents",
+          summary: "List your account's agent identities (session required; tokens/hashes never appear)",
+          responses: {
+            "200": jsonResponse("Your agents", {
+              type: "object",
+              properties: { agents: { type: "array", items: { $ref: "#/components/schemas/AgentIdentity" } } },
+              required: ["agents"],
+            }),
+          },
+        },
+      },
+      "/v1/accounts/me/agents/{id}": {
+        delete: {
+          operationId: "revokeAgent",
+          summary: "Revoke one of your agent identities (session required). The record stays for audit; the token dies immediately",
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": jsonResponse("Revoked", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, agent: { $ref: "#/components/schemas/AgentIdentity" } },
+              required: ["ok", "agent"],
+            }),
+            "404": errorResponse("No such agent on your account"),
+          },
+        },
+      },
       "/v1/workspaces": {
         post: {
           operationId: "createWorkspace",
@@ -566,6 +724,31 @@ export function buildOpenApiDocument() {
       },
       schemas: {
         Error: ERROR_SCHEMA,
+        Account: {
+          type: "object",
+          description: "A forge account. Password hashes and token hashes are never part of any response.",
+          properties: {
+            id: { type: "string" },
+            email: { type: "string", format: "email" },
+            name: { type: "string" },
+            owner: { type: "string", description: "The account's namespace on the forge — its workspaces and repos live under this owner" },
+            createdAt: { type: "string", format: "date-time" },
+          },
+          required: ["id", "email", "name", "owner", "createdAt"],
+        },
+        AgentIdentity: {
+          type: "object",
+          description: "An agent identity owned by an account. The raw token is returned once at creation and never stored or shown again.",
+          properties: {
+            id: { type: "string" },
+            accountId: { type: "string" },
+            name: { type: "string" },
+            scopes: { type: "array", items: { type: "string", enum: ["workspaces", "project-details"] } },
+            createdAt: { type: "string", format: "date-time" },
+            revoked: { type: "boolean" },
+          },
+          required: ["id", "accountId", "name", "scopes", "createdAt", "revoked"],
+        },
         Workspace: WORKSPACE_SCHEMA,
         WorkspaceTreeNode: WORKSPACE_TREE_NODE_SCHEMA,
         WorkspaceSummary: WORKSPACE_SUMMARY_SCHEMA,
