@@ -264,8 +264,11 @@ describe("ci suite results (e2e)", () => {
     assert.ok(stored.split("\n").includes("fill-1"));
     assert.ok(stored.split("\n").includes("fill-300"));
     assert.match(stored, /SUITE_RESULT\tstderr suite\tfail\t3/);
-    // Status endpoint consumers see the same suites.
-    const res = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-suites-pass/ci/status/${sha}`);
+    // Status endpoint consumers see the same suites. (CI reads are
+    // principal-gated since the 2026-10-28 accounts-only rule.)
+    const res = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-suites-pass/ci/status/${sha}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     assert.equal(res.status, 200);
     assert.deepEqual((await res.json()).suites, doc.suites);
   });

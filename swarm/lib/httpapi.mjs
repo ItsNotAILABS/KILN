@@ -34,10 +34,15 @@
  *   DELETE /v1/compute/apps/:id     -> {ok:true}
  * Git hosting (KILN-native repos, served via git http-backend CGI):
  *   POST /git/:owner/:repo            create repo (auth required)
- *   GET  /git                         list repos (public)
- *   GET  /git/:owner/:repo/info/refs?service=...   (public)
- *   POST /git/:owner/:repo/git-upload-pack          (public — clone/fetch)
- *   POST /git/:owner/:repo/git-receive-pack         (auth required — push)
+ *   GET  /git                         list repos (auth required; account
+ *                                     principals see only their namespace)
+ *   GET  /git/:owner/:repo/info/refs?service=...   (auth required)
+ *   POST /git/:owner/:repo/git-upload-pack          (auth required — clone/fetch)
+ *   POST /git/:owner/:repo/git-receive-pack         (auth required — push,
+ *                                     operator token only)
+ *   Reads are principal-gated by the architect's rule (2026-10-28): only
+ *   our accounts see the forge. CI status/latest/log under /git/.../ci/
+ *   are gated the same way — a CI log can carry code.
  * Promotion (KILN-native repos -> GitHub, Git Data API rebuild):
  *   POST /v1/promote                {repo:"owner/repo", github?:"owner/repo",
  *                                    branch?, rebase?, force?} -> receipt
@@ -265,45 +270,32 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, { ok: true, version: 1, service: "kiln-swarm" });
       }
 
-      // ---- git hosting: public routes (list/clone/fetch need no token) ----
-      if (req.method === "GET" && path === "/git") {
-        return send(res, 200, { repos: listRepos(dir) });
-      }
-      // CI status, GitHub commit-status style — public, like clone/fetch.
+      // ---- git hosting: read routes are HELD for the auth gate below ----
+      // (architect's rule, 2026-10-28: only our accounts see the forge —
+      // repo list, clone/fetch and CI reads all require a principal).
+      let gitList = false;
+      if (req.method === "GET" && path === "/git") gitList = true;
+      // CI status, GitHub commit-status style — gated like clone/fetch.
       // ci/log/:sha serves the run's retained FULL log as text/plain
       // (the status doc's logTail is only the last 120 lines).
+      let ciRoute = null;
       {
         const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/ci\/(status|latest|log)(?:\/([0-9a-f]{4,40}))?$/);
         if (req.method === "GET" && m) {
-          const owner = m[1], repo = m[2], which = m[3], sha = m[4] || null;
-          if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
-            return send(res, 404, { error: "no such repo" });
-          }
-          if (which === "log") {
-            const text = sha ? readLog(dir, owner, repo, sha) : null;
-            if (text === null) return send(res, 404, { error: "no CI log" });
-            res.writeHead(200, {
-              "content-type": "text/plain; charset=utf-8",
-              "content-length": Buffer.byteLength(text),
-            });
-            res.end(text);
-            return;
-          }
-          const doc = which === "status"
-            ? (sha ? readResult(dir, owner, repo, sha) : null)
-            : readLatest(dir, owner, repo, url.searchParams.get("branch") || undefined);
-          if (!doc) return send(res, 404, { error: "no CI result" });
-          return send(res, 200, doc);
+          ciRoute = { owner: m[1], repo: m[2], which: m[3], sha: m[4] || null };
         }
       }
       // gitReceive is set for receive-pack; served after the auth gate below.
       // NOTE: only paths WITH a trailing smart-http segment are intercepted
       // here; bare /git/:owner/:repo (repo create) falls through to auth.
       let gitReceive = null;
+      let gitRead = null;
       let memoryRoute = null;
       {
         const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(\/.*)?$/);
-        if (m && m[3]) {
+        // CI paths also match this shape — they are held as ciRoute above
+        // and must not fall into the smart-http kind check (404) here.
+        if (m && m[3] && !ciRoute) {
           const owner = m[1], repo = m[2], rest = m[3] || "";
           // Memory routes live under /git/:owner/:repo/memory/* but are
           // NOT git protocol — hold them for the auth gate below.
@@ -322,8 +314,7 @@ export function startApiServer(dir, cfg) {
           if (kind === "receive") {
             gitReceive = { owner, repo };
           } else {
-            await serveGitHttp(dir, req, res);
-            return;
+            gitRead = { owner, repo };
           }
           }
         }
@@ -396,6 +387,53 @@ export function startApiServer(dir, cfg) {
       // tokens are API principals, not git credentials (yet).
       if (gitReceive && principal.kind !== "operator") {
         return unauthorized(res);
+      }
+
+      // ---- git reads: held above, served now that a principal exists ----
+      // Operator reads everything. Account/agent principals read only
+      // their own owner namespace — "only our accounts see it", with the
+      // account boundary as the wall (403, self-describing, otherwise).
+      const gitScopeDenied = (owner) =>
+        principal.kind !== "operator" && principal.account?.owner !== owner;
+      const gitScopeError = (owner) => ({
+        error: `account principals may read only their own namespace ("${principal.account?.owner}") — "${owner}" is not yours`,
+      });
+      if (gitList) {
+        const all = listRepos(dir);
+        return send(res, 200, {
+          repos: principal.kind === "operator"
+            ? all
+            : all.filter((r) => r.owner === principal.account?.owner),
+        });
+      }
+      if (ciRoute) {
+        const { owner, repo, which, sha } = ciRoute;
+        if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
+          return send(res, 404, { error: "no such repo" });
+        }
+        if (gitScopeDenied(owner)) return send(res, 403, gitScopeError(owner));
+        if (which === "log") {
+          const text = sha ? readLog(dir, owner, repo, sha) : null;
+          if (text === null) return send(res, 404, { error: "no CI log" });
+          res.writeHead(200, {
+            "content-type": "text/plain; charset=utf-8",
+            "content-length": Buffer.byteLength(text),
+          });
+          res.end(text);
+          return;
+        }
+        const doc = which === "status"
+          ? (sha ? readResult(dir, owner, repo, sha) : null)
+          : readLatest(dir, owner, repo, url.searchParams.get("branch") || undefined);
+        if (!doc) return send(res, 404, { error: "no CI result" });
+        return send(res, 200, doc);
+      }
+      if (gitRead) {
+        if (gitScopeDenied(gitRead.owner)) {
+          return send(res, 403, gitScopeError(gitRead.owner));
+        }
+        await serveGitHttp(dir, req, res);
+        return;
       }
 
       // ---- accounts: self routes ----

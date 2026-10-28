@@ -10,6 +10,7 @@ import { newKeypair } from "./keys.mjs";
 import { nowSec } from "./grant.mjs";
 import {
   nodeDir, saveNode, writeKeyFile, touchHeartbeat, loadNode, resolveNode,
+  loadApiToken,
 } from "./state.mjs";
 
 /**
@@ -19,9 +20,19 @@ import {
  * self-deadlock plus a 120s API freeze for everyone else. Async keeps the
  * loop alive so the clone's own HTTP requests get answered.
  */
-export function gitClone(repo, workdir, timeoutMs) {
+export function gitClone(repo, workdir, timeoutMs, token = null) {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", ["clone", repo, workdir], { stdio: ["ignore", "pipe", "pipe"] });
+    // Forge reads are principal-gated (2026-10-28): a KILN-native HTTP
+    // clone carries the daemon's bearer token as an http.extraHeader for
+    // this ONE invocation via env — same pattern as git.push in
+    // tools.mjs. The token never lands in the workdir's .git/config.
+    const env = { ...process.env };
+    if (token && /^https?:\/\//.test(repo)) {
+      env.GIT_CONFIG_COUNT = "1";
+      env.GIT_CONFIG_KEY_0 = "http.extraHeader";
+      env.GIT_CONFIG_VALUE_0 = `Authorization: Bearer ${token}`;
+    }
+    const child = spawn("git", ["clone", repo, workdir], { stdio: ["ignore", "pipe", "pipe"], env });
     let out = "", err = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { err += d; });
@@ -40,18 +51,21 @@ export function gitClone(repo, workdir, timeoutMs) {
         // Best-effort memory fetch (phase 5), awaited before resolve so
         // callers see the finished state — but it swallows everything
         // and time-boxes each step, so it can never fail or hang a clone.
-        fetchMemoryRef(workdir).then(() => resolve(), () => resolve());
+        fetchMemoryRef(workdir, token).then(() => resolve(), () => resolve());
       }
     });
   });
 }
 
 /** Async one-shot git in a workdir; resolves { code, out }, never rejects. */
-function gitRun(workdir, args, timeoutMs) {
+function gitRun(workdir, args, timeoutMs, extraEnv = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn("git", ["-C", workdir, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn("git", ["-C", workdir, ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, ...extraEnv },
+      });
     } catch { resolve({ code: -1, out: "" }); return; }
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
@@ -82,14 +96,23 @@ function gitRun(workdir, args, timeoutMs) {
  * workdir for the node's whole life. So: probe with ls-remote first;
  * configure + fetch only on a non-empty answer.
  */
-async function fetchMemoryRef(workdir) {
+async function fetchMemoryRef(workdir, token = null) {
   try {
-    const ls = await gitRun(workdir, ["ls-remote", "origin", "refs/kiln/memory"], 15000);
+    // Same principal gate as the clone itself: carry the bearer header
+    // per-invocation when we have the daemon token.
+    const authEnv = token
+      ? {
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "http.extraHeader",
+          GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+        }
+      : {};
+    const ls = await gitRun(workdir, ["ls-remote", "origin", "refs/kiln/memory"], 15000, authEnv);
     if (ls.code !== 0 || !ls.out.trim()) return;
     await gitRun(workdir, ["config", "--add", "remote.origin.fetch",
       "+refs/kiln/memory:refs/kiln/memory"], 15000);
     await gitRun(workdir, ["fetch", "-q", "origin",
-      "+refs/kiln/memory:refs/kiln/memory"], 15000);
+      "+refs/kiln/memory:refs/kiln/memory"], 15000, authEnv);
   } catch { /* best effort: a memory fetch must never fail a clone */ }
 }
 
@@ -167,7 +190,11 @@ export async function createNode(dir, opts) {
   const workdir = join(ndir, "work");
   if (repo) {
     try {
-      await gitClone(repo, workdir, cloneTimeoutMs);
+      // The daemon clones with its own credential — forge reads are
+      // principal-gated, and the daemon is the root principal.
+      let cloneToken = null;
+      try { cloneToken = loadApiToken(dir); } catch { /* filesystem repos need none */ }
+      await gitClone(repo, workdir, cloneTimeoutMs, cloneToken);
       // A clone can exit 0 with no working tree (remote HEAD -> missing
       // branch). Gate node creation on a real checkout — a deploy must
       // fail loudly here, never become a crash-looping app node.

@@ -2,7 +2,10 @@
  * KILN-native git hosting: real git round trip against the daemon's HTTP API.
  * Creates a repo via the API, clones it over smart HTTP, pushes a commit with
  * the Bearer <redacted>, and verifies a fresh clone sees it. Then proves an
- * unauthenticated push is refused (401) and lands nothing.
+ * unauthenticated push is refused (401) and lands nothing, and — since
+ * the 2026-10-28 accounts-only rule — anonymous reads (list, info/refs,
+ * upload-pack, clone) are refused too; account sessions read only their
+ * own owner namespace.
  *
  * No mocks: a real `git` client talks to the real `git http-backend` CGI.
  */
@@ -16,11 +19,20 @@ import { makeStateDir } from "./helpers.mjs";
 import { loadApiToken } from "../lib/state.mjs";
 import { startApiServer } from "../lib/httpapi.mjs";
 import { validRepoName } from "../lib/git.mjs";
+import { createAccount, login } from "../lib/accounts.mjs";
 
 const dir = makeStateDir();
 const token = loadApiToken(dir);
 let api;
 let base;
+
+// Forge reads are principal-gated: clones carry the operator bearer as an
+// http.extraHeader for the one invocation (never persisted in .git/config).
+const bearerEnv = {
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "http.extraHeader",
+  GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+};
 
 // NOTE: async spawn, never spawnSync — the API server under test lives in
 // this same event loop, and spawnSync would deadlock it (git waits for the
@@ -108,16 +120,58 @@ describe("KILN-native git hosting", () => {
     assert.equal(r.status, 400);
   });
 
-  it("lists repos publicly", async () => {
+  it("refuses repo listing without a token", async () => {
     const r = await apiCall("GET", "/git", { auth: false });
+    assert.equal(r.status, 401);
+  });
+
+  it("lists repos with the operator token", async () => {
+    const r = await apiCall("GET", "/git");
     assert.equal(r.status, 200);
     assert.ok(r.data.repos.some((x) => x.owner === "testowner" && x.repo === "testrepo"));
+  });
+
+  it("refuses anonymous reads: info/refs, upload-pack, and clone", async () => {
+    const refs = await fetch(`${base}/git/testowner/testrepo/info/refs?service=git-upload-pack`);
+    assert.equal(refs.status, 401);
+    assert.ok((refs.headers.get("www-authenticate") || "").includes("Basic"));
+    await refs.arrayBuffer();
+    const up = await fetch(`${base}/git/testowner/testrepo/git-upload-pack`, { method: "POST" });
+    assert.equal(up.status, 401);
+    await up.arrayBuffer();
+    const work = mkdtempSync(join(tmpdir(), "kiln-git-anon-"));
+    const r = await git(work, ["clone", "-q", `${base}/git/testowner/testrepo`, "anon"]);
+    assert.notEqual(r.status, 0, "anonymous clone must fail");
+  });
+
+  it("account sessions read only their own namespace", async () => {
+    createAccount(dir, {
+      email: "reader@example.com", name: "Reader", owner: "reader1",
+      password: "reader-password-1",
+    });
+    const created = await apiCall("POST", "/git/reader1/owned");
+    assert.equal(created.status, 201);
+    const { sessionToken } = login(dir, {
+      email: "reader@example.com", password: "reader-password-1",
+    });
+    const sess = { headers: { authorization: `Bearer ${sessionToken}` } };
+    const own = await fetch(`${base}/git/reader1/owned/info/refs?service=git-upload-pack`, sess);
+    assert.equal(own.status, 200);
+    await own.arrayBuffer();
+    const other = await fetch(`${base}/git/testowner/testrepo/info/refs?service=git-upload-pack`, sess);
+    assert.equal(other.status, 403);
+    await other.arrayBuffer();
+    const listRes = await fetch(`${base}/git`, sess);
+    assert.equal(listRes.status, 200);
+    const listData = await listRes.json();
+    assert.ok(listData.repos.length > 0);
+    assert.ok(listData.repos.every((x) => x.owner === "reader1"));
   });
 
   it("round trip: clone, push with token, fresh clone sees the commit", async () => {
     const cloneUrl = `${base}/git/testowner/testrepo`;
     const work = mkdtempSync(join(tmpdir(), "kiln-git-"));
-    await gitOk(work, ["clone", "-q", cloneUrl, "w1"]);
+    await gitOk(work, ["clone", "-q", cloneUrl, "w1"], bearerEnv);
     const w1 = join(work, "w1");
     writeFileSync(join(w1, "hello.txt"), "hello from KILN\n");
     await gitOk(w1, ["-c", "user.email=t@kiln.local", "-c", "user.name=kiln-test", "add", "hello.txt"]);
@@ -130,7 +184,7 @@ describe("KILN-native git hosting", () => {
     });
 
     const w2 = join(work, "w2");
-    await gitOk(work, ["clone", "-q", cloneUrl, "w2"]);
+    await gitOk(work, ["clone", "-q", cloneUrl, "w2"], bearerEnv);
     const content = readFileSync(join(w2, "hello.txt"), "utf8");
     assert.equal(content, "hello from KILN\n");
     const log = await gitOk(w2, ["log", "--oneline", "-1"]);
@@ -165,7 +219,7 @@ describe("KILN-native git hosting", () => {
     await gitOk(w1, ["push", "-q", "origin", "main"]);
 
     const w2 = join(work, "w2");
-    await gitOk(work, ["clone", "-q", `${base}/git/testowner/urlrepo`, "w2"]);
+    await gitOk(work, ["clone", "-q", authedUrl, "w2"]);
     const content = readFileSync(join(w2, "url.txt"), "utf8");
     assert.equal(content, "pushed via URL credentials\n");
   });
@@ -173,7 +227,7 @@ describe("KILN-native git hosting", () => {
   it("push WITHOUT a token is refused and lands nothing", async () => {
     const cloneUrl = `${base}/git/testowner/testrepo`;
     const work = mkdtempSync(join(tmpdir(), "kiln-git-evil-"));
-    await gitOk(work, ["clone", "-q", cloneUrl, "evil"]);
+    await gitOk(work, ["clone", "-q", cloneUrl, "evil"], bearerEnv);
     const e = join(work, "evil");
     writeFileSync(join(e, "evil.txt"), "should never land\n");
     await gitOk(e, ["-c", "user.email=e@kiln.local", "-c", "user.name=eve", "add", "evil.txt"]);
@@ -187,7 +241,7 @@ describe("KILN-native git hosting", () => {
 
     // and nothing landed: a fresh clone has no evil.txt
     const w3 = join(work, "clean");
-    await gitOk(work, ["clone", "-q", cloneUrl, "clean"]);
+    await gitOk(work, ["clone", "-q", cloneUrl, "clean"], bearerEnv);
     const log = await gitOk(w3, ["log", "--oneline"]);
     assert.ok(!log.includes("evil commit"), `evil commit landed! log: ${log}`);
   });

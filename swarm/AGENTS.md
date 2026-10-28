@@ -111,9 +111,15 @@ const r = await swarm.createRepo({ owner: "auro", repo: "scratch" });
 // r.cloneUrl → "http://127.0.0.1:18787/git/auro/scratch"
 ```
 
-Clone/fetch are public. **Push needs the bearer token**: the daemon's
-`api.token` as an `Authorization: Bearer <token>` header (git http.extraHeader).
-Pushes without it are refused — verified, not assumed.
+Clone/fetch need a forge credential too (architect's rule, 2026-10-28:
+only our accounts see the forge — anonymous reads get 401). Use the
+daemon's `api.token` as an `Authorization: Bearer <token>` header (git
+http.extraHeader), or a Basic userinfo URL (`http://oauth2:<token>@host/…`)
+— git retries with the credentials after the 401 challenge. Account
+sessions and agent tokens may read only their own owner namespace.
+**Push needs the operator bearer token** (account/agent tokens cannot
+push). Reads and pushes without credentials are refused — verified, not
+assumed.
 
 ## 5. Persistent pieces of yourself
 

@@ -6,8 +6,13 @@
  * CGI backend — the git protocol itself is NOT reimplemented here.
  *
  * Auth policy (enforced by the caller, lib/httpapi.mjs):
- *   - repo create, receive-pack (push): bearer token required
- *   - repo list, info/refs, upload-pack (clone/fetch): public
+ *   - repo create, receive-pack (push): operator bearer token required
+ *   - repo list, info/refs, upload-pack (clone/fetch) + CI reads: a forge
+ *     principal is required (operator token, account session, or agent
+ *     token); account principals are owner-scoped to their namespace.
+ *     (Changed 2026-10-28 on the architect's rule — only our accounts see
+ *     the forge. Reads were public before, which the public tunnel turned
+ *     into public-internet read access to every hosted repo.)
  */
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";

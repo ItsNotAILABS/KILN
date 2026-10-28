@@ -9,7 +9,7 @@
  *     back, and the retention cap truncates WITH an in-band marker
  *     and honest droppedBytes — never silently;
  *   - e2e: a real push whose command prints 300 lines and fails —
- *     the stored log and the public /ci/log/:sha endpoint carry
+ *     the stored log and the (credential-gated) /ci/log/:sha endpoint carry
  *     line 1, not just the tail; a passing run retains its log too.
  *
  * NOTE: async spawn, never spawnSync — same event-loop deadlock
@@ -157,14 +157,19 @@ describe("ci full-log retention (e2e)", () => {
     assert.ok(storedLines.includes("ci-line-1"), "first line retained");
     assert.ok(storedLines.includes("ci-line-300"));
     assert.match(stored, /\[kiln-ci\] \$ git clone/);
-    // And it is served publicly, like status.
-    const res = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-log-fail/ci/log/${sha}`);
+    // And it is served to a credential holder, like status (CI reads are
+    // principal-gated since the 2026-10-28 accounts-only rule).
+    const auth = { Authorization: `Bearer ${token}` };
+    const res = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-log-fail/ci/log/${sha}`, { headers: auth });
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type"), /text\/plain/);
     const body = await res.text();
     assert.ok(body.split("\n").includes("ci-line-1"));
-    const missing = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-log-fail/ci/log/deadbeef`);
+    const missing = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-log-fail/ci/log/deadbeef`, { headers: auth });
     assert.equal(missing.status, 404);
+    const anon = await fetch(`http://127.0.0.1:${api.port}/git/auro/ci-log-fail/ci/log/${sha}`);
+    assert.equal(anon.status, 401);
+    await anon.arrayBuffer();
   });
 
   it("a passing run retains its full log too", async () => {

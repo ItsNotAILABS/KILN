@@ -50,7 +50,10 @@ function git(cwd, args, extraEnv = {}) {
 }
 
 async function apiGet(path) {
-  const res = await fetch(`http://127.0.0.1:${api.port}${path}`);
+  // CI reads are principal-gated (2026-10-28 accounts-only rule).
+  const res = await fetch(`http://127.0.0.1:${api.port}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
