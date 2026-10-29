@@ -4,7 +4,9 @@
  *
  * A Model Context Protocol server over stdio (JSON-RPC 2.0, newline-
  * delimited JSON, MCP protocol version 2024-11-05) that exposes the
- * KILN workspaces + project-details HTTP API as vendor-neutral tools.
+ * KILN workspaces + project-details HTTP API as vendor-neutral tools,
+ * plus the forge surface (kiln_forge_*: branches, tree, contents,
+ * commits, compare, pull requests, tags, releases, packages).
  * Any MCP client — any vendor, any model — can spawn it:
  *
  *   { "command": "node", "args": ["<path-to>/swarm/mcp-server.mjs"],
@@ -23,7 +25,7 @@
  * called. A tool call that cannot reach the daemon returns an isError
  * result naming the fix instead of a stack dump.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -109,23 +111,43 @@ function resolveConfig() {
  *   VERBATIM (the API's errors are self-describing; we add nothing).
  * - Connection failures: throws ToolFailure naming the fix.
  */
-async function apiRequest(method, path, body) {
+async function apiFetch(method, path, headers, body) {
   const { baseUrl, token, dir } = resolveConfig();
   let res;
   try {
     res = await fetch(baseUrl + path, {
       method,
-      headers: {
-        authorization: `Bearer ${token}`,
-        ...(body === undefined ? {} : { "content-type": "application/json" }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: { authorization: `Bearer ${token}`, ...headers },
+      body,
     });
   } catch {
     // fetch() hides the cause behind a bare TypeError on connection
     // failure — translate it into the actionable message, always.
     throw new ToolFailure(unreachableHint(dir, baseUrl));
   }
+  return { res, baseUrl };
+}
+
+async function apiError(res, baseUrl) {
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = null; }
+  }
+  const msg =
+    data && typeof data.error === "string" && data.error
+      ? data.error
+      : `HTTP ${res.status} from the KILN daemon at ${baseUrl}`;
+  return new ToolFailure(msg);
+}
+
+async function apiRequest(method, path, body) {
+  const { res, baseUrl } = await apiFetch(
+    method,
+    path,
+    body === undefined ? {} : { "content-type": "application/json" },
+    body === undefined ? undefined : JSON.stringify(body)
+  );
   const text = await res.text();
   let data = null;
   if (text) {
@@ -139,6 +161,33 @@ async function apiRequest(method, path, body) {
     throw new ToolFailure(msg);
   }
   return data === null ? { raw: text } : data;
+}
+
+/** Raw-bytes request body (package publish), JSON/text reply parsed like apiRequest. */
+async function apiRequestRawBody(method, path, bytes) {
+  const { res, baseUrl } = await apiFetch(
+    method, path, { "content-type": "application/octet-stream" }, bytes
+  );
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = null; }
+  }
+  if (!res.ok) {
+    const msg =
+      data && typeof data.error === "string" && data.error
+        ? data.error
+        : `HTTP ${res.status} from the KILN daemon at ${baseUrl}`;
+    throw new ToolFailure(msg);
+  }
+  return data === null ? { raw: text } : data;
+}
+
+/** Raw-bytes reply (contents ?raw=1, package download), returned as a Buffer. */
+async function apiRequestBytes(method, path) {
+  const { res, baseUrl } = await apiFetch(method, path, {}, undefined);
+  if (!res.ok) throw await apiError(res, baseUrl);
+  return Buffer.from(await res.arrayBuffer());
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +205,11 @@ function objectSchema(properties, required) {
     ...(required && required.length ? { required } : {}),
     additionalProperties: false,
   };
+}
+
+/** Base path for one repo's forge routes: /v1/repos/:owner/:repo. */
+function forgeRepoBase(args) {
+  return `/v1/repos/${encodeURIComponent(String(args.owner))}/${encodeURIComponent(String(args.repo))}`;
 }
 
 /** Pick only the keys that are PRESENT in args (so a null survives). */
@@ -288,6 +342,517 @@ const TOOLS = [
       );
     },
   },
+
+  // -------------------------------------------------------------------------
+  // Forge tools (kiln_forge_*) — branches, tree, contents, commits, compare,
+  // pull requests, tags, releases, packages. Same daemon, same bearer token.
+  // Principals: operator is root; account sessions + agent tokens are
+  // owner-scoped and agents need scope `forge`. The contents API is the
+  // agent write path (git push stays operator-only). A 404 from the daemon
+  // means the route is staged for its next boot, not broken — the error
+  // surfaces verbatim.
+  // -------------------------------------------------------------------------
+  {
+    name: "kiln_forge_branches_list",
+    description:
+      "List a forge repo's branches: { branches: [{ name, sha }] }. Repo is \"owner/repo\" under /v1/repos/:owner/:repo.",
+    inputSchema: objectSchema(
+      { owner: { ...str }, repo: { ...str } },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `${forgeRepoBase(args)}/branches`);
+    },
+  },
+  {
+    name: "kiln_forge_branch_create",
+    description:
+      "Create a branch in a forge repo. `from` (a ref or sha) is optional — omit it to branch from the daemon's default. Returns the daemon's answer verbatim. Verify with kiln_forge_branches_list.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        name: { ...str, description: "New branch name." },
+        from: { ...str, description: "Optional ref/sha to branch from." },
+      },
+      ["owner", "repo", "name"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["name", "from"]);
+      return apiRequest("POST", `${forgeRepoBase(args)}/branches`, body);
+    },
+  },
+  {
+    name: "kiln_forge_branch_delete",
+    description:
+      "Delete a branch from a forge repo by name. Returns the daemon's answer verbatim. Verify with kiln_forge_branches_list.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        name: { ...str, description: "Branch name to delete." },
+      },
+      ["owner", "repo", "name"]
+    ),
+    async call(args) {
+      return apiRequest("DELETE", `${forgeRepoBase(args)}/branches/${encodeURIComponent(String(args.name))}`);
+    },
+  },
+  {
+    name: "kiln_forge_tree",
+    description:
+      "List one level of a forge repo's tree: { entries: [{ name, type, sha, size }] }. Optional `ref` (branch/tag/sha; daemon default when omitted) and `path` (directory prefix; root when omitted).",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        ref: { ...str, description: "Optional ref (branch, tag, or sha)." },
+        path: { ...str, description: "Optional directory path within the repo." },
+      },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      const qs = new URLSearchParams();
+      if (args.ref !== undefined) qs.set("ref", String(args.ref));
+      if (args.path !== undefined) qs.set("path", String(args.path));
+      const s = qs.toString();
+      return apiRequest("GET", `${forgeRepoBase(args)}/tree${s ? "?" + s : ""}`);
+    },
+  },
+  {
+    name: "kiln_forge_contents_get",
+    description:
+      "Read one file from a forge repo. Default answer is the daemon's JSON envelope { path, ref, sha, size, encoding, content }. Pass raw=true to get the file's raw bytes instead, returned as { size, contentBase64 } (base64 because MCP results are text). `path` is required; `ref` is optional.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        path: { ...str, description: "File path within the repo." },
+        ref: { ...str, description: "Optional ref (branch, tag, or sha)." },
+        raw: { type: "boolean", description: "Return raw bytes as base64 instead of the JSON envelope." },
+      },
+      ["owner", "repo", "path"]
+    ),
+    async call(args) {
+      const qs = new URLSearchParams();
+      qs.set("path", String(args.path));
+      if (args.ref !== undefined) qs.set("ref", String(args.ref));
+      if (args.raw === true) {
+        qs.set("raw", "1");
+        const buf = await apiRequestBytes("GET", `${forgeRepoBase(args)}/contents?${qs.toString()}`);
+        return { size: buf.length, contentBase64: buf.toString("base64") };
+      }
+      return apiRequest("GET", `${forgeRepoBase(args)}/contents?${qs.toString()}`);
+    },
+  },
+  {
+    name: "kiln_forge_contents_put",
+    description:
+      "Create or update one file in a forge repo as a REAL git commit (author = the calling principal) — this is the agent write path; git push stays operator-only. `content` is the file text (utf8 default); for binary content pass encoding \"base64\" with base64 content. `message` is the commit message (required). `branch` targets a non-default branch; `sha` is the current blob sha when updating an existing file. Returns { commit, sha }. Verify with kiln_forge_contents_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        path: { ...str, description: "File path within the repo." },
+        content: { ...str, description: "File content (utf8 text, or base64 when encoding is \"base64\")." },
+        encoding: { ...str, description: "Optional: \"utf8\" (default) or \"base64\"." },
+        message: { ...str, description: "Commit message." },
+        branch: { ...str, description: "Optional target branch." },
+        sha: { ...str, description: "Optional current blob sha when updating." },
+      },
+      ["owner", "repo", "path", "content", "message"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["path", "content", "encoding", "message", "branch", "sha"]);
+      return apiRequest("PUT", `${forgeRepoBase(args)}/contents`, body);
+    },
+  },
+  {
+    name: "kiln_forge_contents_delete",
+    description:
+      "Delete one file from a forge repo as a real git commit. `message` is the commit message (required); `sha` is the file's current blob sha; `branch` targets a non-default branch. Returns { commit }. Verify with kiln_forge_tree or kiln_forge_contents_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        path: { ...str, description: "File path within the repo." },
+        message: { ...str, description: "Commit message." },
+        branch: { ...str, description: "Optional target branch." },
+        sha: { ...str, description: "Optional current blob sha." },
+      },
+      ["owner", "repo", "path", "message"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["path", "message", "branch", "sha"]);
+      return apiRequest("DELETE", `${forgeRepoBase(args)}/contents`, body);
+    },
+  },
+  {
+    name: "kiln_forge_commits_list",
+    description:
+      "List a forge repo's commits, newest first. Optional `ref` (branch/tag/sha), `limit`, and `path` (only commits touching that path).",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        ref: { ...str, description: "Optional ref (branch, tag, or sha)." },
+        limit: { type: "integer", description: "Optional maximum number of commits." },
+        path: { ...str, description: "Optional path filter." },
+      },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      const qs = new URLSearchParams();
+      if (args.ref !== undefined) qs.set("ref", String(args.ref));
+      if (args.limit !== undefined) qs.set("limit", String(args.limit));
+      if (args.path !== undefined) qs.set("path", String(args.path));
+      const s = qs.toString();
+      return apiRequest("GET", `${forgeRepoBase(args)}/commits${s ? "?" + s : ""}`);
+    },
+  },
+  {
+    name: "kiln_forge_commit_get",
+    description:
+      "Get one commit from a forge repo by its sha: message, author, parents, and the daemon's change detail.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        sha: { ...str, description: "Commit sha." },
+      },
+      ["owner", "repo", "sha"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `${forgeRepoBase(args)}/commits/${encodeURIComponent(String(args.sha))}`);
+    },
+  },
+  {
+    name: "kiln_forge_compare",
+    description:
+      "Compare two refs in a forge repo: ahead/behind counts, the commits between them, changed files, and a capped patch. Both `base` and `head` are required.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        base: { ...str, description: "Base ref." },
+        head: { ...str, description: "Head ref." },
+      },
+      ["owner", "repo", "base", "head"]
+    ),
+    async call(args) {
+      const qs = new URLSearchParams({ base: String(args.base), head: String(args.head) });
+      return apiRequest("GET", `${forgeRepoBase(args)}/compare?${qs.toString()}`);
+    },
+  },
+  {
+    name: "kiln_forge_pull_create",
+    description:
+      "Open a pull request in a forge repo: { title, body?, head, base } — head is the source branch, base the target branch. Returns the created pull (keep its number for the other kiln_forge_pull_* tools). Verify with kiln_forge_pull_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        title: { ...str, description: "Pull title." },
+        body: { ...str, description: "Optional pull body." },
+        head: { ...str, description: "Source branch." },
+        base: { ...str, description: "Target branch." },
+      },
+      ["owner", "repo", "title", "head", "base"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["title", "body", "head", "base"]);
+      return apiRequest("POST", `${forgeRepoBase(args)}/pulls`, body);
+    },
+  },
+  {
+    name: "kiln_forge_pulls_list",
+    description:
+      "List a forge repo's pull requests. Optional `state` filter (the daemon's state vocabulary, e.g. open/closed/merged).",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        state: { ...str, description: "Optional state filter." },
+      },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      const qs = new URLSearchParams();
+      if (args.state !== undefined) qs.set("state", String(args.state));
+      const s = qs.toString();
+      return apiRequest("GET", `${forgeRepoBase(args)}/pulls${s ? "?" + s : ""}`);
+    },
+  },
+  {
+    name: "kiln_forge_pull_get",
+    description:
+      "Get one pull request by number: title, body, head/base, state, reviews and comments as the daemon records them.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        number: { type: "integer", description: "Pull number." },
+      },
+      ["owner", "repo", "number"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `${forgeRepoBase(args)}/pulls/${encodeURIComponent(String(args.number))}`);
+    },
+  },
+  {
+    name: "kiln_forge_pull_update",
+    description:
+      "Update a pull request in place: only the fields you pass change — title, body, or state (e.g. close by setting the daemon's closed state). Returns the daemon's updated record. Verify with kiln_forge_pull_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        number: { type: "integer", description: "Pull number." },
+        title: { ...str, description: "New title." },
+        body: { ...str, description: "New body." },
+        state: { ...str, description: "New state." },
+      },
+      ["owner", "repo", "number"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["title", "body", "state"]);
+      return apiRequest("PATCH", `${forgeRepoBase(args)}/pulls/${encodeURIComponent(String(args.number))}`, body);
+    },
+  },
+  {
+    name: "kiln_forge_pull_comment",
+    description:
+      "Comment on a pull request: { body }. Returns the daemon's answer verbatim. Verify with kiln_forge_pull_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        number: { type: "integer", description: "Pull number." },
+        body: { ...str, description: "Comment text." },
+      },
+      ["owner", "repo", "number", "body"]
+    ),
+    async call(args) {
+      return apiRequest("POST", `${forgeRepoBase(args)}/pulls/${encodeURIComponent(String(args.number))}/comments`, { body: args.body });
+    },
+  },
+  {
+    name: "kiln_forge_pull_review",
+    description:
+      "Review a pull request: state is one of \"approved\", \"changes_requested\", \"commented\"; body is optional review text. A changes-requested review blocks merge for non-operator principals (merge answers 409). Returns the daemon's answer verbatim.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        number: { type: "integer", description: "Pull number." },
+        state: { ...str, description: "approved | changes_requested | commented." },
+        body: { ...str, description: "Optional review text." },
+      },
+      ["owner", "repo", "number", "state"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["state", "body"]);
+      return apiRequest("POST", `${forgeRepoBase(args)}/pulls/${encodeURIComponent(String(args.number))}/reviews`, body);
+    },
+  },
+  {
+    name: "kiln_forge_pull_merge",
+    description:
+      "Merge a pull request for real: method \"merge\" (default daemon behavior) or \"fast-forward\", with an optional merge message. Answers 409 on conflicts, and on changes-requested for non-operator principals. CI is enqueued on the base branch after a merge. Verify with kiln_forge_pull_get and kiln_forge_commits_list.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        number: { type: "integer", description: "Pull number." },
+        method: { ...str, description: "merge | fast-forward." },
+        message: { ...str, description: "Optional merge commit message." },
+      },
+      ["owner", "repo", "number"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["method", "message"]);
+      return apiRequest("POST", `${forgeRepoBase(args)}/pulls/${encodeURIComponent(String(args.number))}/merge`, body);
+    },
+  },
+  {
+    name: "kiln_forge_tags_list",
+    description:
+      "List a forge repo's tags (the daemon's tag records: names and their target shas).",
+    inputSchema: objectSchema(
+      { owner: { ...str }, repo: { ...str } },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `${forgeRepoBase(args)}/tags`);
+    },
+  },
+  {
+    name: "kiln_forge_release_create",
+    description:
+      "Create a release in a forge repo: { tag, name?, notes?, target? }. Creates the annotated tag if it does not exist yet (target is the ref/sha to tag). Returns the created release. Verify with kiln_forge_release_get or kiln_forge_releases_list.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        tag: { ...str, description: "Release tag, e.g. v1.2.0." },
+        name: { ...str, description: "Optional release name." },
+        notes: { ...str, description: "Optional release notes." },
+        target: { ...str, description: "Optional ref/sha the tag should point at." },
+      },
+      ["owner", "repo", "tag"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["tag", "name", "notes", "target"]);
+      return apiRequest("POST", `${forgeRepoBase(args)}/releases`, body);
+    },
+  },
+  {
+    name: "kiln_forge_releases_list",
+    description:
+      "List a forge repo's releases (tag, name, notes, target as recorded by the daemon).",
+    inputSchema: objectSchema(
+      { owner: { ...str }, repo: { ...str } },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `${forgeRepoBase(args)}/releases`);
+    },
+  },
+  {
+    name: "kiln_forge_release_get",
+    description:
+      "Get one release by its tag.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        tag: { ...str, description: "Release tag." },
+      },
+      ["owner", "repo", "tag"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `${forgeRepoBase(args)}/releases/${encodeURIComponent(String(args.tag))}`);
+    },
+  },
+  {
+    name: "kiln_forge_release_update",
+    description:
+      "Update a release in place by tag: only the fields you pass change — name and/or notes. Returns the daemon's updated record. Verify with kiln_forge_release_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        tag: { ...str, description: "Release tag." },
+        name: { ...str, description: "New release name." },
+        notes: { ...str, description: "New release notes." },
+      },
+      ["owner", "repo", "tag"]
+    ),
+    async call(args) {
+      const body = pickPresent(args, ["name", "notes"]);
+      return apiRequest("PATCH", `${forgeRepoBase(args)}/releases/${encodeURIComponent(String(args.tag))}`, body);
+    },
+  },
+  {
+    name: "kiln_forge_release_delete",
+    description:
+      "Delete a release by tag. Returns the daemon's answer verbatim. Verify with kiln_forge_releases_list.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str }, repo: { ...str },
+        tag: { ...str, description: "Release tag." },
+      },
+      ["owner", "repo", "tag"]
+    ),
+    async call(args) {
+      return apiRequest("DELETE", `${forgeRepoBase(args)}/releases/${encodeURIComponent(String(args.tag))}`);
+    },
+  },
+  {
+    name: "kiln_forge_packages_list",
+    description:
+      "List forge packages: { packages: [...] } as the daemon records them. Optional `owner` filter; omit it to list across owners your token can see. Packages live at /v1/packages, separate from repos.",
+    inputSchema: objectSchema(
+      { owner: { ...str, description: "Optional owner filter." } },
+      []
+    ),
+    async call(args) {
+      const qs = new URLSearchParams();
+      if (args.owner !== undefined) qs.set("owner", String(args.owner));
+      const s = qs.toString();
+      return apiRequest("GET", `/v1/packages${s ? "?" + s : ""}`);
+    },
+  },
+  {
+    name: "kiln_forge_package_get",
+    description:
+      "Get one package's metadata by owner + name: its versions and files as recorded by the daemon.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str, description: "Package owner." },
+        name: { ...str, description: "Package name." },
+      },
+      ["owner", "name"]
+    ),
+    async call(args) {
+      return apiRequest("GET", `/v1/packages/${encodeURIComponent(String(args.owner))}/${encodeURIComponent(String(args.name))}`);
+    },
+  },
+  {
+    name: "kiln_forge_package_version_get",
+    description:
+      "Get one package version's metadata by owner + name + version: the files published under that version.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str, description: "Package owner." },
+        name: { ...str, description: "Package name." },
+        version: { ...str, description: "Version string." },
+      },
+      ["owner", "name", "version"]
+    ),
+    async call(args) {
+      return apiRequest(
+        "GET",
+        `/v1/packages/${encodeURIComponent(String(args.owner))}/${encodeURIComponent(String(args.name))}/${encodeURIComponent(String(args.version))}`
+      );
+    },
+  },
+  {
+    name: "kiln_forge_package_publish",
+    description:
+      "Publish one file to a package version: reads `filePath` (a local path on the machine running this MCP server) and PUTs its raw bytes to /v1/packages/:owner/:name/:version/:filename. `filename` defaults to the file's basename. Publishing is IMMUTABLE — different bytes for an existing version+filename answer 409. Returns the daemon's answer verbatim. Verify with kiln_forge_package_version_get.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str, description: "Package owner." },
+        name: { ...str, description: "Package name." },
+        version: { ...str, description: "Version string." },
+        filePath: { ...str, description: "Local path of the file to publish." },
+        filename: { ...str, description: "Optional published filename (default: the file's basename)." },
+      },
+      ["owner", "name", "version", "filePath"]
+    ),
+    async call(args) {
+      const filePath = String(args.filePath);
+      if (!existsSync(filePath)) {
+        throw new ToolFailure(`Package publish failed: no such local file: ${filePath}`);
+      }
+      const bytes = readFileSync(filePath);
+      const filename = args.filename !== undefined ? String(args.filename) : filePath.split(/[\\/]/).pop();
+      return apiRequestRawBody(
+        "PUT",
+        `/v1/packages/${encodeURIComponent(String(args.owner))}/${encodeURIComponent(String(args.name))}/${encodeURIComponent(String(args.version))}/${encodeURIComponent(filename)}`,
+        bytes
+      );
+    },
+  },
+  {
+    name: "kiln_forge_package_download",
+    description:
+      "Download one published package file's raw bytes, returned as { filename, size, contentBase64 } (base64 because MCP results are text). With `saveTo` (a local path on the machine running this MCP server) the bytes are also written to that file and the result names the path. Verify a download against kiln_forge_package_version_get's metadata.",
+    inputSchema: objectSchema(
+      {
+        owner: { ...str, description: "Package owner." },
+        name: { ...str, description: "Package name." },
+        version: { ...str, description: "Version string." },
+        filename: { ...str, description: "Published filename." },
+        saveTo: { ...str, description: "Optional local path to also write the bytes to." },
+      },
+      ["owner", "name", "version", "filename"]
+    ),
+    async call(args) {
+      const buf = await apiRequestBytes(
+        "GET",
+        `/v1/packages/${encodeURIComponent(String(args.owner))}/${encodeURIComponent(String(args.name))}/${encodeURIComponent(String(args.version))}/${encodeURIComponent(String(args.filename))}`
+      );
+      const out = { filename: String(args.filename), size: buf.length, contentBase64: buf.toString("base64") };
+      if (args.saveTo !== undefined) {
+        writeFileSync(String(args.saveTo), buf);
+        out.savedTo = String(args.saveTo);
+      }
+      return out;
+    },
+  },
 ];
 
 const TOOL_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
@@ -304,6 +869,8 @@ function invalidParams(message) {
 
 function typeOk(value, type) {
   if (type === "string") return typeof value === "string";
+  if (type === "number") return typeof value === "number";
+  if (type === "integer") return typeof value === "number" && Number.isInteger(value);
   if (type === "array") return Array.isArray(value);
   if (type === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
   if (type === "null") return value === null;
