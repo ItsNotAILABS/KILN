@@ -38,7 +38,7 @@ export class AccountsError extends Error {
 }
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-export const AGENT_SCOPES = ["workspaces", "project-details"];
+export const AGENT_SCOPES = ["workspaces", "project-details", "forge"];
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const OWNER_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 

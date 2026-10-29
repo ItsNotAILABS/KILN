@@ -90,6 +90,34 @@
  *   GET  /v1/repos/:owner/:repo/details -> project details object
  *   PATCH /v1/repos/:owner/:repo/details {description?, topics?}
  *                                    -> {ok, details}
+ * Forge (the GitHub-shaped repo surface, lib/forge.mjs; operator = root,
+ * account/agent principals walled to their own namespace, agents need
+ * the "forge" scope; every write authenticated, audited, rate-limited):
+ *   GET  /v1/repos/:owner/:repo/branches · POST (create) · DELETE /:name
+ *   GET  /v1/repos/:owner/:repo/tree?ref&path
+ *   GET  /v1/repos/:owner/:repo/contents?path&ref (&raw=1 = raw bytes)
+ *   PUT  /v1/repos/:owner/:repo/contents {path, content, encoding?,
+ *        message, branch?, sha?} -> a REAL git commit by the principal
+ *   DELETE /v1/repos/:owner/:repo/contents {path, message, branch?, sha?}
+ *   GET  /v1/repos/:owner/:repo/commits(?ref&limit&path) · /commits/:sha
+ *   GET  /v1/repos/:owner/:repo/compare?base&head (ahead/behind, files,
+ *        capped patch)
+ *   POST /v1/repos/:owner/:repo/pulls {title, body?, head, base}
+ *   GET  /v1/repos/:owner/:repo/pulls(?state) · GET/PATCH /pulls/:n
+ *   POST /v1/repos/:owner/:repo/pulls/:n/comments {body}
+ *   POST /v1/repos/:owner/:repo/pulls/:n/reviews {state, body?}
+ *   POST /v1/repos/:owner/:repo/pulls/:n/merge {method?, message?}
+ *        (fast-forward or merge-commit; conflicts -> 409; CI enqueued
+ *        on the base branch after merge, best-effort like pushes)
+ *   GET  /v1/repos/:owner/:repo/tags
+ *   POST /v1/repos/:owner/:repo/releases {tag, name?, notes?, target?}
+ *   GET  /v1/repos/:owner/:repo/releases · GET/PATCH/DELETE /releases/:tag
+ * Packages (lib/packages.mjs; immutable versions, blobs on disk):
+ *   GET  /v1/packages(?owner) · GET /v1/packages/:owner/:name
+ *   GET  /v1/packages/:owner/:name/:version
+ *   GET  /v1/packages/:owner/:name/:version/:filename (raw download)
+ *   PUT  /v1/packages/:owner/:name/:version/:filename (raw bytes publish;
+ *        same version+file with different bytes -> 409)
  * Accounts + agent identities (lib/accounts.mjs). Principals resolve
  * operator -> account session -> agent token; account/agent principals
  * are owner-scoped (see the guard after the auth gate):
@@ -120,7 +148,7 @@ import { parseCaps, capsToNames, nowSec } from "./grant.mjs";
 import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
-import { createRepo, listRepos, repoExists, serveGitHttp, validRepoName } from "./git.mjs";
+import { createRepo, listRepos, repoExists, repoPath, serveGitHttp, validRepoName } from "./git.mjs";
 import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
@@ -151,12 +179,24 @@ import {
   RepoDetailsError, repoDetails, updateRepoDetails,
 } from "./repodetails.mjs";
 import {
+  ForgeError, actorOf, appendAudit, listBranches, createBranch, deleteBranch,
+  readTree, readContents, writeFile, listCommits, getCommit, compareRefs,
+  listTags, listReleases, createRelease, updateRelease, deleteRelease,
+  createPull, listPulls, getPull, updatePull, commentPull, reviewPull, mergePull,
+} from "./forge.mjs";
+import {
+  PackagesError, publishPackage, listPackages, getPackage, getPackageVersion,
+  readPackageFile, PACKAGE_MAX_BYTES,
+} from "./packages.mjs";
+import {
   AccountsError, accountPublic, agentPublic, createAccount, login,
   createAgent, listAgents, revokeAgent, resolveAccountToken,
 } from "./accounts.mjs";
 import { buildCapabilities, buildOpenApiDocument } from "./openapi.mjs";
 
-const MAX_BODY = 1024 * 1024;
+// 4MB: the forge contents API carries base64-encoded files (1MB raw
+// file ≈ 1.4MB encoded) plus PR/release prose in one JSON body.
+const MAX_BODY = 4 * 1024 * 1024;
 
 function nodeStatus(dir, cfg, node) {
   const alive = pidAlive(node.workerPid);
@@ -200,6 +240,42 @@ function readBody(req) {
     });
     req.on("error", reject);
   });
+}
+
+/** Raw-body reader for package publishes — bytes, not JSON, with a hard cap. */
+function readRawBody(req, cap) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > cap) { reject(new Error(`body too large (>${cap} bytes)`)); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+/**
+ * Write rate sanity for the forge surface: a fixed window per principal.
+ * 120 writes/minute is far above any honest agent flow and far below
+ * anything that could hammer the git plumbing. Reads are not limited.
+ */
+const writeWindows = new Map();
+function writeRateLimited(principal) {
+  const key = principal.kind === "operator" ? "operator"
+    : principal.kind === "agent" ? `agt:${principal.agent.id}`
+    : `sess:${principal.account.id}`;
+  const now = Date.now();
+  const w = writeWindows.get(key);
+  if (!w || now - w.start >= 60000) {
+    writeWindows.set(key, { start: now, count: 1 });
+    return 0;
+  }
+  w.count += 1;
+  if (w.count > 120) return Math.ceil((w.start + 60000 - now) / 1000);
+  return 0;
 }
 
 function send(res, code, obj, extraHeaders = {}) {
@@ -482,15 +558,19 @@ export function startApiServer(dir, cfg) {
       // tokens additionally need the matching ability in their scopes.
       // Owner-level checks live in the route blocks themselves.
       if (principal.kind !== "operator") {
+        const forgeRepoRoute = /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path);
+        const packageRoute = path === "/v1/packages" || path.startsWith("/v1/packages/");
         const allowed =
           path === "/v1/capabilities" || path === "/v1/openapi.json" ||
           path === "/v1/workspaces" || path.startsWith("/v1/workspaces/") ||
-          /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path);
+          /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path) ||
+          forgeRepoRoute || packageRoute;
         if (!allowed) {
-          return send(res, 403, { error: "this surface is operator-only — account and agent tokens cover workspaces, project details, and their own account routes (see swarm/docs/ACCOUNTS.md)" });
+          return send(res, 403, { error: "this surface is operator-only — account and agent tokens cover workspaces, project details, the forge (branches/contents/pulls/releases/packages), and their own account routes (see swarm/docs/ACCOUNTS.md)" });
         }
         if (principal.kind === "agent") {
           const ability = path.startsWith("/v1/workspaces") ? "workspaces"
+            : (forgeRepoRoute || packageRoute) ? "forge"
             : path.startsWith("/v1/repos/") ? "project-details" : null;
           if (ability && !principal.agent.scopes.includes(ability)) {
             return send(res, 403, { error: `this agent token lacks the "${ability}" scope` });
@@ -1059,6 +1139,216 @@ export function startApiServer(dir, cfg) {
             if (e instanceof RepoDetailsError) return send(res, e.status, { error: e.message });
             throw e;
           }
+        }
+      }
+
+      // ---- forge: branches / contents / commits / pulls / releases ----
+      // The GitHub-shaped surface (lib/forge.mjs). Operator = root;
+      // account/agent principals are walled to their own namespace,
+      // exactly like git reads. The actor writes under its own identity.
+      {
+        const fm = path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/);
+        if (fm) {
+          const [, fOwner, fRepo, kind, rest] = fm;
+          const actor = actorOf(principal);
+          try {
+            if (principal.kind !== "operator" && fOwner !== principal.account.owner) {
+              return send(res, 403, { error: `account principals may use the forge only under their own namespace ("${principal.account.owner}")` });
+            }
+            if (req.method !== "GET") {
+              const retry = writeRateLimited(principal);
+              if (retry) return send(res, 429, { error: "forge write rate limit (120/min per principal) — slow down" }, { "retry-after": String(retry) });
+            }
+            const gd = () => {
+              if (!validRepoName(fOwner) || !validRepoName(fRepo) || !repoExists(dir, fOwner, fRepo)) {
+                throw new ForgeError(404, `no such repo: ${fOwner}/${fRepo}`);
+              }
+              return repoPath(dir, fOwner, fRepo);
+            };
+            if (kind === "branches") {
+              if (req.method === "GET" && !rest) return send(res, 200, { branches: listBranches(gd()) });
+              if (req.method === "POST" && !rest) {
+                const b = await readBody(req);
+                const br = createBranch(gd(), b.name, b.from);
+                appendAudit(dir, actor, "branch.create", `${fOwner}/${fRepo}:${b.name}`, {});
+                return send(res, 201, { ok: true, branch: br });
+              }
+              const bm = (rest || "").match(/^\/([A-Za-z0-9._/-]+)$/);
+              if (req.method === "DELETE" && bm) {
+                const r = deleteBranch(gd(), decodeURIComponent(bm[1]));
+                appendAudit(dir, actor, "branch.delete", `${fOwner}/${fRepo}:${bm[1]}`, {});
+                return send(res, 200, r);
+              }
+            }
+            if (kind === "tree" && req.method === "GET" && !rest) {
+              return send(res, 200, readTree(gd(), url.searchParams.get("ref") || undefined, url.searchParams.get("path") || ""));
+            }
+            if (kind === "contents" && !rest) {
+              if (req.method === "GET") {
+                const c = readContents(gd(), url.searchParams.get("ref") || undefined, url.searchParams.get("path") || "");
+                if (url.searchParams.get("raw") === "1") {
+                  res.writeHead(200, { "content-type": "application/octet-stream", "content-length": c.buffer.length, "x-kiln-sha": c.sha });
+                  res.end(c.buffer);
+                  return;
+                }
+                return send(res, 200, { path: c.path, ref: c.ref, commit: c.commit, sha: c.sha, size: c.size, encoding: "base64", content: c.buffer.toString("base64") });
+              }
+              if (req.method === "PUT") {
+                const b = await readBody(req);
+                const r = writeFile(dir, fOwner, fRepo, actor, {
+                  path: b.path, content: b.content, encoding: b.encoding, message: b.message, branch: b.branch, sha: b.sha,
+                });
+                return send(res, 201, { ok: true, ...r });
+              }
+              if (req.method === "DELETE") {
+                const b = await readBody(req);
+                const r = writeFile(dir, fOwner, fRepo, actor, {
+                  path: b.path, message: b.message, branch: b.branch, sha: b.sha, deleteFile: true,
+                });
+                return send(res, 200, { ok: true, ...r });
+              }
+            }
+            if (kind === "commits") {
+              if (req.method === "GET" && !rest) {
+                return send(res, 200, listCommits(gd(), {
+                  ref: url.searchParams.get("ref") || undefined,
+                  limit: url.searchParams.get("limit") || undefined,
+                  path: url.searchParams.get("path") || undefined,
+                }));
+              }
+              const cm = (rest || "").match(/^\/([0-9a-f]{4,64})$/);
+              if (req.method === "GET" && cm) return send(res, 200, getCommit(gd(), cm[1]));
+            }
+            if (kind === "compare" && req.method === "GET" && !rest) {
+              return send(res, 200, compareRefs(gd(), url.searchParams.get("base") || "", url.searchParams.get("head") || ""));
+            }
+            if (kind === "tags" && req.method === "GET" && !rest) {
+              return send(res, 200, { tags: listTags(gd()) });
+            }
+            if (kind === "releases") {
+              if (req.method === "GET" && !rest) return send(res, 200, { releases: listReleases(dir, fOwner, fRepo) });
+              if (req.method === "POST" && !rest) {
+                const b = await readBody(req);
+                const rel = createRelease(dir, fOwner, fRepo, actor, { tag: b.tag, name: b.name, notes: b.notes, target: b.target });
+                return send(res, 201, { ok: true, release: rel });
+              }
+              const rm = (rest || "").match(/^\/([^/]+)$/);
+              if (rm) {
+                const tag = decodeURIComponent(rm[1]);
+                if (req.method === "GET") {
+                  const rel = listReleases(dir, fOwner, fRepo).find((r) => r.tag === tag);
+                  if (!rel) return send(res, 404, { error: `no such release: ${tag}` });
+                  return send(res, 200, { release: rel });
+                }
+                if (req.method === "PATCH") {
+                  const b = await readBody(req);
+                  return send(res, 200, { ok: true, release: updateRelease(dir, fOwner, fRepo, actor, tag, { name: b.name, notes: b.notes }) });
+                }
+                if (req.method === "DELETE") {
+                  const b = await readBody(req).catch(() => ({}));
+                  return send(res, 200, deleteRelease(dir, fOwner, fRepo, actor, tag, { deleteTag: !!b.deleteTag }));
+                }
+              }
+            }
+            if (kind === "pulls") {
+              if (req.method === "GET" && !rest) {
+                return send(res, 200, { pulls: listPulls(dir, fOwner, fRepo, { state: url.searchParams.get("state") || undefined }) });
+              }
+              if (req.method === "POST" && !rest) {
+                const b = await readBody(req);
+                const pull = createPull(dir, fOwner, fRepo, actor, { title: b.title, body: b.body, head: b.head, base: b.base });
+                return send(res, 201, { ok: true, pull });
+              }
+              const pm = (rest || "").match(/^\/(\d+)(\/(comments|reviews|merge))?$/);
+              if (pm) {
+                const n = parseInt(pm[1], 10);
+                const sub = pm[3];
+                if (req.method === "GET" && !sub) return send(res, 200, { pull: getPull(dir, fOwner, fRepo, n) });
+                if (req.method === "PATCH" && !sub) {
+                  const b = await readBody(req);
+                  return send(res, 200, { ok: true, pull: updatePull(dir, fOwner, fRepo, actor, n, { title: b.title, body: b.body, state: b.state }) });
+                }
+                if (req.method === "POST" && sub === "comments") {
+                  const b = await readBody(req);
+                  return send(res, 201, { ok: true, comment: commentPull(dir, fOwner, fRepo, actor, n, { body: b.body }) });
+                }
+                if (req.method === "POST" && sub === "reviews") {
+                  const b = await readBody(req);
+                  return send(res, 201, { ok: true, review: reviewPull(dir, fOwner, fRepo, actor, n, { state: b.state, body: b.body }) });
+                }
+                if (req.method === "POST" && sub === "merge") {
+                  const b = await readBody(req);
+                  const r = mergePull(dir, fOwner, fRepo, actor, n, { method: b.method, message: b.message });
+                  return send(res, 200, { ok: true, ...r });
+                }
+              }
+            }
+          } catch (e) {
+            if (e instanceof ForgeError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+          return send(res, 404, { error: "not found" });
+        }
+      }
+
+      // ---- packages: publish / list / resolve / download ----
+      {
+        const pm = path.match(/^\/v1\/packages(?:\/([A-Za-z0-9_.-]+)(?:\/([A-Za-z0-9_.-]+)(?:\/([0-9][^/]*)(?:\/([^/]+))?)?)?)?$/);
+        if (pm && (path === "/v1/packages" || path.startsWith("/v1/packages/"))) {
+          const actor = actorOf(principal);
+          const [, pOwner, pName, pVersion, pFile] = pm;
+          try {
+            if (req.method === "GET" && !pOwner) {
+              const owner = principal.kind === "operator"
+                ? (url.searchParams.get("owner") || undefined)
+                : principal.account.owner;
+              return send(res, 200, { packages: listPackages(dir, { owner }) });
+            }
+            if (pOwner) {
+              if (principal.kind !== "operator" && pOwner !== principal.account.owner) {
+                return send(res, 403, { error: `account principals may use packages only under their own namespace ("${principal.account.owner}")` });
+              }
+              if (req.method === "GET" && pOwner && !pName) {
+                return send(res, 200, { packages: listPackages(dir, { owner: pOwner }) });
+              }
+              if (req.method === "GET" && pName && !pVersion) {
+                return send(res, 200, { package: getPackage(dir, pOwner, pName) });
+              }
+              if (req.method === "GET" && pName && pVersion && !pFile) {
+                return send(res, 200, getPackageVersion(dir, pOwner, decodeURIComponent(pName), decodeURIComponent(pVersion)));
+              }
+              if (req.method === "GET" && pName && pVersion && pFile) {
+                const { buffer, file } = readPackageFile(dir, pOwner, decodeURIComponent(pName), decodeURIComponent(pVersion), decodeURIComponent(pFile));
+                res.writeHead(200, {
+                  "content-type": file.contentType,
+                  "content-length": buffer.length,
+                  "x-kiln-sha256": file.sha256,
+                });
+                res.end(buffer);
+                return;
+              }
+              if (req.method === "PUT" && pName && pVersion && pFile) {
+                const retry = writeRateLimited(principal);
+                if (retry) return send(res, 429, { error: "forge write rate limit (120/min per principal) — slow down" }, { "retry-after": String(retry) });
+                let buffer;
+                try {
+                  buffer = await readRawBody(req, PACKAGE_MAX_BYTES);
+                } catch (e) {
+                  return send(res, 413, { error: e.message });
+                }
+                const r = publishPackage(dir, actor, pOwner, decodeURIComponent(pName), decodeURIComponent(pVersion), decodeURIComponent(pFile), buffer, {
+                  description: url.searchParams.get("description") || undefined,
+                  repo: url.searchParams.get("repo") || undefined,
+                  contentType: req.headers["content-type"] || undefined,
+                });
+                return send(res, r.idempotent ? 200 : 201, { ok: true, ...r });
+              }
+            }
+          } catch (e) {
+            if (e instanceof PackagesError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+          return send(res, 404, { error: "not found" });
         }
       }
 
