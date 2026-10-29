@@ -199,7 +199,13 @@ logs in (session bearer `kiln_sess_…`), and mints scoped tokens for their
 own agents (`kiln_agt_…`). Account/agent principals are owner-scoped —
 they act only under their account's namespace, on workspaces + project
 details + their own account routes; the operator token remains root.
-Model and boundaries: `docs/ACCOUNTS.md`.
+Repos also carry a **forge surface** (`/v1/repos/<owner>/<repo>/…`):
+branches, file contents (a write is a real git commit by the acting
+principal — the agent write path; git push stays operator-only),
+commits, compare, pull requests (open/comment/review/merge), tags and
+releases, plus a packages store (`/v1/packages`). Sessions act under
+their account; agent tokens need the `forge` scope. Model and
+boundaries: `docs/ACCOUNTS.md`.
 
 ## 8. Rules (non-negotiable)
 

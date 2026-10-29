@@ -189,12 +189,40 @@ describe("mcp server: stock JSON-RPC client over stdio", () => {
     assert.deepEqual(ping.result, {});
   });
 
-  it("tools/list returns exactly the 7 workspace/details tools, each with a description and a strict input schema", async () => {
+  it("tools/list returns exactly the 35 workspace/details/forge tools, each with a description and a strict input schema", async () => {
     const res = await rpc.request("tools/list");
     const tools = res.result.tools;
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
       [
+        "kiln_forge_branch_create",
+        "kiln_forge_branch_delete",
+        "kiln_forge_branches_list",
+        "kiln_forge_commit_get",
+        "kiln_forge_commits_list",
+        "kiln_forge_compare",
+        "kiln_forge_contents_delete",
+        "kiln_forge_contents_get",
+        "kiln_forge_contents_put",
+        "kiln_forge_package_download",
+        "kiln_forge_package_get",
+        "kiln_forge_package_publish",
+        "kiln_forge_package_version_get",
+        "kiln_forge_packages_list",
+        "kiln_forge_pull_comment",
+        "kiln_forge_pull_create",
+        "kiln_forge_pull_get",
+        "kiln_forge_pull_merge",
+        "kiln_forge_pull_review",
+        "kiln_forge_pull_update",
+        "kiln_forge_pulls_list",
+        "kiln_forge_release_create",
+        "kiln_forge_release_delete",
+        "kiln_forge_release_get",
+        "kiln_forge_release_update",
+        "kiln_forge_releases_list",
+        "kiln_forge_tags_list",
+        "kiln_forge_tree",
         "kiln_repo_details",
         "kiln_workspace_create",
         "kiln_workspace_delete",

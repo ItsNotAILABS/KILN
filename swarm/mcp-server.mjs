@@ -704,7 +704,7 @@ const TOOLS = [
   {
     name: "kiln_forge_release_get",
     description:
-      "Get one release by its tag.",
+      "Get one release by its tag: name, markdown notes, target, the commit it points at, and who published it.",
     inputSchema: objectSchema(
       {
         owner: { ...str }, repo: { ...str },
