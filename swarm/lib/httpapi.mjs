@@ -43,6 +43,10 @@
  *   Reads are principal-gated by the architect's rule (2026-10-28): only
  *   our accounts see the forge. CI status/latest/log under /git/.../ci/
  *   are gated the same way — a CI log can carry code.
+ *   Exception (architect's order, 2026-10-29): a repo whose stored
+ *   visibility is "public" (owner's choice, details PATCH) reads like
+ *   public GitHub — list, clone/fetch, details and forge GETs are open
+ *   to anyone including anonymous readers. Writes never open up.
  * Promotion (KILN-native repos -> GitHub, Git Data API rebuild):
  *   POST /v1/promote                {repo:"owner/repo", github?:"owner/repo",
  *                                    branch?, rebase?, force?} -> receipt
@@ -86,10 +90,13 @@
  *                                    children reparent to its parent)
  *   GET  /v1/workspaces?tree=1      -> {workspaces:[roots with nested
  *                                    children]} (see GET list above)
- * Project details (live per-repo facts + editable description/topics):
+ * Project details (live per-repo facts + editable metadata):
  *   GET  /v1/repos/:owner/:repo/details -> project details object
- *   PATCH /v1/repos/:owner/:repo/details {description?, topics?}
- *                                    -> {ok, details}
+ *   PATCH /v1/repos/:owner/:repo/details {description?, topics?,
+ *                                    visibility?: "public"|"private"}
+ *                                    -> {ok, details}   (owner/operator
+ *                                    only; visibility defaults "private";
+ *                                    "public" opens READS to anyone)
  * Forge (the GitHub-shaped repo surface, lib/forge.mjs; operator = root,
  * account/agent principals walled to their own namespace, agents need
  * the "forge" scope; every write authenticated, audited, rate-limited):
@@ -176,7 +183,7 @@ import {
   updateWorkspace, deleteWorkspace, workspaceStatus, resolveWorkspace,
 } from "./workspaces.mjs";
 import {
-  RepoDetailsError, repoDetails, updateRepoDetails,
+  RepoDetailsError, repoDetails, updateRepoDetails, repoVisibility,
 } from "./repodetails.mjs";
 import {
   ForgeError, actorOf, appendAudit, listBranches, createBranch, deleteBranch,
@@ -457,7 +464,26 @@ export function startApiServer(dir, cfg) {
       }
 
       if (!principal) {
-        return unauthorized(res);
+        // GitHub-style public reads (architect's order, 2026-10-29):
+        // a repo whose stored visibility is exactly "public" (owner's
+        // choice via the details PATCH) is readable by ANYONE — repo
+        // list, clone/fetch, details and forge GETs — like public
+        // GitHub. Everything else still demands a principal, and no
+        // write is ever public. The anonymous principal minted here is
+        // fenced to exactly those reads by the handlers + scope guard
+        // below (and answers 401 everywhere else, as unauthenticated
+        // requests always have).
+        const pubMatch =
+          (req.method === "GET" &&
+            path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/details$/)) ||
+          (req.method === "GET" &&
+            path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/));
+        if (gitList || gitRead ||
+            (pubMatch && repoVisibility(dir, pubMatch[1], pubMatch[2]) === "public")) {
+          principal = { kind: "anonymous" };
+        } else {
+          return unauthorized(res);
+        }
       }
       // Git pushes stay operator-only in this slice: account and agent
       // tokens are API principals, not git credentials (yet).
@@ -479,7 +505,9 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, {
           repos: principal.kind === "operator"
             ? all
-            : all.filter((r) => r.owner === principal.account?.owner),
+            : all.filter((r) =>
+                r.owner === principal.account?.owner ||
+                repoVisibility(dir, r.owner, r.repo) === "public"),
         });
       }
       if (ciRoute) {
@@ -505,7 +533,13 @@ export function startApiServer(dir, cfg) {
         return send(res, 200, doc);
       }
       if (gitRead) {
-        if (gitScopeDenied(gitRead.owner)) {
+        // Public repos clone/fetch for anyone, exactly like public
+        // GitHub; private repos keep the accounts-only wall
+        // byte-identically (anonymous 401 below, non-owner account 403).
+        const isPublic = repoVisibility(dir, gitRead.owner, gitRead.repo) === "public";
+        if (principal.kind === "anonymous") {
+          if (!isPublic) return unauthorized(res);
+        } else if (gitScopeDenied(gitRead.owner) && !isPublic) {
           return send(res, 403, gitScopeError(gitRead.owner));
         }
         await serveGitHttp(dir, req, res);
@@ -558,6 +592,16 @@ export function startApiServer(dir, cfg) {
       // tokens additionally need the matching ability in their scopes.
       // Owner-level checks live in the route blocks themselves.
       if (principal.kind !== "operator") {
+        // Anonymous principals exist only for public-repo reads (see
+        // the auth gate): details GET and forge GETs of public repos.
+        // Anything else they touch still answers 401, exactly as
+        // unauthenticated requests always have.
+        if (principal.kind === "anonymous") {
+          const anonRead = req.method === "GET" && (
+            /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path) ||
+            /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path));
+          if (!anonRead) return unauthorized(res);
+        }
         const forgeRepoRoute = /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path);
         const packageRoute = path === "/v1/packages" || path.startsWith("/v1/packages/");
         const allowed =
@@ -1133,6 +1177,7 @@ export function startApiServer(dir, cfg) {
           try {
             const details = updateRepoDetails(dir, m[1], m[2], {
               description: b.description, topics: b.topics,
+              visibility: b.visibility,
             });
             return send(res, 200, { ok: true, details });
           } catch (e) {
@@ -1152,8 +1197,17 @@ export function startApiServer(dir, cfg) {
           const [, fOwner, fRepo, kind, rest] = fm;
           const actor = actorOf(principal);
           try {
-            if (principal.kind !== "operator" && fOwner !== principal.account.owner) {
-              return send(res, 403, { error: `account principals may use the forge only under their own namespace ("${principal.account.owner}")` });
+            if (principal.kind !== "operator" && fOwner !== principal.account?.owner) {
+              // GitHub semantics: a public repo's forge GETs are open
+              // to anyone (any account, any agent, anonymous). Writes
+              // stay walled to the owner namespace, always — the flip
+              // to "public" never loosens a single write.
+              const publicRead = req.method === "GET" &&
+                repoVisibility(dir, fOwner, fRepo) === "public";
+              if (!publicRead) {
+                if (principal.kind === "anonymous") return unauthorized(res);
+                return send(res, 403, { error: `account principals may use the forge only under their own namespace ("${principal.account.owner}")` });
+              }
             }
             if (req.method !== "GET") {
               const retry = writeRateLimited(principal);

@@ -56,6 +56,11 @@ export function actorOf(principal) {
   if (!principal || principal.kind === "operator") {
     return { kind: "operator", label: "operator", name: "KILN Operator", email: "operator@kiln.local", owner: null };
   }
+  if (principal.kind === "anonymous") {
+    // Public-repo reads only (the HTTP gate never lets an anonymous
+    // principal reach a write, where an actor would be stamped).
+    return { kind: "anonymous", label: "anonymous", name: "Anonymous", email: "anonymous@kiln.local", owner: null };
+  }
   const a = principal.account;
   if (principal.kind === "agent") {
     return {

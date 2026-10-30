@@ -4,8 +4,8 @@
  * an fs size walk), exactly like siteStatus/workspaceStatus derive their
  * answers. Nothing is cached, so details can never go stale and lie.
  *
- * The only persisted part is the EDITABLE metadata — description and
- * topics — which lives in the bare repo's own `kiln.json` (the metadata
+ * The only persisted part is the EDITABLE metadata — description,
+ * topics and visibility — which lives in the bare repo's own `kiln.json` (the metadata
  * file lib/git.mjs createRepo writes at repo creation). Updates merge
  * atomically into that file and preserve unknown fields, so older and
  * future tooling fields survive a details edit. Repos without a
@@ -229,6 +229,34 @@ function metaTopics(meta) {
   return Array.isArray(meta.topics) ? meta.topics.filter((t) => typeof t === "string") : [];
 }
 
+/**
+ * Visibility is GitHub-shaped: "public" only when kiln.json says exactly
+ * that. Anything else — absent, corrupt, a typo — reads "private", the
+ * safe default every read gate relies on.
+ */
+function metaVisibility(meta) {
+  return meta && meta.visibility === "public" ? "public" : "private";
+}
+
+function validVisibility(visibility) {
+  if (visibility !== "public" && visibility !== "private") {
+    throw new RepoDetailsError(400, `visibility must be "public" or "private"`);
+  }
+  return visibility;
+}
+
+/**
+ * The repo's stored visibility ("public" | "private"). Unknown repos and
+ * unreadable metadata read "private": gates consult this on every public
+ * read, so the failure mode must be closed, never open.
+ */
+export function repoVisibility(dir, owner, repo) {
+  if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
+    return "private";
+  }
+  return metaVisibility(readKilnMeta(repoPath(dir, owner, repo)));
+}
+
 function validDescription(description) {
   if (typeof description !== "string" || description.length > MAX_DESCRIPTION) {
     throw new RepoDetailsError(400, `description must be a string of at most ${MAX_DESCRIPTION} chars`);
@@ -303,6 +331,7 @@ export function repoDetails(dir, owner, repo) {
     createdAt: typeof meta.createdAt === "string" ? meta.createdAt : null,
     description: metaDescription(meta),
     topics: metaTopics(meta),
+    visibility: metaVisibility(meta),
     empty: !head,
     defaultBranch: defaultBranch(gd),
     commitCount: commitCount(gd, head),
@@ -320,7 +349,7 @@ export function repoDetails(dir, owner, repo) {
 }
 
 /**
- * Edit the persisted metadata (description and/or topics) in the repo's
+ * Edit the persisted metadata (description, topics and/or visibility) in the repo's
  * kiln.json — merged atomically, unknown fields preserved, file created
  * when absent. Returns the full updated details object.
  */
@@ -338,6 +367,7 @@ export function updateRepoDetails(dir, owner, repo, patch = {}) {
   }
   if (patch.description !== undefined) next.description = validDescription(patch.description);
   if (patch.topics !== undefined) next.topics = validTopics(patch.topics);
+  if (patch.visibility !== undefined) next.visibility = validVisibility(patch.visibility);
   writeFileAtomicSync(kilnJsonPath(gd), JSON.stringify(next, null, 2) + "\n");
   return repoDetails(dir, owner, repo);
 }

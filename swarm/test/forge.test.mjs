@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { makeStateDir } from "./helpers.mjs";
 import { startApiServer } from "../lib/httpapi.mjs";
 import { loadApiToken } from "../lib/state.mjs";
+import { createAccount, login } from "../lib/accounts.mjs";
 
 describe("forge: HTTP API", () => {
   let api;
@@ -182,5 +183,117 @@ describe("forge: HTTP API", () => {
     // from the same author label — latest-per-reviewer wins, so it unblocks:
     const am2 = await call("POST", `/v1/repos/alice/repo1/pulls/${an}/merge`, {}, agTok);
     assert.equal(am2.status, 200, am2.text);
+  });
+});
+
+describe("forge: public repo visibility", () => {
+  let api;
+  after(() => { try { api?.server?.close(); } catch { /* already closed */ } });
+
+  it("public repos open every forge GET to anyone; writes stay owner-only", async () => {
+    const dir = makeStateDir();
+    process.env.KILN_SWARM_API_PORT = "0";
+    try {
+      api = await startApiServer(dir, { apiPort: 0 });
+    } finally {
+      delete process.env.KILN_SWARM_API_PORT;
+    }
+    const base = api.url;
+    const op = loadApiToken(dir);
+    const call = async (method, path, body, bearer) => {
+      const res = await fetch(base + path, {
+        method,
+        headers: {
+          ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* raw response */ }
+      return { status: res.status, text, data };
+    };
+
+    // Accounts first (namespaces must be claimed before they hold
+    // content): pubowner owns the repo, visitor is the other account.
+    createAccount(dir, { email: "owner@example.com", name: "Owner", owner: "pubowner", password: "owner-password-1" });
+    createAccount(dir, { email: "guest@example.com", name: "Guest", owner: "visitor", password: "guest-password-1" });
+    const ownerSess = login(dir, { email: "owner@example.com", password: "owner-password-1" }).sessionToken;
+    const guestSess = login(dir, { email: "guest@example.com", password: "guest-password-1" }).sessionToken;
+    // Visitor's agents: one with the forge scope, one without.
+    const agMint = await call("POST", "/v1/accounts/me/agents", { name: "guest-bot", scopes: ["forge"] }, guestSess);
+    assert.equal(agMint.status, 201, agMint.text);
+    const guestAgent = agMint.data.token;
+    const ag2Mint = await call("POST", "/v1/accounts/me/agents", { name: "guest-lookout", scopes: ["workspaces"] }, guestSess);
+    assert.equal(ag2Mint.status, 201, ag2Mint.text);
+    const guestAgentNoForge = ag2Mint.data.token;
+
+    // Repo with content, a branch, and a commit to compare (operator).
+    assert.equal((await call("POST", "/git/pubowner/pub", undefined, op)).status, 201);
+    const w = await call("PUT", "/v1/repos/pubowner/pub/contents", { path: "README.md", content: "# Public Test\n", message: "add readme" }, op);
+    assert.equal(w.status, 201, w.text);
+    assert.equal((await call("POST", "/v1/repos/pubowner/pub/branches", { name: "feature" }, op)).status, 201);
+    const w3 = await call("PUT", "/v1/repos/pubowner/pub/contents", { path: "feat.txt", content: "feat\n", message: "feature work", branch: "feature" }, op);
+    assert.equal(w3.status, 201, w3.text);
+
+    // ---- while private: today's walls, byte for byte
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/details", undefined, op)).data.visibility, "private");
+    for (const p of ["branches", "tree", "contents?path=README.md", "commits", "pulls", "tags", "releases", "details"]) {
+      assert.equal((await call("GET", `/v1/repos/pubowner/pub/${p}`)).status, 401, `anonymous GET ${p} on a private repo`);
+    }
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestSess)).status, 403);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/commits", undefined, guestAgent)).status, 403);
+    // a non-owner may not flip visibility either
+    assert.equal((await call("PATCH", "/v1/repos/pubowner/pub/details", { visibility: "public" }, guestSess)).status, 403);
+
+    // ---- the owner flips it public (session, own namespace)
+    const flip = await call("PATCH", "/v1/repos/pubowner/pub/details", { visibility: "public" }, ownerSess);
+    assert.equal(flip.status, 200, flip.text);
+    assert.equal(flip.data.details.visibility, "public");
+
+    // ---- anonymous: every forge GET opens, with real content
+    const dAnon = await call("GET", "/v1/repos/pubowner/pub/details");
+    assert.equal(dAnon.status, 200);
+    assert.equal(dAnon.data.visibility, "public");
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/branches")).status, 200);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/tree")).status, 200);
+    const cAnon = await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md");
+    assert.equal(cAnon.status, 200);
+    assert.equal(Buffer.from(cAnon.data.content, "base64").toString("utf8"), "# Public Test\n");
+    const commitsAnon = await call("GET", "/v1/repos/pubowner/pub/commits");
+    assert.equal(commitsAnon.status, 200);
+    assert.equal(commitsAnon.data.commits.length, 1);
+    assert.equal((await call("GET", `/v1/repos/pubowner/pub/commits/${w.data.commit}`)).status, 200);
+    const cmpAnon = await call("GET", "/v1/repos/pubowner/pub/compare?base=main&head=feature");
+    assert.equal(cmpAnon.status, 200);
+    assert.equal(cmpAnon.data.ahead, 1);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/pulls")).status, 200);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/tags")).status, 200);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/releases")).status, 200);
+
+    // ---- other principals read it too; the scope rule is NOT loosened
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestSess)).status, 200);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestAgent)).status, 200);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestAgentNoForge)).status, 403);
+
+    // ---- writes on a PUBLIC repo stay refused for everyone but the owner
+    assert.equal((await call("PUT", "/v1/repos/pubowner/pub/contents", { path: "evil.txt", content: "x", message: "x" })).status, 401);
+    assert.equal((await call("POST", "/v1/repos/pubowner/pub/branches", { name: "evil" })).status, 401);
+    assert.equal((await call("POST", "/v1/repos/pubowner/pub/pulls", { title: "x", head: "feature", base: "main" })).status, 401);
+    assert.equal((await call("DELETE", "/v1/repos/pubowner/pub/contents", { path: "README.md", message: "x" })).status, 401);
+    assert.equal((await call("PUT", "/v1/repos/pubowner/pub/contents", { path: "evil.txt", content: "x", message: "x" }, guestSess)).status, 403);
+    assert.equal((await call("POST", "/v1/repos/pubowner/pub/branches", { name: "evil" }, guestSess)).status, 403);
+    assert.equal((await call("POST", "/v1/repos/pubowner/pub/pulls", { title: "x", head: "feature", base: "main" }, guestAgent)).status, 403);
+    assert.equal((await call("PATCH", "/v1/repos/pubowner/pub/details", { visibility: "private" }, guestSess)).status, 403);
+    // packages are a separate namespace — untouched by repo visibility
+    assert.equal((await call("GET", "/v1/packages/pubowner")).status, 401);
+
+    // ---- the owner still writes, and flipping back closes the reads
+    const wOwner = await call("PUT", "/v1/repos/pubowner/pub/contents", { path: "owner.txt", content: "mine\n", message: "owner write" }, ownerSess);
+    assert.equal(wOwner.status, 201, wOwner.text);
+    assert.equal((await call("PATCH", "/v1/repos/pubowner/pub/details", { visibility: "private" }, ownerSess)).status, 200);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md")).status, 401);
+    assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestSess)).status, 403);
   });
 });

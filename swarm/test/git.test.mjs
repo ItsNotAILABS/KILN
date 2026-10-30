@@ -3,9 +3,12 @@
  * Creates a repo via the API, clones it over smart HTTP, pushes a commit with
  * the Bearer <redacted>, and verifies a fresh clone sees it. Then proves an
  * unauthenticated push is refused (401) and lands nothing, and — since
- * the 2026-10-28 accounts-only rule — anonymous reads (list, info/refs,
- * upload-pack, clone) are refused too; account sessions read only their
- * own owner namespace.
+ * the 2026-10-28 accounts-only rule — anonymous reads (info/refs,
+ * upload-pack, clone) of private repos are refused too; account
+ * sessions read only their own owner namespace. Since the 2026-10-29
+ * visibility order, a repo the owner flips "public" reads like public
+ * GitHub for anyone (list, clone/fetch, forge GETs) — covered by the
+ * last test in this suite.
  *
  * No mocks: a real `git` client talks to the real `git http-backend` CGI.
  */
@@ -120,9 +123,15 @@ describe("KILN-native git hosting", () => {
     assert.equal(r.status, 400);
   });
 
-  it("refuses repo listing without a token", async () => {
+  it("repo listing without a token shows only public repos (none yet)", async () => {
+    // Since the 2026-10-29 visibility order, GET /git answers
+    // anonymously too — filtered to public repos, GitHub-style. Every
+    // repo in this suite is private at this point, so the anonymous
+    // list is empty; the public cases live in the visibility test at
+    // the end of this suite.
     const r = await apiCall("GET", "/git", { auth: false });
-    assert.equal(r.status, 401);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.data.repos, []);
   });
 
   it("lists repos with the operator token", async () => {
@@ -244,6 +253,97 @@ describe("KILN-native git hosting", () => {
     await gitOk(work, ["clone", "-q", cloneUrl, "clean"], bearerEnv);
     const log = await gitOk(w3, ["log", "--oneline"]);
     assert.ok(!log.includes("evil commit"), `evil commit landed! log: ${log}`);
+  });
+
+  it("public repos read like GitHub; private repos keep the accounts-only wall", async () => {
+    // One repo stays private (the default); one the owner flips public.
+    assert.equal((await apiCall("POST", "/git/testowner/privlib")).status, 201);
+    assert.equal((await apiCall("POST", "/git/testowner/publib")).status, 201);
+
+    // Seed publib with one commit (operator push) so a clone has content.
+    const work = mkdtempSync(join(tmpdir(), "kiln-git-pub-"));
+    await gitOk(work, ["clone", "-q", `${base}/git/testowner/publib`, "seed"], bearerEnv);
+    const seed = join(work, "seed");
+    writeFileSync(join(seed, "PUB.md"), "public hello\n");
+    await gitOk(seed, ["-c", "user.email=t@kiln.local", "-c", "user.name=kiln-test", "add", "PUB.md"]);
+    await gitOk(seed, ["-c", "user.email=t@kiln.local", "-c", "user.name=kiln-test", "commit", "-q", "-m", "public seed"]);
+    await gitOk(seed, ["push", "-q", "origin", "main"], {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.extraHeader",
+      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+    });
+
+    const detailsCall = async (method, repo, body, bearer) => {
+      const res = await fetch(`${base}/v1/repos/testowner/${repo}/details`, {
+        method,
+        headers: {
+          ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+
+    // Default visibility is private on both; the flip validates its input.
+    assert.equal((await detailsCall("GET", "publib", null, token)).data.visibility, "private");
+    assert.equal((await detailsCall("GET", "privlib", null, token)).data.visibility, "private");
+    const flip = await detailsCall("PATCH", "publib", { visibility: "public" }, token);
+    assert.equal(flip.status, 200);
+    assert.equal(flip.data.details.visibility, "public");
+    assert.equal((await detailsCall("PATCH", "publib", { visibility: "friends" }, token)).status, 400);
+
+    // Anonymous: the repo list shows public repos only — privlib and
+    // the older private repos of this suite stay invisible.
+    const anonList = await fetch(`${base}/git`);
+    assert.equal(anonList.status, 200);
+    const anonRepos = (await anonList.json()).repos;
+    assert.ok(anonRepos.some((x) => x.owner === "testowner" && x.repo === "publib"));
+    assert.ok(!anonRepos.some((x) => x.repo === "privlib"));
+    assert.ok(!anonRepos.some((x) => x.repo === "testrepo"));
+
+    // Anonymous: info/refs and a real clone of the public repo work…
+    const pubRefs = await fetch(`${base}/git/testowner/publib/info/refs?service=git-upload-pack`);
+    assert.equal(pubRefs.status, 200);
+    await pubRefs.arrayBuffer();
+    await gitOk(work, ["clone", "-q", `${base}/git/testowner/publib`, "anonclone"]);
+    assert.equal(readFileSync(join(work, "anonclone", "PUB.md"), "utf8"), "public hello\n");
+    // …while the private repo still refuses anonymous reads with 401.
+    const privRefs = await fetch(`${base}/git/testowner/privlib/info/refs?service=git-upload-pack`);
+    assert.equal(privRefs.status, 401);
+    await privRefs.arrayBuffer();
+
+    // A different account reads the public repo, is walled (403) on
+    // the private one, and its list gains the public repo only.
+    createAccount(dir, {
+      email: "visitor@example.com", name: "Visitor", owner: "visitor1",
+      password: "visitor-password-1",
+    });
+    const { sessionToken: visitorToken } = login(dir, {
+      email: "visitor@example.com", password: "visitor-password-1",
+    });
+    const vsess = { headers: { authorization: `Bearer ${visitorToken}` } };
+    const vPub = await fetch(`${base}/git/testowner/publib/info/refs?service=git-upload-pack`, vsess);
+    assert.equal(vPub.status, 200);
+    await vPub.arrayBuffer();
+    const vPriv = await fetch(`${base}/git/testowner/privlib/info/refs?service=git-upload-pack`, vsess);
+    assert.equal(vPriv.status, 403);
+    await vPriv.arrayBuffer();
+    const vList = await (await fetch(`${base}/git`, vsess)).json();
+    assert.ok(vList.repos.some((x) => x.owner === "testowner" && x.repo === "publib"));
+    assert.ok(!vList.repos.some((x) => x.repo === "privlib"));
+
+    // Writes never open up: anonymous receive-pack stays 401 even on
+    // the public repo.
+    const anonPush = await fetch(`${base}/git/testowner/publib/git-receive-pack`, { method: "POST" });
+    assert.equal(anonPush.status, 401);
+    await anonPush.arrayBuffer();
+
+    // The flip takes effect on the very next read.
+    assert.equal((await detailsCall("PATCH", "publib", { visibility: "private" }, token)).status, 200);
+    const backRefs = await fetch(`${base}/git/testowner/publib/info/refs?service=git-upload-pack`);
+    assert.equal(backRefs.status, 401);
+    await backRefs.arrayBuffer();
   });
 
   after(async () => {

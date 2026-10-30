@@ -15,7 +15,7 @@ import { createRepo, repoPath } from "../lib/git.mjs";
 import { createSite } from "../lib/sites.mjs";
 import { createWorkspace } from "../lib/workspaces.mjs";
 import {
-  RepoDetailsError, repoDetails, updateRepoDetails, repoFactsSummary,
+  RepoDetailsError, repoDetails, updateRepoDetails, repoFactsSummary, repoVisibility,
 } from "../lib/repodetails.mjs";
 import { startApiServer } from "../lib/httpapi.mjs";
 import { loadApiToken } from "../lib/state.mjs";
@@ -210,6 +210,41 @@ describe("repodetails: editable metadata in kiln.json", () => {
     assert.equal(repoDetails(dir, "auro", "widget").description, "");
   });
 
+  it("visibility defaults to private, flips via update, and reads fail-closed", () => {
+    const dir = makeStateDir();
+    seedMultiRepo(dir, "auro", "widget");
+    // Default: kiln.json carries no visibility -> private everywhere.
+    assert.equal(repoDetails(dir, "auro", "widget").visibility, "private");
+    assert.equal(repoVisibility(dir, "auro", "widget"), "private");
+    // The owner flips it public; details, the gate helper and the
+    // persisted kiln.json all agree.
+    const d = updateRepoDetails(dir, "auro", "widget", { visibility: "public" });
+    assert.equal(d.visibility, "public");
+    assert.equal(repoVisibility(dir, "auro", "widget"), "public");
+    const meta = JSON.parse(readFileSync(join(repoPath(dir, "auro", "widget"), "kiln.json"), "utf8"));
+    assert.equal(meta.visibility, "public");
+    // And back to private.
+    assert.equal(
+      updateRepoDetails(dir, "auro", "widget", { visibility: "private" }).visibility,
+      "private"
+    );
+    // Invalid values are refused (400) and persist nothing.
+    const is400 = (e) => e instanceof RepoDetailsError && e.status === 400;
+    assert.throws(() => updateRepoDetails(dir, "auro", "widget", { visibility: "everyone" }), is400);
+    assert.throws(() => updateRepoDetails(dir, "auro", "widget", { visibility: "PUBLIC" }), is400);
+    assert.equal(repoVisibility(dir, "auro", "widget"), "private");
+    // A corrupt / hand-written value reads private — the gates fail
+    // closed, never open.
+    writeFileSync(
+      join(repoPath(dir, "auro", "widget"), "kiln.json"),
+      JSON.stringify({ schema: "kiln.git-repo.v1", owner: "auro", repo: "widget", visibility: "yes" })
+    );
+    assert.equal(repoVisibility(dir, "auro", "widget"), "private");
+    assert.equal(repoDetails(dir, "auro", "widget").visibility, "private");
+    // Unknown repos read private too.
+    assert.equal(repoVisibility(dir, "auro", "ghost"), "private");
+  });
+
   it("unknown repos 404 across details, summary, and update", () => {
     const dir = makeStateDir();
     const is404 = (e) => e instanceof RepoDetailsError && e.status === 404;
@@ -292,6 +327,16 @@ describe("repodetails: HTTP API", () => {
     assert.equal((await call("PATCH", "/v1/repos/auro/widget/details", { topics: ["NOPE"] })).status, 400);
     assert.equal((await call("GET", "/v1/repos/auro/ghost/details")).status, 404);
     assert.equal((await call("PATCH", "/v1/repos/auro/ghost/details", { description: "x" })).status, 404);
+
+    // Visibility over HTTP: private by default, PATCH flips it,
+    // details GET returns it, invalid values are 400.
+    assert.equal(got.data.visibility, "private");
+    const flipped = await call("PATCH", "/v1/repos/auro/widget/details", { visibility: "public" });
+    assert.equal(flipped.status, 200);
+    assert.equal(flipped.data.details.visibility, "public");
+    assert.equal((await call("GET", "/v1/repos/auro/widget/details")).data.visibility, "public");
+    assert.equal((await call("PATCH", "/v1/repos/auro/widget/details", { visibility: "friends" })).status, 400);
+    assert.equal((await call("GET", "/v1/repos/auro/widget/details")).data.visibility, "public");
 
     // Discovery rides the same server + auth.
     assert.equal((await call("GET", "/v1/capabilities", null, false)).status, 401);

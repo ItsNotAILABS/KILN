@@ -173,6 +173,10 @@ const REPO_DETAILS_SCHEMA = {
       type: "array", maxItems: 16,
       items: { type: "string", pattern: "^[a-z0-9][a-z0-9-]{0,31}$" },
     },
+    visibility: {
+      type: "string", enum: ["private", "public"],
+      description: "Owner-chosen read visibility (GitHub-shaped): \"private\" (the default) = accounts-only reads; \"public\" = anyone, including anonymous readers, may read (list, clone/fetch, details, forge GETs). Writes stay owner/operator-only either way.",
+    },
     empty: { type: "boolean" },
     defaultBranch: { type: ["string", "null"] },
     commitCount: { type: "integer", minimum: 0 },
@@ -278,7 +282,7 @@ export function buildCapabilities() {
       },
       {
         id: "project-details",
-        title: "Project details — live per-repo facts (history, languages, README) plus editable description/topics",
+        title: "Project details — live per-repo facts (history, languages, README) plus editable description/topics/visibility",
         endpoints: [
           "GET /v1/repos/:owner/:repo/details",
           "PATCH /v1/repos/:owner/:repo/details",
@@ -733,7 +737,7 @@ export function buildOpenApiDocument() {
         },
         patch: {
           operationId: "updateRepoDetails",
-          summary: "Edit description/topics (persisted in the repo's kiln.json, unknown fields preserved)",
+          summary: "Edit description/topics/visibility (persisted in the repo's kiln.json, unknown fields preserved)",
           requestBody: {
             required: true,
             content: {
@@ -746,6 +750,7 @@ export function buildOpenApiDocument() {
                       type: "array", maxItems: 16,
                       items: { type: "string", pattern: "^[a-z0-9][a-z0-9-]{0,31}$" },
                     },
+                    visibility: { type: "string", enum: ["private", "public"] },
                   },
                 },
               },
