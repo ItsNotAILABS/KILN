@@ -313,8 +313,9 @@ export function buildCapabilities() {
       },
       {
         id: "forge",
-        title: "Forge — the GitHub-shaped repo surface: branches, tree/contents (files written as real git commits by the acting principal — no local clone needed), commit history, compare/diff, pull requests (open, comment, review, merge: fast-forward or merge-commit, CI enqueued on the base), tags and releases with markdown notes. Account/agent principals are walled to their own owner namespace; agents need the \"forge\" scope. Every mutation lands in the forge audit log",
+        title: "Forge — the GitHub-shaped repo surface: branches, tree/contents (files written as real git commits by the acting principal — no local clone needed), commit history, compare/diff, pull requests (open, comment, review, merge: fast-forward or merge-commit, optional deleteBranch on merge, CI enqueued on the base), tags and releases with markdown notes. Repos are born with an initial commit on main (authored by the creator), so branch → PR → merge works immediately — no client-side seed commit. A repo can be deleted outright (DELETE /v1/repos/:owner/:repo) by its owner's account session or the operator only — agent tokens can never delete. Account/agent principals are walled to their own owner namespace; agents need the \"forge\" scope. Every mutation lands in the forge audit log",
         endpoints: [
+          "DELETE /v1/repos/:owner/:repo",
           "GET /v1/repos/:owner/:repo/branches",
           "POST /v1/repos/:owner/:repo/branches",
           "DELETE /v1/repos/:owner/:repo/branches/:name",
@@ -340,6 +341,7 @@ export function buildCapabilities() {
           "DELETE /v1/repos/:owner/:repo/releases/:tag",
         ],
         mcpTools: [
+          "kiln_forge_repo_delete",
           "kiln_forge_branches_list",
           "kiln_forge_branch_create",
           "kiln_forge_branch_delete",
@@ -718,6 +720,32 @@ export function buildOpenApiDocument() {
             "200": jsonResponse("Site status", { type: "object" }),
             "404": errorResponse("No such site"),
             "401": errorResponse("Missing or invalid bearer <redacted>"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        delete: {
+          operationId: "deleteRepo",
+          summary: "Delete a repo outright: the bare git dir (with its kiln.json details and memory chain), its forge records (pulls/releases), and its stored CI results are removed; workspace/site registries keep their member refs and render the repo as missing. Authorization is the strictest on the forge: the repo owner's account session or the operator token — agent tokens can NEVER delete, a non-owner session answers 403, anonymous answers 401",
+          responses: {
+            "200": jsonResponse("Deleted", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                owner: { type: "string" },
+                repo: { type: "string" },
+                deleted: { type: "boolean" },
+              },
+              required: ["ok", "owner", "repo", "deleted"],
+            }),
+            "400": errorResponse("Invalid owner/repo name"),
+            "403": errorResponse("Agent token, or an account session that does not own this repo"),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
           },
         },
       },

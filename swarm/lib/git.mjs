@@ -15,7 +15,7 @@
  *     into public-internet read access to every hosted repo.)
  */
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { writeFileAtomicSync } from "./state.mjs";
 
@@ -47,7 +47,17 @@ export function repoExists(dir, owner, repo) {
   }
 }
 
-export function createRepo(dir, owner, repo) {
+/**
+ * Default author of a repo's initial commit when the caller names no
+ * other: the operator identity (the same name/email lib/forge.mjs's
+ * actorOf stamps for operator writes). The HTTP create route passes the
+ * creating principal's actor explicitly; the CLI's local fallback lands
+ * here, which is truthful — the CLI is the operator's own tool.
+ */
+export const DEFAULT_REPO_AUTHOR = { name: "KILN Operator", email: "operator@kiln.local" };
+export const INITIAL_COMMIT_MESSAGE = "chore: initialize repository";
+
+export function createRepo(dir, owner, repo, opts = {}) {
   const p = repoPath(dir, owner, repo); // throws on invalid names
   if (existsSync(p)) {
     const e = new Error(`repo exists: ${owner}/${repo}`);
@@ -64,7 +74,50 @@ export function createRepo(dir, owner, repo) {
     join(p, "kiln.json"),
     JSON.stringify({ schema: "kiln.git-repo.v1", owner, repo, createdAt: new Date().toISOString() }) + "\n"
   );
-  return { owner, repo, path: p };
+  // Born PR-ready: main starts at an initial commit (empty tree),
+  // authored by the creating principal, so branch → PR → merge works
+  // from minute one with no client-side seeding. Before this, a new
+  // repo had an unborn main and createPull 404'd until the client
+  // hand-pushed a seed commit. Plumbing only — no worktree.
+  const author = opts.author && opts.author.name && opts.author.email
+    ? opts.author
+    : DEFAULT_REPO_AUTHOR;
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email,
+    GIT_COMMITTER_NAME: author.name, GIT_COMMITTER_EMAIL: author.email,
+  };
+  const tree = execFileSync("git", ["--git-dir", p, "mktree"], { input: "", encoding: "utf8" }).trim();
+  const initialCommit = execFileSync(
+    "git",
+    ["--git-dir", p, "commit-tree", tree, "-m", opts.message || INITIAL_COMMIT_MESSAGE],
+    { env, encoding: "utf8" }
+  ).trim();
+  execFileSync("git", ["--git-dir", p, "update-ref", "refs/heads/main", initialCommit], { stdio: "ignore" });
+  return { owner, repo, path: p, initialCommit };
+}
+
+/**
+ * Delete a repo outright: the bare git dir (which also carries the
+ * repo's kiln.json details and its refs/kiln/memory chain) is removed,
+ * so the repo vanishes from listRepos and every existence check at
+ * once. Registry state that lives OUTSIDE the bare dir is the caller's
+ * cleanup: forge records (lib/forge.mjs forgetRepo) and CI results
+ * (lib/ci.mjs forgetRepoCiResults). Workspace/site registries keep
+ * their member refs by the codebase's own pattern — their status views
+ * already render a missing repo as exists:false, and membership is the
+ * workspace owner's explicit edit, never a side effect.
+ * Throws an Error with .code "NOT_FOUND" when the repo does not exist.
+ */
+export function deleteRepo(dir, owner, repo) {
+  const p = repoPath(dir, owner, repo); // throws on invalid names
+  if (!existsSync(p)) {
+    const e = new Error(`no such repo: ${owner}/${repo}`);
+    e.code = "NOT_FOUND";
+    throw e;
+  }
+  rmSync(p, { recursive: true, force: true });
+  return { owner, repo };
 }
 
 export function listRepos(dir) {

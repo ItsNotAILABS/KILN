@@ -18,7 +18,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync,
-  openSync, closeSync, statSync, unlinkSync,
+  openSync, closeSync, statSync, unlinkSync, rmSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -245,6 +245,18 @@ export function readLatest(dir, owner, repo, branch) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Repo deletion cleanup: drop the repo's stored CI results + logs
+ * (results/<owner>/<repo>/), so a repo recreated under the same name
+ * never inherits verdicts for commits it does not contain. The
+ * operator's enrollment config (ci/repos.json) is NOT touched — it is
+ * the operator's registry, keyed by name on purpose, exactly like
+ * workspace membership surviving a member repo's deletion.
+ */
+export function forgetRepoCiResults(dir, owner, repo) {
+  try { rmSync(join(ciDir(dir), "results", owner, repo), { recursive: true, force: true }); } catch { /* nothing stored */ }
 }
 
 // ---------------------------------------------------------- reconciliation

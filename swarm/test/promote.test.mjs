@@ -102,10 +102,11 @@ describe("git plumbing over the seeded bare repo", () => {
   it("extracts modify + add, then a deletion with null sha", async () => {
     const list = execFileSync("git", ["--git-dir", bare, "rev-list", "--reverse", "HEAD"], { encoding: "utf8" })
       .trim().split("\n");
-    assert.equal(list.length, 3);
-    const e2 = await diffEntries(bare, list[0], list[1]);
+    // The forge's seeded initial commit + this suite's three commits.
+    assert.equal(list.length, 4);
+    const e2 = await diffEntries(bare, list[1], list[2]);
     assert.deepEqual(e2.map((e) => e.path).sort(), ["a.txt", "b.txt"]);
-    const e3 = await diffEntries(bare, list[1], list[2]);
+    const e3 = await diffEntries(bare, list[2], list[3]);
     assert.equal(e3.length, 1);
     assert.equal(e3[0].path, "b.txt");
     assert.equal(e3[0].localSha, null);
@@ -124,8 +125,8 @@ describe("promoteRepo without a credential", () => {
       assert.equal(r.branch, "main");
       assert.equal(r.sourceBranch, "main");
       assert.equal(r.sourceTip, headSha);
-      assert.equal(r.commitsTotal, 3);
-      assert.equal(r.commitsPlanned, 3);
+      assert.equal(r.commitsTotal, 4); // seeded initial commit + the suite's three
+      assert.equal(r.commitsPlanned, 4);
     } finally {
       if (savedToken !== undefined) process.env.KILN_GITHUB_TOKEN = savedToken;
     }

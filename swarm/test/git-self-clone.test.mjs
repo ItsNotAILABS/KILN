@@ -69,22 +69,25 @@ describe("E3: node spawn with a self-hosted KILN-native repo", () => {
     const token = readFileSync(join(dir, "api.token"), "utf8").trim();
 
     // A real KILN-native repo on THIS daemon, with a real seed commit.
+    // The repo is born with an initial commit now, so the seed commit
+    // is built by cloning it and committing on top.
     const created = await client.createRepo({ owner: "auro", repo: "selfclone" });
     const cloneUrl = created.cloneUrl || `${dj.apiUrl}/git/auro/selfclone`;
-    const seed = mkdtempSync(join(tmpdir(), "kiln-seed-"));
-    git(seed, ["init", "-q"]);
-    git(seed, ["config", "user.email", "e3@test.local"]);
-    git(seed, ["config", "user.name", "e3"]);
-    const fs = await import("node:fs");
-    fs.writeFileSync(join(seed, "SEED.md"), "# e3 seed\n");
-    git(seed, ["add", "."]);
-    git(seed, ["commit", "-qm", "e3 seed commit"]);
-    git(seed, ["remote", "add", "origin", cloneUrl]);
-    git(seed, ["push", "-q", "origin", "HEAD:refs/heads/main"], {
+    const authEnv = {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "http.extraHeader",
       GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
-    });
+    };
+    const seed = mkdtempSync(join(tmpdir(), "kiln-seed-"));
+    git(seed, ["clone", "-q", cloneUrl, "clone"], authEnv);
+    const work = join(seed, "clone");
+    git(work, ["config", "user.email", "e3@test.local"]);
+    git(work, ["config", "user.name", "e3"]);
+    const fs = await import("node:fs");
+    fs.writeFileSync(join(work, "SEED.md"), "# e3 seed\n");
+    git(work, ["add", "."]);
+    git(work, ["commit", "-qm", "e3 seed commit"]);
+    git(work, ["push", "-q", "origin", "HEAD:refs/heads/main"], authEnv);
 
     // The daemon must stay responsive DURING the clone. Poll /health in the
     // background; any gap > 10s means the event loop blocked (old behavior:

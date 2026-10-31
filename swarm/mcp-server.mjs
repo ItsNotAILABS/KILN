@@ -353,6 +353,18 @@ const TOOLS = [
   // surfaces verbatim.
   // -------------------------------------------------------------------------
   {
+    name: "kiln_forge_repo_delete",
+    description:
+      "Delete a forge repo OUTRIGHT: the bare git dir (with its details and memory chain), its forge records (pulls/releases), and its stored CI results are removed; workspace/site registries keep their member refs and render the repo as missing. This is the strictest write on the forge: only the repo owner's account session or the operator token may delete — an agent token (this tool's usual caller) is refused with 403 by design; repo creation is operator-only and deletion never drops below that bar. A non-owner session also answers 403, anonymous 401, an unknown repo 404. There is no undo. Verify with a repo list (the repo is gone) or kiln_repo_details (404).",
+    inputSchema: objectSchema(
+      { owner: { ...str }, repo: { ...str } },
+      ["owner", "repo"]
+    ),
+    async call(args) {
+      return apiRequest("DELETE", `${forgeRepoBase(args)}`);
+    },
+  },
+  {
     name: "kiln_forge_branches_list",
     description:
       "List a forge repo's branches: { branches: [{ name, sha }] }. Repo is \"owner/repo\" under /v1/repos/:owner/:repo.",
@@ -643,18 +655,19 @@ const TOOLS = [
   {
     name: "kiln_forge_pull_merge",
     description:
-      "Merge a pull request for real: method \"merge\" (default daemon behavior) or \"fast-forward\", with an optional merge message. Answers 409 on conflicts, and on changes-requested for non-operator principals. CI is enqueued on the base branch after a merge. Verify with kiln_forge_pull_get and kiln_forge_commits_list.",
+      "Merge a pull request for real: method \"merge\" (default daemon behavior) or \"fast-forward\", with an optional merge message. Pass deleteBranch=true to also delete the head branch after the merge (default off, GitHub-style delete-on-merge); the answer reports headBranchDeleted, or headBranchKept with the reason when the branch had to stay (e.g. it is the default branch). Answers 409 on conflicts, and on changes-requested for non-operator principals. CI is enqueued on the base branch after a merge. Verify with kiln_forge_pull_get and kiln_forge_commits_list.",
     inputSchema: objectSchema(
       {
         owner: { ...str }, repo: { ...str },
         number: { type: "integer", description: "Pull number." },
         method: { ...str, description: "merge | fast-forward." },
         message: { ...str, description: "Optional merge commit message." },
+        deleteBranch: { type: "boolean", description: "Delete the head branch after a successful merge (default false)." },
       },
       ["owner", "repo", "number"]
     ),
     async call(args) {
-      const body = pickPresent(args, ["method", "message"]);
+      const body = pickPresent(args, ["method", "message", "deleteBranch"]);
       return apiRequest("POST", `${forgeRepoBase(args)}/pulls/${encodeURIComponent(String(args.number))}/merge`, body);
     },
   },

@@ -87,9 +87,13 @@ describe("memory: episodes + provenance facts", () => {
     const gd = repoPath(dir, ...R);
     const tip = execFileSync("git", ["--git-dir", gd, "rev-parse", MEMORY_REF], { encoding: "utf8" }).trim();
     assert.match(tip, /^[0-9a-f]{40}$/);
-    // The memory lineage is NOT the code lineage.
-    const branches = execFileSync("git", ["--git-dir", gd, "branch", "-a"], { encoding: "utf8" });
-    assert.equal(branches.trim(), "");
+    // The memory lineage is NOT the code lineage: the repo's only
+    // branch is main (the seeded initial commit), and the memory ref
+    // is not an ancestor of it — the two chains share no history.
+    const branches = execFileSync("git", ["--git-dir", gd, "branch", "--format=%(refname:short)"], { encoding: "utf8" });
+    assert.equal(branches.trim(), "main");
+    assert.throws(() =>
+      execFileSync("git", ["--git-dir", gd, "merge-base", "--is-ancestor", MEMORY_REF, "main"], { stdio: "pipe" }));
   });
 });
 

@@ -34,13 +34,17 @@ const FILES = {
 };
 
 /**
- * Create a hosted repo and push TWO real commits: the FILES set, then
- * one extra file. Returns { shas } newest last.
+ * Create a hosted repo and add TWO real commits on top of its seeded
+ * initial commit: the FILES set, then one extra file. (Clone-based —
+ * hosted repos are born with an initial commit, so an unrelated
+ * history would be refused as non-fast-forward.) Returns { shas }
+ * newest last.
  */
 function seedMultiRepo(dir, owner, repo) {
   createRepo(dir, owner, repo);
-  const work = mkdtempSync(join(tmpdir(), "kiln-details-seed-"));
-  git(work, ["init", "-q", "-b", "main"]);
+  const seed = mkdtempSync(join(tmpdir(), "kiln-details-seed-"));
+  const work = join(seed, "clone");
+  git(seed, ["clone", "-q", repoPath(dir, owner, repo), "clone"]);
   git(work, ["config", "user.email", "test@kiln.local"]);
   git(work, ["config", "user.name", "kiln-test"]);
   for (const [path, content] of Object.entries(FILES)) {
@@ -55,7 +59,7 @@ function seedMultiRepo(dir, owner, repo) {
   git(work, ["add", "-A"]);
   git(work, ["commit", "-q", "-m", "widget: add extra"]);
   const sha2 = git(work, ["rev-parse", "HEAD"]);
-  git(work, ["push", "-q", repoPath(dir, owner, repo), "main"]);
+  git(work, ["push", "-q", "origin", "main"]);
   return { shas: [sha1, sha2] };
 }
 
@@ -75,7 +79,7 @@ describe("repodetails: live derivation", () => {
     assert.deepEqual(d.topics, []);
     assert.equal(d.empty, false);
     assert.equal(d.defaultBranch, "main");
-    assert.equal(d.commitCount, 2);
+    assert.equal(d.commitCount, 3); // seeded initial commit + the two pushed
 
     const expectedBytes =
       Object.values(FILES).reduce((s, c) => s + bytes(c), 0) + bytes("extra file\n");
@@ -88,7 +92,7 @@ describe("repodetails: live derivation", () => {
     assert.equal(d.lastCommit.subject, "widget: add extra");
     assert.equal(d.lastCommit.author, "kiln-test");
     assert.ok(d.lastCommit.date);
-    assert.equal(d.recentActivity.length, 2);
+    assert.equal(d.recentActivity.length, 3);
     assert.equal(d.recentActivity[0].sha, shas[1]);
     assert.equal(d.recentActivity[1].sha, shas[0]);
     assert.equal(d.recentActivity[1].subject, "widget: initial commit");
@@ -116,18 +120,23 @@ describe("repodetails: live derivation", () => {
     assert.equal(d.ci, null); // no CI result recorded — null, never invented
   });
 
-  it("an empty repo reports zeros and nulls, not an error", () => {
+  it("a fresh repo reports its seeded initial commit, with zero files — not an error", () => {
     const dir = makeStateDir();
-    createRepo(dir, "auro", "blank");
+    // Repos are born with an initial commit now, so a brand-new repo
+    // is not "empty": it has exactly one commit and an empty tree.
+    const { initialCommit } = createRepo(dir, "auro", "blank");
     const d = repoDetails(dir, "auro", "blank");
-    assert.equal(d.empty, true);
+    assert.equal(d.empty, false);
     assert.equal(d.defaultBranch, "main");
-    assert.equal(d.commitCount, 0);
+    assert.equal(d.commitCount, 1);
     assert.equal(d.fileCount, 0);
     assert.equal(d.treeBytes, 0);
     assert.ok(d.diskBytes > 0, "the bare repo itself occupies disk");
-    assert.equal(d.lastCommit, null);
-    assert.deepEqual(d.recentActivity, []);
+    assert.equal(d.lastCommit.sha, initialCommit);
+    assert.equal(d.lastCommit.subject, "chore: initialize repository");
+    assert.equal(d.lastCommit.author, "KILN Operator");
+    assert.equal(d.recentActivity.length, 1);
+    assert.equal(d.recentActivity[0].sha, initialCommit);
     assert.deepEqual(d.languages, []);
     assert.equal(d.readme, null);
     assert.equal(d.ci, null);
@@ -140,7 +149,7 @@ describe("repodetails: live derivation", () => {
     assert.deepEqual(Object.keys(s).sort(),
       ["commitCount", "defaultBranch", "description", "lastCommit", "topics"]);
     assert.equal(s.defaultBranch, "main");
-    assert.equal(s.commitCount, 2);
+    assert.equal(s.commitCount, 3);
     assert.equal(s.lastCommit.sha, shas[1]);
   });
 });
@@ -312,7 +321,7 @@ describe("repodetails: HTTP API", () => {
     const got = await call("GET", "/v1/repos/auro/widget/details");
     assert.equal(got.status, 200);
     assert.equal(got.data.repo, "auro/widget");
-    assert.equal(got.data.commitCount, 2);
+    assert.equal(got.data.commitCount, 3);
     assert.equal(got.data.readme.path, "README.md");
 
     const patched = await call("PATCH", "/v1/repos/auro/widget/details", {

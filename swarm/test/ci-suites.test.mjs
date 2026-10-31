@@ -214,12 +214,13 @@ async function pushProbe(repo, command) {
   writeFileSync(cfgPath, JSON.stringify(cfg));
   const work = mkdtempSync(join(tmpdir(), "kiln-ci-suites-test-"));
   const url = `http://oauth2:${token}@127.0.0.1:${api.port}/git/auro/${repo}`;
-  await git(work, ["init", "-q", "-b", "main", "src"]);
+  // Clone-based: hosted repos are born with an initial commit now.
+  await git(work, ["clone", "-q", url, "src"]);
   writeFileSync(join(work, "src", "NOTE.md"), "ci suites probe\n");
   await git(join(work, "src"), ["add", "."]);
   await git(join(work, "src"), ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "probe"]);
   const sha = await git(join(work, "src"), ["rev-parse", "HEAD"]);
-  await git(join(work, "src"), ["push", "-q", url, "main"]);
+  await git(join(work, "src"), ["push", "-q", "origin", "main"]);
   await waitFor(() => {
     const doc = readLatest(dir, "auro", repo, "main");
     return doc && doc.sha === sha;

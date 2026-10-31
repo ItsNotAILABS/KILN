@@ -8,10 +8,14 @@
  */
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { makeStateDir } from "./helpers.mjs";
 import { startApiServer } from "../lib/httpapi.mjs";
 import { loadApiToken } from "../lib/state.mjs";
 import { createAccount, login } from "../lib/accounts.mjs";
+import { repoPath } from "../lib/git.mjs";
 
 describe("forge: HTTP API", () => {
   let api;
@@ -65,7 +69,7 @@ describe("forge: HTTP API", () => {
     assert.equal(w2.status, 201, w2.text);
     assert.notEqual(w2.data.commit, w1.data.commit);
     const commits = await call("GET", "/v1/repos/auro/f/commits", undefined, op);
-    assert.equal(commits.data.commits.length, 2);
+    assert.equal(commits.data.commits.length, 3); // initial commit + the two writes
     assert.equal(commits.data.commits[0].subject, "edit readme");
     const one = await call("GET", `/v1/repos/auro/f/commits/${w1.data.commit}`, undefined, op);
     assert.equal(one.data.files[0].path, "README.md");
@@ -326,7 +330,7 @@ describe("forge: public repo visibility", () => {
     assert.equal(Buffer.from(cAnon.data.content, "base64").toString("utf8"), "# Public Test\n");
     const commitsAnon = await call("GET", "/v1/repos/pubowner/pub/commits");
     assert.equal(commitsAnon.status, 200);
-    assert.equal(commitsAnon.data.commits.length, 1);
+    assert.equal(commitsAnon.data.commits.length, 2); // initial commit + "add readme"
     assert.equal((await call("GET", `/v1/repos/pubowner/pub/commits/${w.data.commit}`)).status, 200);
     const cmpAnon = await call("GET", "/v1/repos/pubowner/pub/compare?base=main&head=feature");
     assert.equal(cmpAnon.status, 200);
@@ -360,4 +364,149 @@ describe("forge: public repo visibility", () => {
     assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestSess)).status, 403);
   });
 
+});
+
+describe("forge: repo lifecycle — born PR-ready, delete, delete-on-merge", () => {
+  let api, dir, base, op, call;
+  after(() => { try { api?.server?.close(); } catch { /* already closed */ } });
+
+  async function boot() {
+    if (api) return;
+    dir = makeStateDir();
+    process.env.KILN_SWARM_API_PORT = "0";
+    try {
+      api = await startApiServer(dir, { apiPort: 0 });
+    } finally {
+      delete process.env.KILN_SWARM_API_PORT;
+    }
+    base = api.url;
+    op = loadApiToken(dir);
+    call = async (method, path, body, bearer) => {
+      const res = await fetch(base + path, {
+        method,
+        headers: {
+          ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* raw response */ }
+      return { status: res.status, text, data };
+    };
+  }
+
+  it("a repo is born with an initial commit and takes a first PR end-to-end; merge can delete the head branch", async () => {
+    await boot();
+    const created = await call("POST", "/git/auro/born", undefined, op);
+    assert.equal(created.status, 201, created.text);
+    assert.match(created.data.initialCommit, /^[0-9a-f]{40}$/);
+
+    // main resolves from minute one: one branch at the initial commit,
+    // whose log is exactly the seed commit with an empty tree.
+    const branches = await call("GET", "/v1/repos/auro/born/branches", undefined, op);
+    assert.deepEqual(branches.data.branches.map((b) => b.name), ["main"]);
+    assert.equal(branches.data.branches[0].sha, created.data.initialCommit);
+    const commits = await call("GET", "/v1/repos/auro/born/commits", undefined, op);
+    assert.equal(commits.data.commits.length, 1);
+    assert.equal(commits.data.commits[0].subject, "chore: initialize repository");
+    assert.equal(commits.data.commits[0].author.name, "KILN Operator");
+
+    // The exact kit-landing flow, with NO client-side seed commit:
+    // branch straight off main, write on the branch, open and merge.
+    assert.equal((await call("POST", "/v1/repos/auro/born/branches", { name: "feat/initial-kit" }, op)).status, 201);
+    const w = await call("PUT", "/v1/repos/auro/born/contents", { path: "README.md", content: "# Born\n", message: "kit readme", branch: "feat/initial-kit" }, op);
+    assert.equal(w.status, 201, w.text);
+    const pr = await call("POST", "/v1/repos/auro/born/pulls", { title: "Initial kit", head: "feat/initial-kit", base: "main" }, op);
+    assert.equal(pr.status, 201, pr.text);
+    const merged = await call("POST", "/v1/repos/auro/born/pulls/1/merge", { deleteBranch: true }, op);
+    assert.equal(merged.status, 200, merged.text);
+    assert.equal(merged.data.headBranchDeleted, true);
+    const names = (await call("GET", "/v1/repos/auro/born/branches", undefined, op)).data.branches.map((b) => b.name);
+    assert.deepEqual(names, ["main"]);
+    const onMain = await call("GET", "/v1/repos/auro/born/contents?path=README.md", undefined, op);
+    assert.equal(onMain.status, 200);
+    assert.equal(Buffer.from(onMain.data.content, "base64").toString("utf8"), "# Born\n");
+
+    // Default stays OFF: a merge without the flag keeps its head branch.
+    assert.equal((await call("POST", "/v1/repos/auro/born/branches", { name: "keep" }, op)).status, 201);
+    assert.equal((await call("PUT", "/v1/repos/auro/born/contents", { path: "keep.txt", content: "k\n", message: "keep work", branch: "keep" }, op)).status, 201);
+    const pr2 = await call("POST", "/v1/repos/auro/born/pulls", { title: "Keep branch", head: "keep", base: "main" }, op);
+    assert.equal(pr2.status, 201, pr2.text);
+    const merged2 = await call("POST", `/v1/repos/auro/born/pulls/${pr2.data.pull.number}/merge`, {}, op);
+    assert.equal(merged2.status, 200, merged2.text);
+    assert.ok(!merged2.data.headBranchDeleted);
+    const names2 = (await call("GET", "/v1/repos/auro/born/branches", undefined, op)).data.branches.map((b) => b.name);
+    assert.ok(names2.includes("keep"));
+  });
+
+  it("DELETE repo: owner session or operator only; deletion is complete and recreation starts clean", async () => {
+    await boot();
+    createAccount(dir, { email: "del@example.com", name: "Del", owner: "delowner", password: "del-password-1" });
+    createAccount(dir, { email: "delguest@example.com", name: "Del Guest", owner: "delguest", password: "guest-password-1" });
+    const ownerSess = login(dir, { email: "del@example.com", password: "del-password-1" }).sessionToken;
+    const guestSess = login(dir, { email: "delguest@example.com", password: "guest-password-1" }).sessionToken;
+    const agMint = await call("POST", "/v1/accounts/me/agents", { name: "del-bot", scopes: ["forge"] }, ownerSess);
+    assert.equal(agMint.status, 201, agMint.text);
+    const ownerAgent = agMint.data.token;
+
+    assert.equal((await call("POST", "/git/delowner/victim", undefined, op)).status, 201);
+    // Seed forge state the deletion must scrub: a file, a branch + open
+    // PR (forge registry), a release, and a workspace membership.
+    assert.equal((await call("PUT", "/v1/repos/delowner/victim/contents", { path: "a.txt", content: "a\n", message: "seed" }, op)).status, 201);
+    assert.equal((await call("POST", "/v1/repos/delowner/victim/branches", { name: "wip" }, op)).status, 201);
+    assert.equal((await call("POST", "/v1/repos/delowner/victim/pulls", { title: "wip pr", head: "wip", base: "main" }, op)).status, 201);
+    assert.equal((await call("POST", "/v1/repos/delowner/victim/releases", { tag: "v1.0.0", name: "One" }, op)).status, 201);
+    const ws = await call("POST", "/v1/workspaces", { owner: "delowner", slug: "del-ws", name: "Del WS", repos: ["delowner/victim"] }, ownerSess);
+    assert.equal(ws.status, 201, ws.text);
+    const wsId = ws.data.workspace.id;
+
+    // ---- the auth matrix
+    assert.equal((await call("DELETE", "/v1/repos/delowner/victim")).status, 401); // anonymous
+    assert.equal((await call("DELETE", "/v1/repos/delowner/victim", undefined, ownerAgent)).status, 403); // agent: never
+    assert.equal((await call("DELETE", "/v1/repos/delowner/victim", undefined, guestSess)).status, 403); // non-owner session
+    assert.equal((await call("DELETE", "/v1/repos/delowner/nope", undefined, ownerSess)).status, 404); // owner, missing repo
+    const del = await call("DELETE", "/v1/repos/delowner/victim", undefined, ownerSess);
+    assert.equal(del.status, 200, del.text);
+    assert.equal(del.data.deleted, true);
+
+    // ---- completeness: gone from listings, details and pulls 404,
+    // and the workspace keeps its member ref rendered as missing (the
+    // codebase's own pattern for registry references).
+    const listing = await call("GET", "/git", undefined, op);
+    assert.ok(!listing.data.repos.some((r) => r.owner === "delowner" && r.repo === "victim"));
+    assert.equal((await call("GET", "/v1/repos/delowner/victim/details", undefined, op)).status, 404);
+    assert.equal((await call("GET", "/v1/repos/delowner/victim/pulls", undefined, op)).status, 404);
+    const wsAfter = await call("GET", `/v1/workspaces/${wsId}`, undefined, ownerSess);
+    assert.equal(wsAfter.status, 200, wsAfter.text);
+    assert.equal(wsAfter.data.repos.find((r) => r.repo === "delowner/victim").exists, false);
+
+    // ---- recreation starts clean: fresh initial commit, forge
+    // registry scrubbed (no pulls/releases, PR counter back to #1).
+    const re = await call("POST", "/git/delowner/victim", undefined, op);
+    assert.equal(re.status, 201, re.text);
+    assert.match(re.data.initialCommit, /^[0-9a-f]{40}$/);
+    assert.deepEqual((await call("GET", "/v1/repos/delowner/victim/pulls", undefined, op)).data.pulls, []);
+    assert.deepEqual((await call("GET", "/v1/repos/delowner/victim/releases", undefined, op)).data.releases, []);
+    assert.equal((await call("GET", "/v1/repos/delowner/victim/details", undefined, op)).data.commitCount, 1);
+    assert.equal((await call("POST", "/v1/repos/delowner/victim/branches", { name: "again" }, op)).status, 201);
+    const prAgain = await call("POST", "/v1/repos/delowner/victim/pulls", { title: "first again", head: "again", base: "main" }, op);
+    assert.equal(prAgain.status, 201, prAgain.text);
+    assert.equal(prAgain.data.pull.number, 1);
+
+    // The operator can delete too.
+    assert.equal((await call("DELETE", "/v1/repos/delowner/victim", undefined, op)).status, 200);
+  });
+
+  it("createPull on a legacy repo with no commits answers an explicit 409, not a bare 404", async () => {
+    await boot();
+    // A pre-fix repo, created by hand the old way: bare, unborn main.
+    const p = repoPath(dir, "legacy", "old");
+    mkdirSync(dirname(p), { recursive: true });
+    execFileSync("git", ["init", "--bare", "--initial-branch=main", p], { stdio: "ignore" });
+    const pr = await call("POST", "/v1/repos/legacy/old/pulls", { title: "x", head: "feat", base: "main" }, op);
+    assert.equal(pr.status, 409, pr.text);
+    assert.match(pr.data.error, /no commits yet/);
+  });
 });

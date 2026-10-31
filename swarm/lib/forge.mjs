@@ -108,6 +108,27 @@ function saveStore(dir, store) {
   writeFileAtomicSync(forgePath(dir), JSON.stringify(store, null, 2) + "\n");
 }
 
+/**
+ * Repo deletion cleanup (the HTTP delete route's second half): drop
+ * this repo's pull/release records and its PR counter from the forge
+ * registry, so a repo recreated under the same name starts clean —
+ * its first PR is #1 again, not a resurrection of the dead repo's
+ * history. Returns what was removed, for the audit line.
+ */
+export function forgetRepo(dir, owner, repo) {
+  const store = loadStore(dir);
+  const k = key(owner, repo);
+  const removed = {
+    pulls: (store.pulls[k] || []).length,
+    releases: (store.releases[k] || []).length,
+  };
+  delete store.pulls[k];
+  delete store.releases[k];
+  delete store.counters[k];
+  if (removed.pulls || removed.releases) saveStore(dir, store);
+  return removed;
+}
+
 // ---------------------------------------------------------------- git plumbing
 
 function git(gd, args, opts = {}) {
@@ -508,8 +529,22 @@ export function createPull(dir, owner, repo, actor, { title, body, head, base } 
   const baseBr = base || defaultBranch(gd);
   if (!validBranchName(baseBr)) throw new ForgeError(400, `invalid base branch: ${baseBr}`);
   if (head === baseBr) throw new ForgeError(400, "head and base are the same branch");
+  // Legacy repos (created before the forge seeded an initial commit at
+  // birth) can have NO commits at all: no branch name can resolve, and
+  // the old bare "no such … branch" 404 sent clients hunting for a
+  // branch problem that does not exist. Name the real state and the
+  // way out. (New repos are born with an initial commit, so this only
+  // fires for pre-fix repos — they are deliberately NOT retro-seeded.)
+  if (listBranches(gd).length === 0) {
+    throw new ForgeError(409,
+      `repo ${owner}/${repo} has no commits yet, so no branch can resolve — it predates seeded initial commits. Land a first commit (push to ${baseBr}, or write a file via the contents API), then open the pull request.`);
+  }
   if (!branchSha(gd, head)) throw new ForgeError(404, `no such head branch: ${head}`);
-  if (!branchSha(gd, baseBr)) throw new ForgeError(404, `no such base branch: ${baseBr}`);
+  if (!branchSha(gd, baseBr)) {
+    throw new ForgeError(404, baseBr === defaultBranch(gd)
+      ? `no such base branch: ${baseBr} — the default branch does not resolve to a commit in this repo (pass base: "<an existing branch>", or land a commit on ${baseBr} first)`
+      : `no such base branch: ${baseBr}`);
+  }
   const store = loadStore(dir);
   const k = key(owner, repo);
   const n = (store.counters[k] || 0) + 1;
@@ -611,7 +646,7 @@ export function reviewPull(dir, owner, repo, actor, n, { state, body } = {}) {
  * After a successful merge, CI is enqueued for the base branch when the
  * repo has a CI command — same best-effort contract as the push path.
  */
-export function mergePull(dir, owner, repo, actor, n, { method = "merge", message } = {}) {
+export function mergePull(dir, owner, repo, actor, n, { method = "merge", message, deleteBranch: deleteHeadBranch = false } = {}) {
   const gd = mustRepo(dir, owner, repo);
   if (!["merge", "fast-forward"].includes(method)) throw new ForgeError(400, `method must be "merge" or "fast-forward"`);
   const store = loadStore(dir);
@@ -669,6 +704,24 @@ export function mergePull(dir, owner, repo, actor, n, { method = "merge", messag
   saveStore(dir, store);
   appendAudit(dir, actor, "pull.merge", `${key(owner, repo)}#${n}`, { method, commit: mergeCommit });
 
+  // Optional delete-on-merge (GitHub parity; default OFF — the kit
+  // landings left feat/* branches behind because merge had no way to
+  // ask). The merge itself is already final at this point, so a head
+  // branch that cannot be deleted (it is the repo's default branch,
+  // or it vanished mid-merge) never fails the call: the answer says
+  // plainly that the branch was kept, and why.
+  let headBranchDeleted = false;
+  let headBranchKept = null;
+  if (deleteHeadBranch) {
+    try {
+      deleteBranch(gd, pull.head);
+      headBranchDeleted = true;
+      appendAudit(dir, actor, "branch.delete", `${key(owner, repo)}:${pull.head}`, { via: `pull #${n} merge (deleteBranch)` });
+    } catch (e) {
+      headBranchKept = e.message;
+    }
+  }
+
   // CI on the merged base — best-effort, exactly like the git-push path.
   let ci = null;
   try {
@@ -678,5 +731,5 @@ export function mergePull(dir, owner, repo, actor, n, { method = "merge", messag
       ci = "enqueued";
     }
   } catch { ci = null; }
-  return { pull: { ...pull, headSha, baseSha: mergeCommit }, mergeCommit, ci };
+  return { pull: { ...pull, headSha, baseSha: mergeCommit }, mergeCommit, ci, headBranchDeleted, headBranchKept };
 }

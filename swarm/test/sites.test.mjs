@@ -6,7 +6,7 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,14 +31,18 @@ function git(cwd, args, env) {
 
 /** Push one real commit into an already-created hosted repo. Returns the sha. */
 function pushCommit(dir, owner, repo, subject) {
-  const work = mkdtempSync(join(tmpdir(), "kiln-sites-seed-"));
-  git(work, ["init", "-q", "-b", "main"]);
+  // Clone-based: hosted repos are born with an initial commit now, so
+  // the seed commit builds on top of it (an unrelated history would be
+  // refused as non-fast-forward).
+  const seed = mkdtempSync(join(tmpdir(), "kiln-sites-seed-"));
+  const work = join(seed, "clone");
+  git(seed, ["clone", "-q", repoPath(dir, owner, repo), "clone"]);
   git(work, ["config", "user.email", "test@kiln.local"]);
   git(work, ["config", "user.name", "kiln-test"]);
   writeFileSync(join(work, "README.md"), `# ${repo}\n`);
   git(work, ["add", "-A"]);
   git(work, ["commit", "-q", "-m", subject]);
-  git(work, ["push", "-q", repoPath(dir, owner, repo), "main"]);
+  git(work, ["push", "-q", "origin", "main"]);
   return git(work, ["rev-parse", "HEAD"]);
 }
 
@@ -217,7 +221,11 @@ describe("sites: aggregated live status", () => {
 
   it("an empty repo reports head: null, not an error", async () => {
     const dir = makeStateDir();
-    createRepo(dir, "auro", "empty-web");
+    // A legacy repo with NO commits at all (hosted repos are born with
+    // an initial commit now, so this state is hand-made the old way).
+    const emptyPath = repoPath(dir, "auro", "empty-web");
+    mkdirSync(dirname(emptyPath), { recursive: true });
+    execFileSync("git", ["init", "--bare", "--initial-branch=main", emptyPath], { stdio: "ignore" });
     seedRepo(dir, "auro", "some-api", "api commit");
     const site = createSite(dir, {
       name: "half", frontend: "auro/empty-web", backend: "auro/some-api", actor: "test",

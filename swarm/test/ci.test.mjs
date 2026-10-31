@@ -89,14 +89,16 @@ describe("kiln CI", () => {
     }));
 
     // Push a real commit through smart HTTP (async — see NOTE above).
+    // Clone-based: hosted repos are born with an initial commit now,
+    // so the probe commit builds on top of it.
     const work = mkdtempSync(join(tmpdir(), "kiln-ci-test-"));
     const url = `http://oauth2:${token}@127.0.0.1:${api.port}/git/auro/ci-probe`;
-    await git(work, ["init", "-q", "-b", "main", "src"]);
+    await git(work, ["clone", "-q", url, "src"]);
     writeFileSync(join(work, "src", "NOTE.md"), "ci probe\n");
     await git(join(work, "src"), ["add", "."]);
     await git(join(work, "src"), ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "probe"]);
     const sha = await git(join(work, "src"), ["rev-parse", "HEAD"]);
-    await git(join(work, "src"), ["push", "-q", url, "main"]);
+    await git(join(work, "src"), ["push", "-q", "origin", "main"]);
 
     // The detached runner should verify it.
     await waitFor(async () => {
@@ -144,11 +146,11 @@ describe("kiln CI", () => {
     assert.equal(res.status, 201);
     const work = mkdtempSync(join(tmpdir(), "kiln-ci-test-"));
     const url = `http://oauth2:${token}@127.0.0.1:${api.port}/git/auro/ci-bare`;
-    await git(work, ["init", "-q", "-b", "main", "src"]);
+    await git(work, ["clone", "-q", url, "src"]);
     writeFileSync(join(work, "src", "N.md"), "x\n");
     await git(join(work, "src"), ["add", "."]);
     await git(join(work, "src"), ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]);
-    await git(join(work, "src"), ["push", "-q", url, "main"]);
+    await git(join(work, "src"), ["push", "-q", "origin", "main"]);
     await new Promise((r) => setTimeout(r, 3000)); // let any runner finish
     assert.equal(readLatest(dir, "auro", "ci-bare"), null);
     const s = await apiGet(`/git/auro/ci-bare/ci/latest`);

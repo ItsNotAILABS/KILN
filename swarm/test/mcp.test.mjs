@@ -35,18 +35,22 @@ function git(cwd, args) {
 function seedRepo(dir, owner, repo, subject) {
   createRepo(dir, owner, repo);
   const bare = repoPath(dir, owner, repo);
-  const work = mkdtempSync(join(tmpdir(), "kiln-mcp-seed-"));
+  const seed = mkdtempSync(join(tmpdir(), "kiln-mcp-seed-"));
+  const work = join(seed, "clone");
   try {
-    git(work, ["init", "-q", "-b", "main"]);
+    // Clone-based: hosted repos are born with an initial commit now,
+    // so the seed commit builds on top of it (an unrelated history
+    // would be refused as non-fast-forward).
+    git(seed, ["clone", "-q", bare, "clone"]);
     git(work, ["config", "user.email", "test@kiln.local"]);
     git(work, ["config", "user.name", "kiln-test"]);
     writeFileSync(join(work, "README.md"), `# ${repo}\n\n${subject}\n`);
     git(work, ["add", "-A"]);
     git(work, ["commit", "-q", "-m", subject]);
-    git(work, ["push", "-q", bare, "main"]);
+    git(work, ["push", "-q", "origin", "main"]);
     return git(work, ["rev-parse", "HEAD"]);
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    rmSync(seed, { recursive: true, force: true });
   }
 }
 
@@ -189,7 +193,7 @@ describe("mcp server: stock JSON-RPC client over stdio", () => {
     assert.deepEqual(ping.result, {});
   });
 
-  it("tools/list returns exactly the 35 workspace/details/forge tools, each with a description and a strict input schema", async () => {
+  it("tools/list returns exactly the 36 workspace/details/forge tools, each with a description and a strict input schema", async () => {
     const res = await rpc.request("tools/list");
     const tools = res.result.tools;
     assert.deepEqual(
@@ -221,6 +225,7 @@ describe("mcp server: stock JSON-RPC client over stdio", () => {
         "kiln_forge_release_get",
         "kiln_forge_release_update",
         "kiln_forge_releases_list",
+        "kiln_forge_repo_delete",
         "kiln_forge_tags_list",
         "kiln_forge_tree",
         "kiln_repo_details",
@@ -276,7 +281,7 @@ describe("mcp server: stock JSON-RPC client over stdio", () => {
     const details = await rpc.callToolJson("kiln_repo_details", { owner: "auro", repo: "mcp-seed" });
     assert.equal(details.repo, "auro/mcp-seed");
     assert.equal(typeof details.description, "string");
-    assert.equal(details.commitCount, 1);
+    assert.equal(details.commitCount, 2); // seeded initial commit + the MCP seed commit
     assert.equal(details.lastCommit.sha, seedSha);
     assert.equal(details.lastCommit.subject, "mcp seed: initial commit");
   });

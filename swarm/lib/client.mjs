@@ -108,6 +108,15 @@ export class SwarmClient {
     if (!owner || !repo) throw new Error("createRepo: owner and repo are required");
     return this._req("POST", `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
   }
+  /**
+   * Delete a repo outright (DELETE /v1/repos/:owner/:repo). Daemon-side
+   * rule: the owner's account session or the operator only — this
+   * client's operator token qualifies; agent tokens never do.
+   */
+  async deleteRepo({ owner, repo }) {
+    if (!owner || !repo) throw new Error("deleteRepo: owner and repo are required");
+    return this._req("DELETE", `/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+  }
 
   // ---- per-repo memory (refs/kiln/memory; see lib/memory.mjs) ----
   _memBase(owner, repo) {

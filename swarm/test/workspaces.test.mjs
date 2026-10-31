@@ -6,7 +6,7 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -243,7 +243,11 @@ describe("workspaces: aggregated live status", () => {
 
   it("an empty member repo reports head: null, not an error", () => {
     const dir = makeStateDir();
-    createRepo(dir, "auro", "empty-one");
+    // A legacy member with NO commits at all (hosted repos are born
+    // with an initial commit now, so this state is hand-made the old way).
+    const emptyPath = repoPath(dir, "auro", "empty-one");
+    mkdirSync(dirname(emptyPath), { recursive: true });
+    execFileSync("git", ["init", "--bare", "--initial-branch=main", emptyPath], { stdio: "ignore" });
     seedRepo(dir, "auro", "full-one", "full commit");
     const ws = createWorkspace(dir, {
       owner: "auro", slug: "mixed", name: "Mixed",
@@ -576,7 +580,7 @@ describe("workspaces: nesting", () => {
       assert.equal(entry.details.description, "");
       assert.deepEqual(entry.details.topics, []);
       assert.equal(entry.details.defaultBranch, "main");
-      assert.equal(entry.details.commitCount, 1);
+      assert.equal(entry.details.commitCount, 2); // seeded initial commit + the pushed one
       assert.ok(entry.details.lastCommit.sha);
     }
     assert.equal(st.repos[0].details.lastCommit.subject, "one: initial commit");

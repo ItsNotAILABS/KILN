@@ -33,7 +33,12 @@
  *   GET  /v1/compute/apps/:id/logs?tail=N -> {appId, log}
  *   DELETE /v1/compute/apps/:id     -> {ok:true}
  * Git hosting (KILN-native repos, served via git http-backend CGI):
- *   POST /git/:owner/:repo            create repo (auth required)
+ *   POST /git/:owner/:repo            create repo (operator only; the repo
+ *                                     is born with an initial commit on
+ *                                     main, authored by the creator)
+ *   DELETE /v1/repos/:owner/:repo     delete repo outright (the owner's
+ *                                     account session or the operator;
+ *                                     agent tokens can NEVER delete)
  *   GET  /git                         list repos (auth required; account
  *                                     principals see only their namespace)
  *   GET  /git/:owner/:repo/info/refs?service=...   (auth required)
@@ -113,9 +118,11 @@
  *   GET  /v1/repos/:owner/:repo/pulls(?state) · GET/PATCH /pulls/:n
  *   POST /v1/repos/:owner/:repo/pulls/:n/comments {body}
  *   POST /v1/repos/:owner/:repo/pulls/:n/reviews {state, body?}
- *   POST /v1/repos/:owner/:repo/pulls/:n/merge {method?, message?}
- *        (fast-forward or merge-commit; conflicts -> 409; CI enqueued
- *        on the base branch after merge, best-effort like pushes)
+ *   POST /v1/repos/:owner/:repo/pulls/:n/merge {method?, message?,
+ *        deleteBranch?}   (fast-forward or merge-commit; conflicts ->
+ *        409; deleteBranch:true also deletes the head branch after the
+ *        merge, default off; CI enqueued on the base branch after
+ *        merge, best-effort like pushes)
  *   GET  /v1/repos/:owner/:repo/tags
  *   POST /v1/repos/:owner/:repo/releases {tag, name?, notes?, target?}
  *   GET  /v1/repos/:owner/:repo/releases · GET/PATCH/DELETE /releases/:tag
@@ -155,7 +162,7 @@ import { parseCaps, capsToNames, nowSec } from "./grant.mjs";
 import { verifyReceipts } from "./receipts.mjs";
 import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
-import { createRepo, listRepos, repoExists, repoPath, serveGitHttp, validRepoName } from "./git.mjs";
+import { createRepo, deleteRepo, listRepos, repoExists, repoPath, serveGitHttp, validRepoName } from "./git.mjs";
 import { promoteRepo } from "./promote.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
@@ -165,6 +172,7 @@ import {
 import { memorySigningPubkey, signatureSummary } from "./memory-signing.mjs";
 import {
   snapshotRefs, loadRepoConfig, enqueueCiJob, readResult, readLatest, readLog,
+  forgetRepoCiResults,
 } from "./ci.mjs";
 import {
   ComputeError, submitInvocation, getInvocation, waitInvocation,
@@ -190,6 +198,7 @@ import {
   readTree, readContents, writeFile, listCommits, getCommit, compareRefs,
   listTags, listReleases, createRelease, updateRelease, deleteRelease,
   createPull, listPulls, getPull, updatePull, commentPull, reviewPull, mergePull,
+  forgetRepo,
 } from "./forge.mjs";
 import {
   PackagesError, publishPackage, listPackages, getPackage, getPackageVersion,
@@ -585,6 +594,50 @@ export function startApiServer(dir, cfg) {
         return send(res, 404, { error: "not found" });
       }
 
+      // ---- repo delete: DELETE /v1/repos/:owner/:repo ----
+      // Authorization is stricter than every other forge write, so the
+      // matrix lives HERE, ahead of the generic scope guard (whose
+      // allow-list governs surfaces, not this): the repo owner's
+      // account session, or the operator. Agent tokens can NEVER
+      // delete a repo — creation is operator-only by design and
+      // deletion stays at least as strict. A non-owner session gets
+      // 403; anonymous gets 401 (the auth gate answers unauthenticated
+      // requests before this block — a DELETE never mints the
+      // anonymous read principal — and the check below keeps that
+      // true even if the gate's minting rules ever widen).
+      {
+        const m = path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+        if (req.method === "DELETE" && m) {
+          const [, dOwner, dRepo] = m;
+          if (principal.kind === "anonymous") return unauthorized(res);
+          if (principal.kind === "agent") {
+            return send(res, 403, { error: "agent tokens cannot delete repos — deletion requires the repo owner's account session or the operator token" });
+          }
+          if (principal.kind !== "operator" && principal.account?.owner !== dOwner) {
+            return send(res, 403, { error: `account principals may delete only repos under their own owner namespace ("${principal.account?.owner}")` });
+          }
+          if (!validRepoName(dOwner) || !validRepoName(dRepo)) {
+            return send(res, 400, { error: `invalid owner/repo name: ${dOwner}/${dRepo}` });
+          }
+          if (!repoExists(dir, dOwner, dRepo)) {
+            return send(res, 404, { error: `no such repo: ${dOwner}/${dRepo}` });
+          }
+          const retry = writeRateLimited(principal);
+          if (retry) return send(res, 429, { error: "forge write rate limit (120/min per principal) — slow down" }, { "retry-after": String(retry) });
+          // Complete removal: forge registry records + stored CI
+          // results go with the bare dir (which itself carries the
+          // kiln.json details and the memory chain). Workspace/site
+          // registries keep their member refs by the codebase's own
+          // pattern — their status views render a missing repo as
+          // exists:false, and membership is the owner's explicit edit.
+          const removed = forgetRepo(dir, dOwner, dRepo);
+          forgetRepoCiResults(dir, dOwner, dRepo);
+          deleteRepo(dir, dOwner, dRepo);
+          appendAudit(dir, actorOf(principal), "repo.delete", `${dOwner}/${dRepo}`, removed);
+          return send(res, 200, { ok: true, owner: dOwner, repo: dRepo, deleted: true });
+        }
+      }
+
       // ---- account/agent scope guard ----
       // Non-operator principals may reach only: discovery, workspaces,
       // repo project-details, and their own account routes (handled
@@ -778,12 +831,18 @@ export function startApiServer(dir, cfg) {
         const m = path.match(/^\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "POST" && m) {
           try {
-            const r = createRepo(dir, m[1], m[2]);
+            // The initial commit is authored by the creating principal
+            // (in practice the operator — creation is operator-only
+            // under the scope guard; the actor plumbing keeps the
+            // authorship truthful if that ever widens).
+            const actor = actorOf(principal);
+            const r = createRepo(dir, m[1], m[2], { author: { name: actor.name, email: actor.email } });
             return send(res, 201, {
               ok: true,
               owner: r.owner,
               repo: r.repo,
               cloneUrl: `http://127.0.0.1:${apiPort}/git/${r.owner}/${r.repo}`,
+              initialCommit: r.initialCommit,
             });
           } catch (e) {
             if (e.code === "EXISTS") return send(res, 409, { error: e.message });
@@ -1337,7 +1396,7 @@ export function startApiServer(dir, cfg) {
                 }
                 if (req.method === "POST" && sub === "merge") {
                   const b = await readBody(req);
-                  const r = mergePull(dir, fOwner, fRepo, actor, n, { method: b.method, message: b.message });
+                  const r = mergePull(dir, fOwner, fRepo, actor, n, { method: b.method, message: b.message, deleteBranch: b.deleteBranch === true });
                   return send(res, 200, { ok: true, ...r });
                 }
               }
