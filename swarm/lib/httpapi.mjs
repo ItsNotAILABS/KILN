@@ -1227,10 +1227,15 @@ export function startApiServer(dir, cfg) {
                 appendAudit(dir, actor, "branch.create", `${fOwner}/${fRepo}:${b.name}`, {});
                 return send(res, 201, { ok: true, branch: br });
               }
-              const bm = (rest || "").match(/^\/([A-Za-z0-9._/-]+)$/);
+              // The name arrives percent-encoded from the kit SDK/CLI
+              // (encodeURIComponent turns "fix/x" into "fix%2Fx"), so the
+              // pattern must admit "%" — without it every slash-named
+              // branch delete fell through to the router's 404.
+              const bm = (rest || "").match(/^\/([A-Za-z0-9._%/-]+)$/);
               if (req.method === "DELETE" && bm) {
-                const r = deleteBranch(gd(), decodeURIComponent(bm[1]));
-                appendAudit(dir, actor, "branch.delete", `${fOwner}/${fRepo}:${bm[1]}`, {});
+                const branchName = decodeURIComponent(bm[1]);
+                const r = deleteBranch(gd(), branchName);
+                appendAudit(dir, actor, "branch.delete", `${fOwner}/${fRepo}:${branchName}`, {});
                 return send(res, 200, r);
               }
             }

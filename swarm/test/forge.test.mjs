@@ -190,6 +190,69 @@ describe("forge: public repo visibility", () => {
   let api;
   after(() => { try { api?.server?.close(); } catch { /* already closed */ } });
 
+  it("deletes branches through the percent-encoded route (the SDK/CLI form)", async () => {
+    const dir = makeStateDir();
+    process.env.KILN_SWARM_API_PORT = "0";
+    try {
+      api = await startApiServer(dir, { apiPort: 0 });
+    } finally {
+      delete process.env.KILN_SWARM_API_PORT;
+    }
+    const base = api.url;
+    const op = loadApiToken(dir);
+    const call = async (method, path, body, bearer) => {
+      const res = await fetch(base + path, {
+        method,
+        headers: {
+          ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* raw response */ }
+      return { status: res.status, text, data };
+    };
+
+    assert.equal((await call("POST", "/git/auro/bd", undefined, op)).status, 201);
+    const w = await call("PUT", "/v1/repos/auro/bd/contents", { path: "README.md", content: "# BD\n", message: "seed" }, op);
+    assert.equal(w.status, 201, w.text);
+
+    // Slash-named branch, deleted the way the kit SDK/CLI send it:
+    // DELETE .../branches/<encodeURIComponent(name)> — the %2F form.
+    // Regression: the route's name pattern excluded "%", so the encoded
+    // name never matched and the request fell through to a bare 404.
+    assert.equal((await call("POST", "/v1/repos/auro/bd/branches", { name: "fix/slash-name" }, op)).status, 201);
+    const del = await call("DELETE", `/v1/repos/auro/bd/branches/${encodeURIComponent("fix/slash-name")}`, undefined, op);
+    assert.equal(del.status, 200, del.text);
+    assert.equal(del.data.name, "fix/slash-name");
+    const names = (await call("GET", "/v1/repos/auro/bd/branches", undefined, op)).data.branches.map((b) => b.name);
+    assert.ok(!names.includes("fix/slash-name"), names.join(","));
+    assert.ok(names.includes("main"), names.join(","));
+
+    // The raw-slash form keeps working, and a plain name deletes both ways.
+    assert.equal((await call("POST", "/v1/repos/auro/bd/branches", { name: "fix/raw-slash" }, op)).status, 201);
+    assert.equal((await call("DELETE", "/v1/repos/auro/bd/branches/fix/raw-slash", undefined, op)).status, 200);
+    assert.equal((await call("POST", "/v1/repos/auro/bd/branches", { name: "plain-name" }, op)).status, 201);
+    assert.equal((await call("DELETE", "/v1/repos/auro/bd/branches/plain-name", undefined, op)).status, 200);
+
+    // Guards still hold through the encoded route: the default branch is
+    // refused, and a missing branch 404s with the forge's own message
+    // (proof the request now reaches deleteBranch, not the router).
+    assert.equal((await call("DELETE", `/v1/repos/auro/bd/branches/${encodeURIComponent("main")}`, undefined, op)).status, 400);
+    const missing = await call("DELETE", `/v1/repos/auro/bd/branches/${encodeURIComponent("fix/not-there")}`, undefined, op);
+    assert.equal(missing.status, 404);
+    assert.match(missing.data.error, /no such branch/);
+
+    // Harness hygiene: the shared `after` closes only the LAST test's
+    // server, and this suite tolerates exactly one leaked server (the
+    // first test's). A middle test must close its own, or the file's
+    // process never exits even with every test green.
+    api.server.closeAllConnections?.();
+    api.server.close();
+  });
+
   it("public repos open every forge GET to anyone; writes stay owner-only", async () => {
     const dir = makeStateDir();
     process.env.KILN_SWARM_API_PORT = "0";
@@ -296,4 +359,5 @@ describe("forge: public repo visibility", () => {
     assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md")).status, 401);
     assert.equal((await call("GET", "/v1/repos/pubowner/pub/contents?path=README.md", undefined, guestSess)).status, 403);
   });
+
 });
