@@ -33,9 +33,15 @@ contract KilnOwnershipRegistry {
         address parent;
     }
 
+    struct LicenseGrant {
+        uint256 permissions;
+        /// @notice 0 means the grant does not expire.
+        uint64 expiresAt;
+    }
+
     mapping(bytes32 => Project) private projects;
     mapping(bytes32 => mapping(address => AgentGrant)) private agentGrants;
-    mapping(bytes32 => mapping(address => uint256)) private licensePermissions;
+    mapping(bytes32 => mapping(address => LicenseGrant)) private licenseGrants;
     /// @notice Per (project, parent agent): the child agents it delegated to.
     mapping(bytes32 => mapping(address => address[])) private delegationChildren;
 
@@ -55,7 +61,8 @@ contract KilnOwnershipRegistry {
 
     event ProjectRegistered(bytes32 indexed projectId, address indexed owner, string repositoryUri, bytes32 indexed licenseId, uint64 timestamp);
     event CommitAnchored(bytes32 indexed projectId, address indexed actor, bytes32 indexed gitCommit, bytes32 treeDigest, bytes32 metadataDigest, uint64 timestamp);
-    event LicenseGranted(bytes32 indexed projectId, address indexed grantee, uint256 permissions, uint64 timestamp);
+    event LicenseGranted(bytes32 indexed projectId, address indexed grantee, uint256 permissions, uint64 expiresAt, uint64 timestamp);
+    event LicenseRevoked(bytes32 indexed projectId, address indexed grantee, uint64 timestamp);
     event AgentAuthorized(bytes32 indexed projectId, address indexed agent, uint256 capabilities, uint64 expiresAt, uint64 authorizationEpoch);
     event AgentDelegated(bytes32 indexed projectId, address indexed parentAgent, address indexed childAgent, uint256 capabilities, uint64 expiresAt);
     event AgentAuthorizationRevoked(bytes32 indexed projectId, address indexed agent);
@@ -104,10 +111,25 @@ contract KilnOwnershipRegistry {
         emit CommitAnchored(projectId, msg.sender, gitCommit, treeDigest, metadataDigest, uint64(block.timestamp));
     }
 
-    function grantLicense(bytes32 projectId, address grantee, uint256 permissions) external projectOwner(projectId) {
+    /// @notice Grant (or replace) a license. `expiresAt` of 0 means the grant
+    /// does not expire; a non-zero expiry must be in the future.
+    function grantLicense(bytes32 projectId, address grantee, uint256 permissions, uint64 expiresAt)
+        external
+        projectOwner(projectId)
+    {
         if (grantee == address(0)) revert InvalidOwner();
-        licensePermissions[projectId][grantee] = permissions;
-        emit LicenseGranted(projectId, grantee, permissions, uint64(block.timestamp));
+        if (expiresAt != 0 && expiresAt <= block.timestamp) revert GrantExpired();
+        licenseGrants[projectId][grantee] = LicenseGrant({permissions: permissions, expiresAt: expiresAt});
+        emit LicenseGranted(projectId, grantee, permissions, expiresAt, uint64(block.timestamp));
+    }
+
+    /// @notice Revoke a license grant immediately. Revoking a grant that does
+    /// not exist (or has already been revoked) is a no-op with no event.
+    function revokeLicense(bytes32 projectId, address grantee) external projectOwner(projectId) {
+        LicenseGrant storage grant = licenseGrants[projectId][grantee];
+        if (grant.permissions == 0 && grant.expiresAt == 0) return; // nothing granted here
+        delete licenseGrants[projectId][grantee];
+        emit LicenseRevoked(projectId, grantee, uint64(block.timestamp));
     }
 
     function authorizeAgent(bytes32 projectId, address agent, uint256 capabilities, uint64 expiresAt) external projectOwner(projectId) {
@@ -231,7 +253,15 @@ contract KilnOwnershipRegistry {
         return agentGrants[projectId][agent];
     }
 
+    /// @notice The permissions currently in force: zero once the grant has
+    /// been revoked or has passed its expiry.
     function getLicensePermissions(bytes32 projectId, address grantee) external view returns (uint256) {
-        return licensePermissions[projectId][grantee];
+        LicenseGrant memory grant = licenseGrants[projectId][grantee];
+        if (grant.expiresAt != 0 && grant.expiresAt <= block.timestamp) return 0;
+        return grant.permissions;
+    }
+
+    function getLicenseGrant(bytes32 projectId, address grantee) external view returns (LicenseGrant memory) {
+        return licenseGrants[projectId][grantee];
     }
 }
