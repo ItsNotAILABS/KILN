@@ -31,6 +31,9 @@ import {
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { writeFileAtomicSync } from "./state.mjs";
+import {
+  decryptEmail, emailHmac, makeEmailBinding, maskEmail, normalizeEmail,
+} from "./emailcrypto.mjs";
 
 export class AccountsError extends Error {
   constructor(status, message) {
@@ -95,10 +98,23 @@ function verifyPassword(password, stored) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-/** The account shape that may leave the daemon. Never the hash. */
+/**
+ * The account shape that may leave the daemon. Never the hash — and,
+ * once an email is bound, never the address itself: `email` carries
+ * the masked form ("a•••@example.com") and `emailBound` says a
+ * binding exists (see the encrypted email binding section below).
+ * A legacy record that still carries a plaintext address (pre-binding
+ * era) reports it until its first login or bind migrates it — the
+ * migration paths are login() and bindAccountEmail().
+ */
 export function accountPublic(a) {
+  const binding = a.emailBinding || null;
   return {
-    id: a.id, email: a.email, name: a.name, owner: a.owner, createdAt: a.createdAt,
+    id: a.id,
+    email: binding ? binding.emailMasked : (a.email ?? null),
+    emailBound: !!binding,
+    emailMasked: binding ? binding.emailMasked : (a.email ? maskEmail(a.email) : null),
+    name: a.name, owner: a.owner, createdAt: a.createdAt,
   };
 }
 
@@ -135,9 +151,14 @@ export function createAccount(dir, { email, name, owner, password } = {}) {
     throw new AccountsError(400, "password must be at least 10 characters");
   }
   const store = loadStore(dir);
-  const emailLc = email.toLowerCase();
+  const emailKey = emailHmac(dir, email);
+  const emailNorm = normalizeEmail(email);
   for (const a of Object.values(store.accounts)) {
-    if (a.email.toLowerCase() === emailLc) {
+    // Uniqueness by lookup tag (bound accounts) or normalized compare
+    // (legacy plaintext records) — the address itself is never stored
+    // for a new account, so there is nothing plaintext to compare.
+    if (a.emailBinding?.emailHmac === emailKey ||
+        (typeof a.email === "string" && normalizeEmail(a.email) === emailNorm)) {
       throw new AccountsError(409, "an account with this email already exists");
     }
     if (a.owner === owner) {
@@ -146,10 +167,14 @@ export function createAccount(dir, { email, name, owner, password } = {}) {
   }
   const account = {
     id: newId("acct"),
-    email,
     name: name.trim(),
     owner,
     passwordHash: hashPassword(password),
+    // The signup address goes through the same encrypted binding path
+    // as every email on the forge (lib/emailcrypto.mjs): at rest there
+    // is only AES-256-GCM ciphertext + an HMAC lookup tag + the masked
+    // form. Login matches by HMAC — nothing is decrypted to find it.
+    emailBinding: { ...makeEmailBinding(dir, email), boundAt: new Date().toISOString() },
     createdAt: new Date().toISOString(),
   };
   store.accounts[account.id] = account;
@@ -160,11 +185,27 @@ export function createAccount(dir, { email, name, owner, password } = {}) {
 /** Verify credentials; on success mint a session and return its raw token (once). */
 export function login(dir, { email, password } = {}) {
   const store = loadStore(dir);
-  const emailLc = typeof email === "string" ? email.toLowerCase() : "";
-  const account = Object.values(store.accounts).find((a) => a.email.toLowerCase() === emailLc);
+  const emailKey = typeof email === "string" ? emailHmac(dir, email) : null;
+  const emailNorm = normalizeEmail(email);
+  let account = emailKey
+    ? Object.values(store.accounts).find((a) => a.emailBinding?.emailHmac === emailKey)
+    : undefined;
+  if (!account && emailNorm) {
+    // Legacy records (pre-binding era) still carry a plaintext
+    // address — they match here, once, and migrate below.
+    account = Object.values(store.accounts).find(
+      (a) => typeof a.email === "string" && normalizeEmail(a.email) === emailNorm);
+  }
   // One error for every failure mode — never reveal which part failed.
   if (!account || typeof password !== "string" || !verifyPassword(password, account.passwordHash)) {
     throw new AccountsError(401, "invalid email or password");
+  }
+  if (typeof account.email === "string" && !account.emailBinding) {
+    // Migrate on the first successful login: the plaintext address
+    // becomes an encrypted binding and the plaintext is deleted, in
+    // the same store write that mints the session below.
+    account.emailBinding = { ...makeEmailBinding(dir, account.email), boundAt: new Date().toISOString() };
+    delete account.email;
   }
   const token = `kiln_sess_${randomBytes(24).toString("hex")}`;
   const now = Date.now();
@@ -231,6 +272,19 @@ export function revokeAgent(dir, accountId, agentId) {
 }
 
 /**
+ * The in-memory account copy a principal carries: for a bound
+ * account, the decrypted address rides along as `.email` for
+ * INTERNAL consumers (the forge's commit authorship). It is never
+ * persisted (this store instance is discarded) and never serialized:
+ * accountPublic() masks whenever a binding exists.
+ */
+function withPlainEmail(dir, account) {
+  if (!account || typeof account.email === "string" || !account.emailBinding) return account;
+  const plain = decryptEmail(dir, account.emailBinding.emailEnc);
+  return plain ? { ...account, email: plain } : account;
+}
+
+/**
  * Resolve a bearer token to a principal:
  *   { kind: "session", account } | { kind: "agent", account, agent } | null
  * The operator token is NOT resolved here — httpapi checks it first.
@@ -243,16 +297,99 @@ export function resolveAccountToken(dir, bearer) {
     if (!s) return null;
     if (Date.parse(s.expiresAt) <= Date.now()) return null;
     const account = store.accounts[s.accountId];
-    return account ? { kind: "session", account } : null;
+    return account ? { kind: "session", account: withPlainEmail(dir, account) } : null;
   }
   if (bearer.startsWith("kiln_agt_")) {
     const hash = sha256hex(bearer);
     const agent = Object.values(store.agents).find((g) => g.tokenHash === hash);
     if (!agent || agent.revoked) return null;
     const account = store.accounts[agent.accountId];
-    return account ? { kind: "agent", account, agent } : null;
+    return account ? { kind: "agent", account: withPlainEmail(dir, account), agent } : null;
   }
   return null;
+}
+
+// ------------------------------------------------------- encrypted email binding
+//
+// The architect's order (2026-10-31): an account can be tied to its
+// email "for business users if they want more — but encrypt my email
+// and stuff". The binding is the ONLY storage an address gets
+// (lib/emailcrypto.mjs): AES-256-GCM ciphertext + HMAC lookup tag +
+// masked form, on the account record as `emailBinding`. Signup runs
+// through this same path (createAccount above), PUT
+// /v1/accounts/me/email rebinds, and workspace invites bind on accept
+// (acceptInviteBinding). Matching is always by HMAC — login included
+// — so no flow ever decrypts to FIND an account, and no endpoint
+// returns the full address once a binding exists (accountPublic
+// masks). A legacy plaintext `email` field (pre-binding accounts) is
+// deleted the moment a binding lands or a login migrates it.
+
+/** The account's stored email binding ({emailHmac, emailEnc, emailMasked, boundAt}) or null. */
+export function getEmailBinding(dir, accountId) {
+  const store = loadStore(dir);
+  return store.accounts[accountId]?.emailBinding || null;
+}
+
+/**
+ * Bind (or rebind) an account's email — session act, route-gated.
+ * One address ties to exactly ONE account: a different account
+ * holding it (bound, or legacy-plaintext) answers 409. Returns
+ * { account (public shape), bindingChanged } — the mailer welcomes
+ * only on a change, so re-saving the same address stays quiet.
+ */
+export function bindAccountEmail(dir, accountId, email) {
+  if (typeof email !== "string" || !EMAIL_RE.test(email.trim())) {
+    throw new AccountsError(400, "email must be a valid email address");
+  }
+  const store = loadStore(dir);
+  const account = store.accounts[accountId];
+  if (!account) throw new AccountsError(404, "no such account");
+  const key = emailHmac(dir, email);
+  for (const a of Object.values(store.accounts)) {
+    if (a.id === accountId) continue;
+    if (a.emailBinding?.emailHmac === key ||
+        (typeof a.email === "string" && emailHmac(dir, a.email) === key)) {
+      throw new AccountsError(409, "this email is already tied to another account");
+    }
+  }
+  const bindingChanged = account.emailBinding?.emailHmac !== key;
+  account.emailBinding = { ...makeEmailBinding(dir, email), boundAt: new Date().toISOString() };
+  delete account.email; // a legacy plaintext address is replaced, never kept alongside
+  saveStore(dir, store);
+  return { account: accountPublic(account), bindingChanged };
+}
+
+/**
+ * The invite-accept half of binding (lib/invites.mjs): the invite's
+ * encrypted binding is ADOPTED by the accepting account — copied, not
+ * decrypted. Rules: an account already bound to a DIFFERENT address
+ * is refused (409 — an invite never silently re-ties an account); a
+ * legacy plaintext address must hash to the invite's tag or the same
+ * 409 answers; no email at all → adopt. Returns { account (raw
+ * record), bindingChanged }.
+ */
+export function acceptInviteBinding(dir, accountId, invite) {
+  const store = loadStore(dir);
+  const account = store.accounts[accountId];
+  if (!account) throw new AccountsError(404, "no such account");
+  if (account.emailBinding) {
+    if (account.emailBinding.emailHmac !== invite.emailHmac) {
+      throw new AccountsError(409, "this invite was issued to a different email than the one tied to your account — sign in with the invited address, or ask for a new invite to your address");
+    }
+    return { account, bindingChanged: false };
+  }
+  if (typeof account.email === "string" && emailHmac(dir, account.email) !== invite.emailHmac) {
+    throw new AccountsError(409, "this invite was issued to a different email than the one tied to your account — sign in with the invited address, or ask for a new invite to your address");
+  }
+  account.emailBinding = {
+    emailHmac: invite.emailHmac,
+    emailEnc: invite.emailEnc,
+    emailMasked: invite.emailMasked,
+    boundAt: new Date().toISOString(),
+  };
+  delete account.email;
+  saveStore(dir, store);
+  return { account, bindingChanged: true };
 }
 
 // ------------------------------------------------------- wallet identity binding
