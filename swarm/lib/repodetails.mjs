@@ -245,6 +245,77 @@ function validVisibility(visibility) {
   return visibility;
 }
 
+// ---------------------------------------------------------------- pages setting
+
+const PAGES_BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+const PAGES_PATH_MAX = 256;
+
+/**
+ * The repo's KILN Pages source designation, normalized from kiln.json.
+ * Stored shape: pages: { enabled, branch, path } — branch "" = the
+ * repo's default branch, path "" = the branch root. Anything malformed
+ * in the store reads as the disabled default: the failure mode is
+ * "no site", never "the wrong site".
+ */
+export function metaPages(meta) {
+  const p = meta && typeof meta.pages === "object" && meta.pages !== null ? meta.pages : {};
+  return {
+    enabled: p.enabled === true,
+    branch: typeof p.branch === "string" ? p.branch : "",
+    path: typeof p.path === "string" ? p.path.replace(/^\/+|\/+$/g, "") : "",
+  };
+}
+
+/** The repo's stored pages designation (disabled default for unknown repos). */
+export function repoPages(dir, owner, repo) {
+  if (!validRepoName(owner) || !validRepoName(repo) || !repoExists(dir, owner, repo)) {
+    return { enabled: false, branch: "", path: "" };
+  }
+  return metaPages(readKilnMeta(repoPath(dir, owner, repo)));
+}
+
+function validPagesPath(path) {
+  if (typeof path !== "string" || path.length > PAGES_PATH_MAX) {
+    throw new RepoDetailsError(400, `pages.path must be a string of at most ${PAGES_PATH_MAX} chars`);
+  }
+  const clean = path.replace(/^\/+|\/+$/g, "");
+  if (clean === "") return "";
+  // A directory inside the repo: relative segments only — no "..", no
+  // ".", no backslashes, no empty segments. The pages server joins this
+  // onto git object lookups, never the filesystem, but the stored value
+  // is held to the same discipline as forge paths regardless.
+  if (clean.includes("\\") || clean.split("/").some((s) => s === "" || s === "." || s === "..")) {
+    throw new RepoDetailsError(400, `pages.path must be a clean relative directory (no "..", ".", or empty segments)`);
+  }
+  return clean;
+}
+
+function validPagesBranch(branch) {
+  if (typeof branch !== "string" ||
+      (branch !== "" && (!PAGES_BRANCH_RE.test(branch) || branch.includes("..") ||
+        branch.endsWith("/") || branch.endsWith(".lock")))) {
+    throw new RepoDetailsError(400, `pages.branch must be "" (the default branch) or a valid branch name`);
+  }
+  return branch;
+}
+
+/** Validate a partial pages patch and merge it over the current setting. */
+function validPages(pages, current) {
+  if (!pages || typeof pages !== "object" || Array.isArray(pages)) {
+    throw new RepoDetailsError(400, `pages must be an object {enabled?, branch?, path?}`);
+  }
+  const next = { ...current };
+  if (pages.enabled !== undefined) {
+    if (typeof pages.enabled !== "boolean") {
+      throw new RepoDetailsError(400, `pages.enabled must be a boolean`);
+    }
+    next.enabled = pages.enabled;
+  }
+  if (pages.branch !== undefined) next.branch = validPagesBranch(pages.branch);
+  if (pages.path !== undefined) next.path = validPagesPath(pages.path);
+  return next;
+}
+
 /**
  * The repo's stored visibility ("public" | "private"). Unknown repos and
  * unreadable metadata read "private": gates consult this on every public
@@ -332,6 +403,7 @@ export function repoDetails(dir, owner, repo) {
     description: metaDescription(meta),
     topics: metaTopics(meta),
     visibility: metaVisibility(meta),
+    pages: metaPages(meta),
     empty: !head,
     defaultBranch: defaultBranch(gd),
     commitCount: commitCount(gd, head),
@@ -368,6 +440,7 @@ export function updateRepoDetails(dir, owner, repo, patch = {}) {
   if (patch.description !== undefined) next.description = validDescription(patch.description);
   if (patch.topics !== undefined) next.topics = validTopics(patch.topics);
   if (patch.visibility !== undefined) next.visibility = validVisibility(patch.visibility);
+  if (patch.pages !== undefined) next.pages = validPages(patch.pages, metaPages(meta));
   writeFileAtomicSync(kilnJsonPath(gd), JSON.stringify(next, null, 2) + "\n");
   return repoDetails(dir, owner, repo);
 }

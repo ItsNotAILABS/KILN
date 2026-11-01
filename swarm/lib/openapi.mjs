@@ -165,6 +165,17 @@ const WORKSPACE_STATUS_SCHEMA = {
   required: ["workspace", "repos", "sites", "memory", "parent", "children", "rollup"],
 };
 
+const PAGES_SETTING_SCHEMA = {
+  type: "object",
+  description: "KILN Pages source designation: when enabled, GET|HEAD /pages/:owner/:repo/[...path] serves files live from this branch + directory of the repo (index.html at directory paths, real 404s, no build step — a push is the republish). branch \"\" = the repo's default branch; path \"\" = the branch root. Visibility law applies unchanged: a public repo's site is readable by anyone, a private repo's only by its owner namespace + the operator.",
+  properties: {
+    enabled: { type: "boolean" },
+    branch: { type: "string", maxLength: 128 },
+    path: { type: "string", maxLength: 256 },
+  },
+  required: ["enabled", "branch", "path"],
+};
+
 const REPO_DETAILS_SCHEMA = {
   type: "object",
   properties: {
@@ -181,6 +192,7 @@ const REPO_DETAILS_SCHEMA = {
       type: "string", enum: ["private", "public"],
       description: "Owner-chosen read visibility (GitHub-shaped): \"private\" (the default) = accounts-only reads; \"public\" = anyone, including anonymous readers, may read (list, clone/fetch, details, forge GETs). Writes stay owner/operator-only either way.",
     },
+    pages: PAGES_SETTING_SCHEMA,
     empty: { type: "boolean" },
     defaultBranch: { type: ["string", "null"] },
     commitCount: { type: "integer", minimum: 0 },
@@ -290,7 +302,7 @@ export function buildCapabilities() {
       },
       {
         id: "project-details",
-        title: "Project details — live per-repo facts (history, languages, README) plus editable description/topics/visibility",
+        title: "Project details — live per-repo facts (history, languages, README) plus editable description/topics/visibility and the repo's KILN Pages source designation (pages {enabled, branch, path})",
         endpoints: [
           "GET /v1/repos/:owner/:repo/details",
           "PATCH /v1/repos/:owner/:repo/details",
@@ -339,7 +351,7 @@ export function buildCapabilities() {
       },
       {
         id: "forge",
-        title: "Forge — the GitHub-shaped repo surface: branches, tree/contents (files written as real git commits by the acting principal — no local clone needed), commit history, compare/diff, pull requests (open, comment, review, merge: fast-forward or merge-commit, optional deleteBranch on merge, CI enqueued on the base), tags and releases with markdown notes. Repos are created canonically at POST /v1/repos (owners under their own namespace; the legacy POST /git/:owner/:repo stays operator-only) and are born with an initial commit on main (authored by the creator), so branch → PR → merge works immediately — no client-side seed commit. A repo can be deleted outright (DELETE /v1/repos/:owner/:repo) by its owner's account session or the operator only — agent tokens can never delete. Account/agent principals are walled to their own owner namespace; agents need the \"forge\" scope. Every mutation lands in the forge audit log",
+        title: "Forge — the GitHub-shaped repo surface: branches, tree/contents (files written as real git commits by the acting principal — no local clone needed), commit history, compare/diff, pull requests (open, comment, review, merge: fast-forward or merge-commit, optional deleteBranch on merge, CI enqueued on the base), tags and releases with markdown notes. Repos are created canonically at POST /v1/repos (owners under their own namespace; the legacy POST /git/:owner/:repo stays operator-only) and are born with an initial commit on main (authored by the creator), so branch → PR → merge works immediately — no client-side seed commit. A repo can be deleted outright (DELETE /v1/repos/:owner/:repo) by its owner's account session or the operator only — agent tokens can never delete. Account/agent principals are walled to their own owner namespace; agents need the \"forge\" scope. Every mutation lands in the forge audit log. KILN Pages: a repo that designates a pages source in its details is served live from that ref at GET|HEAD /pages/:owner/:repo/* (index.html at directory paths, real 404s, a push is the republish) under the same visibility law as every other read",
         endpoints: [
           "POST /v1/repos",
           "DELETE /v1/repos/:owner/:repo",
@@ -1296,7 +1308,7 @@ export function buildOpenApiDocument() {
         },
         patch: {
           operationId: "updateRepoDetails",
-          summary: "Edit description/topics/visibility (persisted in the repo's kiln.json, unknown fields preserved)",
+          summary: "Edit description/topics/visibility/pages (persisted in the repo's kiln.json, unknown fields preserved)",
           requestBody: {
             required: true,
             content: {
@@ -1310,6 +1322,15 @@ export function buildOpenApiDocument() {
                       items: { type: "string", pattern: "^[a-z0-9][a-z0-9-]{0,31}$" },
                     },
                     visibility: { type: "string", enum: ["private", "public"] },
+                    pages: {
+                      type: "object",
+                      description: "Partial KILN Pages designation, merged over the current setting (see RepoDetails.pages for the serving semantics)",
+                      properties: {
+                        enabled: { type: "boolean" },
+                        branch: { type: "string", maxLength: 128 },
+                        path: { type: "string", maxLength: 256 },
+                      },
+                    },
                   },
                 },
               },

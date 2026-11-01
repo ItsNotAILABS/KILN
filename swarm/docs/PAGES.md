@@ -7,6 +7,61 @@ and the smallest build order that closes it. (Discovery listing —
 capabilities + OpenAPI — was fixed ahead of this document in the
 2026-10-31 discovery round; everything below is the remaining work.)
 
+## Status — 2026-10-31 (pages lane, branch `kiln-pages`)
+
+**Real now (in code, suite-proven; activates at the next Doctor boot
+after the merge train lands this branch):**
+
+- **Build-order step 1 — DONE.** Repo details carry
+  `pages: {enabled, branch, path}` (kiln.json; `""` branch = default
+  branch, `""` path = branch root). PATCH is owner/operator-gated
+  exactly like visibility; validation is strict (branch shape, clean
+  relative directory); a malformed stored value reads as DISABLED —
+  the failure mode is "no site", never "the wrong site". OpenAPI +
+  capabilities document it; the drift test covers it.
+- **Step 2 — DONE.** `GET|HEAD /pages/:owner/:repo/[...path]`
+  (lib/pages.mjs) serves blobs from the designated ref via git
+  plumbing — never a checkout, never the filesystem. Index.html at
+  directory paths, 301 to the slash form, real 404s (no SPA
+  fallback), a 28-type content-type table, `x-kiln-pages-sha` +
+  `x-kiln-pages-path` provenance headers, `cache-control: no-cache`.
+- **Step 3 — DONE by construction.** Serving reads the CURRENT ref
+  on every request: a push is the republish (test-proven — a new
+  commit changes the served bytes and the sha header).
+- **Step 6 (the setting half) — DONE.** The pages setting rides the
+  details PATCH, which account sessions (owner namespace) and
+  forge-scoped agents already reach; the pages READ route likewise
+  admits owner-namespace accounts and forge-scoped agents.
+- **Visibility law — unchanged and test-proven.** Public repo →
+  anyone incl. anonymous; private → owner namespace + operator
+  (anonymous 401, non-owner account 403). Path traversal is
+  impossible by construction (per-segment percent-decode + reject)
+  and probed with raw request paths in swarm/test/pages.test.mjs.
+
+**Staged (built, not yet live — the running daemon predates this
+code):**
+
+- The first paper (auro/marketplace-paper, `/site` on main) gets its
+  designation the moment the merged daemon boots:
+  `PATCH /v1/repos/auro/marketplace-paper/details {pages:{enabled:true, branch:"", path:"site"}}`
+  (owner session or operator). Its site already renders correctly on
+  phones (375px gate, PR #5) so it is ready to be KILN-served as-is.
+- Public exposure wiring (step 5's v1 shape): canonical URL
+  `https://kiln.pocketnova.app/papers/<repo>/` served by routing, in
+  kiln-workspace's origin (scripts/serve-original.mjs), the prefix
+  `/papers/<repo>/` → the daemon's `/pages/auro/<repo>/` on
+  127.0.0.1:18787 (the same loopback door /api/kiln already rides;
+  the daemon stays loopback-only, the origin stays the public door).
+  That edit lives in the app tree and lands with the app lanes; until
+  both it and the daemon activation land, the paper's Cloudflare
+  Pages deployment remains the serving copy of record and the repo
+  remains the source of truth.
+
+**Remaining from the build order:** step 4 (site record fits a
+frontend-only pages site), step 5 proper (preview-relay slugs for
+pages, per-repo), step 6's sites half (owner-managed /v1/sites),
+step 7 (build step, custom domains, MCP/CLI parity for /pages).
+
 ## What "GitHub Pages" means, decomposed
 
 1. A repo (or a branch/folder in it) is designated the site's source.

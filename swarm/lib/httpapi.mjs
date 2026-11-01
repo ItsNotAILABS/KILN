@@ -115,10 +115,20 @@
  * Project details (live per-repo facts + editable metadata):
  *   GET  /v1/repos/:owner/:repo/details -> project details object
  *   PATCH /v1/repos/:owner/:repo/details {description?, topics?,
- *                                    visibility?: "public"|"private"}
+ *                                    visibility?: "public"|"private",
+ *                                    pages?: {enabled?, branch?, path?}}
  *                                    -> {ok, details}   (owner/operator
  *                                    only; visibility defaults "private";
  *                                    "public" opens READS to anyone)
+ * KILN Pages (lib/pages.mjs — static serving of the repo's designated
+ * pages source, live from the ref; a push IS the republish):
+ *   GET|HEAD /pages/:owner/:repo/[...path] -> the file at path under
+ *                                    the details' pages {branch, path}
+ *                                    (index.html at directory paths,
+ *                                    301 to the slash form, real 404s;
+ *                                    visibility law unchanged: public
+ *                                    repo → anyone, private → owner/
+ *                                    operator only)
  * Forge (the GitHub-shaped repo surface, lib/forge.mjs; operator = root,
  * account/agent principals walled to their own namespace, agents need
  * the "forge" scope; every write authenticated, audited, rate-limited):
@@ -257,6 +267,7 @@ import {
 import {
   RepoDetailsError, repoDetails, updateRepoDetails, repoVisibility,
 } from "./repodetails.mjs";
+import { PagesError, planPage } from "./pages.mjs";
 import {
   ForgeError, actorOf, appendAudit, listBranches, createBranch, deleteBranch,
   readTree, readContents, writeFile, listCommits, getCommit, compareRefs,
@@ -589,7 +600,9 @@ export function startApiServer(dir, cfg) {
           (req.method === "GET" &&
             path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/details$/)) ||
           (req.method === "GET" &&
-            path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/));
+            path.match(/^\/v1\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/)) ||
+          ((req.method === "GET" || req.method === "HEAD") &&
+            path.match(/^\/pages\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(\/.*)?$/));
         if (gitList || gitRead ||
             (pubMatch && repoVisibility(dir, pubMatch[1], pubMatch[2]) === "public")) {
           principal = { kind: "anonymous" };
@@ -879,26 +892,29 @@ export function startApiServer(dir, cfg) {
         // Anything else they touch still answers 401, exactly as
         // unauthenticated requests always have.
         if (principal.kind === "anonymous") {
-          const anonRead = req.method === "GET" && (
+          const anonRead = (req.method === "GET" && (
             /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path) ||
-            /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path));
+            /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path))) ||
+            ((req.method === "GET" || req.method === "HEAD") &&
+              /^\/pages\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(\/.*)?$/.test(path));
           if (!anonRead) return unauthorized(res);
         }
         const forgeRepoRoute = /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path);
         const packageRoute = path === "/v1/packages" || path.startsWith("/v1/packages/");
         const repoCreateRoute = req.method === "POST" && path === "/v1/repos";
         const templatesRoute = path === "/v1/templates" || path.startsWith("/v1/templates/");
+        const pagesRoute = /^\/pages\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(\/.*)?$/.test(path);
         const allowed =
           path === "/v1/capabilities" || path === "/v1/openapi.json" ||
           path === "/v1/workspaces" || path.startsWith("/v1/workspaces/") ||
           /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path) ||
-          forgeRepoRoute || packageRoute || repoCreateRoute || templatesRoute;
+          forgeRepoRoute || packageRoute || repoCreateRoute || templatesRoute || pagesRoute;
         if (!allowed) {
           return send(res, 403, { error: "this surface is operator-only — account and agent tokens cover workspaces, project details, the forge (branches/contents/pulls/releases/packages), repo creation + their creation templates, and their own account routes (see swarm/docs/ACCOUNTS.md)" });
         }
         if (principal.kind === "agent") {
           const ability = path.startsWith("/v1/workspaces") ? "workspaces"
-            : (forgeRepoRoute || packageRoute || repoCreateRoute || templatesRoute) ? "forge"
+            : (forgeRepoRoute || packageRoute || repoCreateRoute || templatesRoute || pagesRoute) ? "forge"
             : path.startsWith("/v1/repos/") ? "project-details" : null;
           if (ability && !principal.agent.scopes.includes(ability)) {
             return send(res, 403, { error: `this agent token lacks the "${ability}" scope` });
@@ -1641,11 +1657,55 @@ export function startApiServer(dir, cfg) {
           try {
             const details = updateRepoDetails(dir, m[1], m[2], {
               description: b.description, topics: b.topics,
-              visibility: b.visibility,
+              visibility: b.visibility, pages: b.pages,
             });
             return send(res, 200, { ok: true, details });
           } catch (e) {
             if (e instanceof RepoDetailsError) return send(res, e.status, { error: e.message });
+            throw e;
+          }
+        }
+      }
+
+      // ---- KILN Pages: static serving from the designated ref ----
+      // GET|HEAD /pages/:owner/:repo/[...path]. Read-only. The access
+      // law is the forge law, byte-identically: a public repo serves
+      // anyone (the anonymous principal was minted at the gate only
+      // for public repos); a private repo serves its owner's
+      // namespace + the operator, anonymous gets 401 and a non-owner
+      // account 403 — a private site leaks exactly as much as a
+      // private repo: nothing.
+      {
+        const pm = (req.method === "GET" || req.method === "HEAD")
+          ? path.match(/^\/pages\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(\/.*)?$/)
+          : null;
+        if (pm) {
+          const [, pOwner, pRepo, pRest] = pm;
+          if (principal.kind !== "operator" && pOwner !== principal.account?.owner) {
+            const publicRead = repoVisibility(dir, pOwner, pRepo) === "public";
+            if (!publicRead) {
+              if (principal.kind === "anonymous") return unauthorized(res);
+              return send(res, 403, { error: `account principals may read pages only under their own namespace ("${principal.account?.owner}")` });
+            }
+          }
+          try {
+            const plan = planPage(dir, pOwner, pRepo, pRest || "", path);
+            if (plan.status === 301) {
+              res.writeHead(301, { location: plan.location });
+              res.end();
+              return;
+            }
+            res.writeHead(200, {
+              "content-type": plan.contentType,
+              "content-length": plan.buffer.length,
+              "cache-control": "no-cache",
+              "x-kiln-pages-sha": plan.commit,
+              "x-kiln-pages-path": plan.servedPath,
+            });
+            res.end(req.method === "HEAD" ? undefined : plan.buffer);
+            return;
+          } catch (e) {
+            if (e instanceof PagesError) return send(res, e.status, { error: e.message });
             throw e;
           }
         }
