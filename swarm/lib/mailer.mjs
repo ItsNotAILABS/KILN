@@ -17,8 +17,11 @@
  *     marked sent without a provider acceptance.
  *   - PLUGGABLE TRANSPORTS, configured by env (see docs/MAIL.md):
  *     SMTP (Outlook-compatible: smtp.office365.com STARTTLS / TLS)
- *     via KILN_SMTP_*, or a generic HTTPS relay API via
- *     KILN_MAIL_API_URL + KILN_MAIL_API_KEY. From is KILN_MAIL_FROM.
+ *     via KILN_SMTP_*, a generic HTTPS relay API via
+ *     KILN_MAIL_API_URL + KILN_MAIL_API_KEY, or Cloudflare Email
+ *     Sending (the app's own domain — the architect's ratified
+ *     transport) via KILN_CF_ACCOUNT_ID + KILN_CF_API_TOKEN.
+ *     From is KILN_MAIL_FROM.
  *
  * Encryption discipline matches the rest of the email layer: the
  * outbox stores the recipient as an email binding (ciphertext + HMAC
@@ -283,12 +286,23 @@ export function outboxCounts(dir) {
  *   KILN_MAIL_FROM       sender address (SMTP: defaults to the user)
  *   KILN_SMTP_HOST/PORT/SECURE(tls|starttls|none)/USER/PASS
  *   KILN_MAIL_API_URL + KILN_MAIL_API_KEY   (HTTPS relay)
- *   KILN_MAIL_TRANSPORT  "smtp" | "https" — pins the choice when both
- *                        families are present.
+ *   KILN_CF_ACCOUNT_ID + KILN_CF_API_TOKEN  (Cloudflare Email Sending;
+ *                        KILN_MAIL_FROM required, as for HTTPS)
+ *   KILN_MAIL_TRANSPORT  "smtp" | "https" | "cloudflare" — pins the
+ *                        choice when several families are present.
  */
 export function transportConfigFromEnv(env = process.env) {
   const pin = String(env.KILN_MAIL_TRANSPORT || "").toLowerCase();
-  if (pin !== "https" && env.KILN_SMTP_HOST) {
+  const cloudflare = () => {
+    if (!env.KILN_CF_ACCOUNT_ID || !env.KILN_CF_API_TOKEN || !env.KILN_MAIL_FROM) return null;
+    return {
+      kind: "cloudflare",
+      accountId: env.KILN_CF_ACCOUNT_ID, apiToken: env.KILN_CF_API_TOKEN,
+      from: env.KILN_MAIL_FROM,
+    };
+  };
+  if (pin === "cloudflare") return cloudflare();
+  if (pin !== "https" && pin !== "cloudflare" && env.KILN_SMTP_HOST) {
     if (!env.KILN_SMTP_USER || !env.KILN_SMTP_PASS) return null;
     const port = parseInt(env.KILN_SMTP_PORT || "587", 10);
     const secure = ["tls", "starttls", "none"].includes(String(env.KILN_SMTP_SECURE || "").toLowerCase())
@@ -301,7 +315,7 @@ export function transportConfigFromEnv(env = process.env) {
       from: env.KILN_MAIL_FROM || env.KILN_SMTP_USER,
     };
   }
-  if (pin !== "smtp" && env.KILN_MAIL_API_URL) {
+  if (pin !== "smtp" && pin !== "cloudflare" && env.KILN_MAIL_API_URL) {
     if (!env.KILN_MAIL_API_KEY || !env.KILN_MAIL_FROM) return null;
     return {
       kind: "https",
@@ -309,13 +323,62 @@ export function transportConfigFromEnv(env = process.env) {
       from: env.KILN_MAIL_FROM,
     };
   }
+  if (!pin) return cloudflare();
   return null;
 }
 
 export function transportFromEnv(env = process.env) {
   const cfg = transportConfigFromEnv(env);
   if (!cfg) return null;
-  return cfg.kind === "smtp" ? createSmtpTransport(cfg) : createHttpsTransport(cfg);
+  if (cfg.kind === "smtp") return createSmtpTransport(cfg);
+  if (cfg.kind === "cloudflare") return createCloudflareTransport(cfg);
+  return createHttpsTransport(cfg);
+}
+
+/**
+ * Cloudflare Email Sending (REST) — the app sends from its own
+ * domain (the architect ratified Cloudflare as the mailer's domain,
+ * 2026-10-31). POST /accounts/{id}/email/sending/send with a bearer
+ * token carrying the Email Sending permission; acceptance is the
+ * recipient landing in the response's delivered[] or queued[] —
+ * a permanent bounce or an API error is a refusal and throws with
+ * Cloudflare's own code + message, so the outbox records the truth.
+ * Cloudflare returns no per-message id on this surface, so a sent
+ * record's providerId stays null (status + sentAt are the receipt).
+ */
+export function createCloudflareTransport(cfg) {
+  const doFetch = cfg.fetchImpl || fetch;
+  return {
+    kind: "cloudflare",
+    from: cfg.from,
+    async send({ to, subject, text, html }) {
+      const res = await doFetch(`https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/email/sending/send`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${cfg.apiToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ from: cfg.from, to, subject, text, html }),
+      });
+      const body = await res.text();
+      let j = null;
+      try { j = JSON.parse(body); } catch { /* handled below */ }
+      if (!res.ok || !j?.success) {
+        const e = j?.errors?.[0];
+        throw new Error(`Cloudflare Email Sending refused (${res.status}${e ? `, code ${e.code}` : ""}): ${e?.message || body.slice(0, 300)}`);
+      }
+      const delivered = j.result?.delivered || [];
+      const queued = j.result?.queued || [];
+      const bounced = j.result?.permanent_bounces || [];
+      if (bounced.includes(to)) {
+        throw new Error(`Cloudflare Email Sending: permanent bounce for the recipient`);
+      }
+      if (!delivered.includes(to) && !queued.includes(to)) {
+        throw new Error(`Cloudflare Email Sending: response did not accept the recipient (delivered=${delivered.length}, queued=${queued.length})`);
+      }
+      return { id: null };
+    },
+  };
 }
 
 /** Generic HTTPS relay: POST {from, to, subject, text, html} with a bearer key. */

@@ -15,6 +15,7 @@ import { makeEmailBinding } from "../lib/emailcrypto.mjs";
 import {
   MailerError, renderEmail, enqueueMail, listOutbox, outboxCounts,
   drainOutbox, transportConfigFromEnv, createSmtpTransport,
+  createCloudflareTransport,
 } from "../lib/mailer.mjs";
 import { startApiServer } from "../lib/httpapi.mjs";
 import { loadApiToken } from "../lib/state.mjs";
@@ -194,6 +195,70 @@ describe("mailer: SMTP wire dialogue (fake server)", () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe("mailer: Cloudflare Email Sending transport", () => {
+  const cfCfg = { accountId: "acct-1", apiToken: "tok-1", from: "KILN <kiln@pocketnova.app>" };
+  const fakeFetch = (respond) => {
+    const calls = [];
+    const impl = async (url, opts) => { calls.push({ url, opts }); return respond(url, opts); };
+    impl.calls = calls;
+    return impl;
+  };
+  const jsonRes = (status, obj) => ({ ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(obj) });
+
+  it("POSTs the documented shape and treats delivered/queued as acceptance", async () => {
+    const impl = fakeFetch(async () => jsonRes(200, {
+      success: true, errors: [], messages: [],
+      result: { delivered: ["dest@example.com"], permanent_bounces: [], queued: [] },
+    }));
+    const tx = createCloudflareTransport({ ...cfCfg, fetchImpl: impl });
+    const r = await tx.send({ to: "dest@example.com", subject: "Hi", text: "Body", html: "<p>Body</p>" });
+    assert.equal(r.id, null, "Cloudflare returns no per-message id on this surface");
+    assert.equal(impl.calls.length, 1);
+    assert.ok(impl.calls[0].url.endsWith("/accounts/acct-1/email/sending/send"));
+    assert.equal(impl.calls[0].opts.headers.authorization, "Bearer tok-1");
+    const sent = JSON.parse(impl.calls[0].opts.body);
+    assert.equal(sent.from, "KILN <kiln@pocketnova.app>");
+    assert.equal(sent.to, "dest@example.com");
+    assert.equal(sent.subject, "Hi");
+
+    const implQ = fakeFetch(async () => jsonRes(200, {
+      success: true, errors: [], messages: [],
+      result: { delivered: [], permanent_bounces: [], queued: ["dest@example.com"] },
+    }));
+    const txQ = createCloudflareTransport({ ...cfCfg, fetchImpl: implQ });
+    await txQ.send({ to: "dest@example.com", subject: "Hi", text: "B", html: null });
+  });
+
+  it("refusals throw with Cloudflare's code — never a silent acceptance", async () => {
+    const denied = fakeFetch(async () => jsonRes(403, {
+      success: false, result: null, messages: [],
+      errors: [{ code: 10102, message: "email.sending.error.authentication.forbidden" }],
+    }));
+    const tx = createCloudflareTransport({ ...cfCfg, fetchImpl: denied });
+    await assert.rejects(() => tx.send({ to: "dest@example.com", subject: "Hi", text: "B", html: null }), /10102/);
+
+    const bounced = fakeFetch(async () => jsonRes(200, {
+      success: true, errors: [], messages: [],
+      result: { delivered: [], permanent_bounces: ["dest@example.com"], queued: [] },
+    }));
+    const txB = createCloudflareTransport({ ...cfCfg, fetchImpl: bounced });
+    await assert.rejects(() => txB.send({ to: "dest@example.com", subject: "Hi", text: "B", html: null }), /permanent bounce/);
+  });
+
+  it("drains the outbox through Cloudflare when configured by env", async () => {
+    assert.equal(transportConfigFromEnv({ KILN_CF_ACCOUNT_ID: "a", KILN_CF_API_TOKEN: "t" }), null, "cloudflare needs an explicit FROM");
+    const cfg = transportConfigFromEnv({
+      KILN_CF_ACCOUNT_ID: "acct-1", KILN_CF_API_TOKEN: "tok-1", KILN_MAIL_FROM: "KILN <kiln@pocketnova.app>",
+    });
+    assert.equal(cfg.kind, "cloudflare");
+    const pinned = transportConfigFromEnv({
+      KILN_MAIL_TRANSPORT: "cloudflare", KILN_CF_ACCOUNT_ID: "acct-1", KILN_CF_API_TOKEN: "tok-1", KILN_MAIL_FROM: "KILN <kiln@pocketnova.app>",
+      KILN_SMTP_HOST: "smtp.office365.com", KILN_SMTP_USER: "u@x.io", KILN_SMTP_PASS: "p",
+    });
+    assert.equal(pinned.kind, "cloudflare", "the pin wins over other configured families");
   });
 });
 
