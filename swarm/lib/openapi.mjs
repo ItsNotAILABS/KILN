@@ -306,7 +306,7 @@ export function buildCapabilities() {
       },
       {
         id: "accounts",
-        title: "Accounts + agent identities — people sign up and log in (sessions), and mint scoped tokens for their own agents. Account/agent principals are owner-scoped: they act only under their own owner namespace, on workspaces + project details + the forge + their own account routes; everything else stays operator-only. Model: swarm/docs/ACCOUNTS.md",
+        title: "Accounts + agent identities — people sign up and log in (sessions), and mint scoped tokens for their own agents. Account/agent principals are owner-scoped: they act only under their own owner namespace, on workspaces + project details + the forge + their own account routes; everything else stays operator-only. Accounts also bind WALLET identities: link a wallet address (the app's local key, or Phantom) by signing a short-TTL single-use challenge with its ed25519 key — an address links to exactly one account — and store an opaque client-encrypted backup of the local secret (encrypted in the browser with a password-derived key; the server never sees plaintext), so signing in on a fresh browser restores the SAME wallet. GET /v1/accounts/me carries the linked wallets + hasBackup flags: the restore surface. Model: swarm/docs/ACCOUNTS.md",
         endpoints: [
           "POST /v1/accounts",
           "POST /v1/accounts/login",
@@ -314,6 +314,12 @@ export function buildCapabilities() {
           "POST /v1/accounts/me/agents",
           "GET /v1/accounts/me/agents",
           "DELETE /v1/accounts/me/agents/:id",
+          "POST /v1/accounts/me/wallets/challenge",
+          "POST /v1/accounts/me/wallets",
+          "GET /v1/accounts/me/wallets",
+          "DELETE /v1/accounts/me/wallets/:address",
+          "PUT /v1/accounts/me/wallet-backup",
+          "GET /v1/accounts/me/wallet-backup",
         ],
         mcpTools: [],
       },
@@ -516,7 +522,7 @@ export function buildOpenApiDocument() {
       "/v1/accounts/me": {
         get: {
           operationId: "getMe",
-          summary: "The caller's account + principal kind (session or agent token; the operator token is not an account)",
+          summary: "The caller's account + principal kind (session or agent token; the operator token is not an account), plus the wallet restore surface: linked wallets (each with hasBackup) and whether an encrypted wallet backup exists",
           responses: {
             "200": jsonResponse("The caller's account", {
               type: "object",
@@ -524,6 +530,8 @@ export function buildOpenApiDocument() {
                 ok: { type: "boolean" },
                 account: { $ref: "#/components/schemas/Account" },
                 principal: { type: "object" },
+                wallets: { type: "array", items: { $ref: "#/components/schemas/WalletLink" } },
+                hasWalletBackup: { type: "boolean" },
               },
               required: ["ok", "account", "principal"],
             }),
@@ -589,6 +597,142 @@ export function buildOpenApiDocument() {
               required: ["ok", "agent"],
             }),
             "404": errorResponse("No such agent on your account"),
+          },
+        },
+      },
+      "/v1/accounts/me/wallets/challenge": {
+        post: {
+          operationId: "issueWalletChallenge",
+          summary: "Issue a wallet-link challenge (session required): a short-TTL (5 min), single-use message the wallet's ed25519 key must sign. Re-issuing for the same address replaces the previous challenge",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: { address: { type: "string", description: "The wallet address to link (0x… or base58)" } },
+              required: ["address"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Challenge issued — sign `message` verbatim (UTF-8) with the wallet key", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                challengeId: { type: "string" },
+                message: { type: "string" },
+                expiresAt: { type: "string", format: "date-time" },
+              },
+              required: ["ok", "challengeId", "message", "expiresAt"],
+            }),
+            "400": errorResponse("Malformed address"),
+            "403": errorResponse("Session required (agent tokens cannot manage identity)"),
+          },
+        },
+      },
+      "/v1/accounts/me/wallets": {
+        post: {
+          operationId: "linkWallet",
+          summary: "Link a wallet to your account (session required) by presenting the signed challenge. The challenge is consumed by ANY attempt — replay answers 404. A base58 address must present its own public key (the address IS the key); a 0x address binds to the presented key as a pair. An address links to exactly one account",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                address: { type: "string" },
+                kind: { type: "string", enum: ["local", "phantom"], description: "\"local\" = the app's generated key; \"phantom\" = a Phantom wallet" },
+                publicKey: { type: "string", description: "32-byte ed25519 public key (hex, base64, or base64url)" },
+                challengeId: { type: "string" },
+                signature: { type: "string", description: "64-byte ed25519 signature over the challenge message (hex, base64, or base64url)" },
+              },
+              required: ["address", "kind", "publicKey", "challengeId", "signature"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Linked", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, wallet: { $ref: "#/components/schemas/WalletLink" } },
+              required: ["ok", "wallet"],
+            }),
+            "400": errorResponse("Malformed key/signature/address, or the address does not match the challenge"),
+            "403": errorResponse("Signature does not verify — or a session is required"),
+            "404": errorResponse("Challenge not found (never issued, already used, or another account's)"),
+            "409": errorResponse("This wallet address is already linked to another account"),
+            "410": errorResponse("Challenge expired — request a fresh one"),
+          },
+        },
+        get: {
+          operationId: "listWallets",
+          summary: "Your account's linked wallets with per-wallet hasBackup (the restore surface; session or agent token)",
+          responses: {
+            "200": jsonResponse("Linked wallets", {
+              type: "object",
+              properties: { wallets: { type: "array", items: { $ref: "#/components/schemas/WalletLink" } } },
+              required: ["wallets"],
+            }),
+          },
+        },
+      },
+      "/v1/accounts/me/wallets/{address}": {
+        parameters: [
+          { name: "address", in: "path", required: true, schema: { type: "string" }, description: "The linked wallet address (as stored: 0x addresses are lowercase)" },
+        ],
+        delete: {
+          operationId: "unlinkWallet",
+          summary: "Unlink a wallet from your account (session required). The address becomes linkable by another account afterwards",
+          responses: {
+            "200": jsonResponse("Unlinked", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, wallet: { $ref: "#/components/schemas/WalletLink" } },
+              required: ["ok", "wallet"],
+            }),
+            "404": errorResponse("No such linked wallet on your account"),
+          },
+        },
+      },
+      "/v1/accounts/me/wallet-backup": {
+        put: {
+          operationId: "putWalletBackup",
+          summary: "Store your encrypted wallet backup (session required). The client encrypts the local secret with a password-derived key IN THE BROWSER; the server stores the opaque blob + KDF metadata only — never plaintext, never in logs or audit records. Replaces any previous backup",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                blob: { type: "string", maxLength: 16384, description: "Opaque client ciphertext" },
+                kdf: { type: "object", description: "Client KDF metadata (algorithm, salt, parameters) — stored opaquely; flat string/number/boolean values" },
+              },
+              required: ["blob", "kdf"],
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Stored", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, updatedAt: { type: "string", format: "date-time" } },
+              required: ["ok", "updatedAt"],
+            }),
+            "400": errorResponse("Malformed blob/kdf"),
+            "403": errorResponse("Session required"),
+          },
+        },
+        get: {
+          operationId: "getWalletBackup",
+          summary: "Fetch your encrypted wallet backup (session required — the owning account's session ONLY; agent tokens and other accounts get nothing). Null when no backup is stored",
+          responses: {
+            "200": jsonResponse("Backup (or null)", {
+              type: "object",
+              properties: {
+                backup: {
+                  type: ["object", "null"],
+                  properties: {
+                    blob: { type: "string" },
+                    kdf: { type: "object" },
+                    updatedAt: { type: "string", format: "date-time" },
+                  },
+                  required: ["blob", "kdf", "updatedAt"],
+                },
+              },
+              required: ["backup"],
+            }),
+            "403": errorResponse("Session required"),
           },
         },
       },
@@ -1843,6 +1987,18 @@ export function buildOpenApiDocument() {
             createdAt: { type: "string", format: "date-time" },
           },
           required: ["id", "email", "name", "owner", "createdAt"],
+        },
+        WalletLink: {
+          type: "object",
+          description: "A wallet address bound to an account by signed-challenge proof. hasBackup is true when the account holds an encrypted backup for this (local) wallet — the flag a fresh browser's restore prompt renders from",
+          properties: {
+            address: { type: "string" },
+            kind: { type: "string", enum: ["local", "phantom"] },
+            publicKey: { type: "string", description: "The ed25519 public key, base64url" },
+            createdAt: { type: "string", format: "date-time" },
+            hasBackup: { type: "boolean" },
+          },
+          required: ["address", "kind", "publicKey", "createdAt", "hasBackup"],
         },
         AgentIdentity: {
           type: "object",

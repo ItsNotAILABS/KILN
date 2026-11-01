@@ -161,6 +161,25 @@
  *                                   -> 201 {ok, agent, token}  (token shown once)
  *   GET  /v1/accounts/me/agents     -> {agents:[...]}  (session only)
  *   DELETE /v1/accounts/me/agents/:id -> {ok, agent}   (session only, revoke)
+ *   Wallet identity binding (lib/accounts.mjs; session only to write,
+ *   session/agent to list; GET /v1/accounts/me also carries the list):
+ *   POST /v1/accounts/me/wallets/challenge {address}
+ *                                   -> 201 {challengeId, message, expiresAt}
+ *                                   (short-TTL, single-use; sign message
+ *                                   with the wallet's ed25519 key)
+ *   POST /v1/accounts/me/wallets    {address, kind: "local"|"phantom",
+ *                                    publicKey, challengeId, signature}
+ *                                   -> 201 {ok, wallet}  (bad sig 403,
+ *                                   replay/unknown challenge 404, expired
+ *                                   410, address on another account 409)
+ *   GET  /v1/accounts/me/wallets    -> {wallets:[{address, kind,
+ *                                    publicKey, createdAt, hasBackup}]}
+ *   DELETE /v1/accounts/me/wallets/:address -> {ok, wallet}
+ *   PUT  /v1/accounts/me/wallet-backup {blob, kdf} -> {ok, updatedAt}
+ *   GET  /v1/accounts/me/wallet-backup -> {backup: {blob, kdf,
+ *                                    updatedAt} | null}   (session only;
+ *                                    blob is opaque client ciphertext —
+ *                                    never logged, never audited)
  * Discovery (bearer-gated like every /v1 route):
  *   GET  /v1/capabilities           -> {version, abilities, openapi, docs}
  *   GET  /v1/openapi.json           -> OpenAPI 3.1 document (lib/openapi.mjs)
@@ -224,6 +243,8 @@ import {
 import {
   AccountsError, accountPublic, agentPublic, createAccount, login,
   createAgent, listAgents, revokeAgent, resolveAccountToken,
+  issueWalletChallenge, linkWallet, listWallets, unlinkWallet,
+  putWalletBackup, getWalletBackup,
 } from "./accounts.mjs";
 import {
   TemplatesError, resolveTemplateFiles, getTemplate,
@@ -587,6 +608,12 @@ export function startApiServer(dir, cfg) {
           principal: principal.kind === "agent"
             ? { kind: "agent", agent: agentPublic(principal.agent) }
             : { kind: "session" },
+          // The restore surface: a fresh browser signs in and renders
+          // "wallet 0x… is linked to this account — restore" from this
+          // list (hasBackup says the encrypted backup exists) instead
+          // of offering to generate a brand-new wallet.
+          wallets: listWallets(dir, principal.account.id),
+          hasWalletBackup: !!getWalletBackup(dir, principal.account.id),
         });
       }
       if (path === "/v1/accounts/me/agents" || path.startsWith("/v1/accounts/me/agents/")) {
@@ -607,6 +634,68 @@ export function startApiServer(dir, cfg) {
           if (req.method === "DELETE" && am) {
             const agent = revokeAgent(dir, principal.account.id, am[1]);
             return send(res, 200, { ok: true, agent });
+          }
+        } catch (e) {
+          if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+        return send(res, 404, { error: "not found" });
+      }
+
+      // ---- account wallets: identity binding + encrypted backup ----
+      // Linking/unlinking and the backup are identity acts: account
+      // SESSION only (agent tokens cannot manage who the account IS,
+      // same rule as agent management above). Listing is a read of
+      // the caller's own restore surface, open to session + agent.
+      // The operator token is not an account and gets the /me answer.
+      if (path === "/v1/accounts/me/wallets" || path.startsWith("/v1/accounts/me/wallets/") ||
+          path === "/v1/accounts/me/wallets/challenge" ||
+          path === "/v1/accounts/me/wallet-backup") {
+        if (principal.kind === "operator") {
+          return send(res, 403, { error: "the operator token is not an account — wallets bind to accounts; sign in with the account" });
+        }
+        if (principal.kind === "anonymous") return unauthorized(res);
+        const needSession = () => send(res, 403, {
+          error: "wallet linking and the wallet backup are managed by the account owner — sign in with the account (a session), not an agent token",
+        });
+        try {
+          if (req.method === "POST" && path === "/v1/accounts/me/wallets/challenge") {
+            if (principal.kind !== "session") return needSession();
+            const b = await readBody(req);
+            const c = issueWalletChallenge(dir, principal.account.id, b.address);
+            return send(res, 201, { ok: true, ...c });
+          }
+          if (req.method === "POST" && path === "/v1/accounts/me/wallets") {
+            if (principal.kind !== "session") return needSession();
+            const b = await readBody(req);
+            const wallet = linkWallet(dir, principal.account.id, {
+              address: b.address, kind: b.kind, publicKey: b.publicKey,
+              challengeId: b.challengeId, signature: b.signature,
+            });
+            return send(res, 201, { ok: true, wallet });
+          }
+          if (req.method === "GET" && path === "/v1/accounts/me/wallets") {
+            return send(res, 200, { wallets: listWallets(dir, principal.account.id) });
+          }
+          const wm = path.match(/^\/v1\/accounts\/me\/wallets\/([A-Za-z0-9_.-]+)$/);
+          if (req.method === "DELETE" && wm) {
+            if (principal.kind !== "session") return needSession();
+            const wallet = unlinkWallet(dir, principal.account.id, decodeURIComponent(wm[1]));
+            return send(res, 200, { ok: true, wallet });
+          }
+          if (path === "/v1/accounts/me/wallet-backup") {
+            if (principal.kind !== "session") return needSession();
+            if (req.method === "PUT") {
+              const b = await readBody(req);
+              // The blob is opaque client ciphertext — it is stored,
+              // never logged, never audited, never echoed anywhere
+              // but the owner's own GET below.
+              const r = putWalletBackup(dir, principal.account.id, { blob: b.blob, kdf: b.kdf });
+              return send(res, 200, { ok: true, ...r });
+            }
+            if (req.method === "GET") {
+              return send(res, 200, { backup: getWalletBackup(dir, principal.account.id) });
+            }
           }
         } catch (e) {
           if (e instanceof AccountsError) return send(res, e.status, { error: e.message });

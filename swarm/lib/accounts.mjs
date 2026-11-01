@@ -24,7 +24,10 @@
  * principal may touch (an account acts only under its own `owner`
  * namespace). See swarm/docs/ACCOUNTS.md for the full model.
  */
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import {
+  createHash, createPublicKey, randomBytes, scryptSync, timingSafeEqual,
+  verify as cryptoVerify,
+} from "node:crypto";
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { writeFileAtomicSync } from "./state.mjs";
@@ -48,16 +51,21 @@ function accountsPath(dir) {
 
 function loadStore(dir) {
   const p = accountsPath(dir);
-  if (!existsSync(p)) return { accounts: {}, sessions: {}, agents: {} };
+  if (!existsSync(p)) {
+    return { accounts: {}, sessions: {}, agents: {}, wallets: {}, walletChallenges: {}, walletBackups: {} };
+  }
   try {
     const s = JSON.parse(readFileSync(p, "utf8"));
     return {
       accounts: s.accounts || {},
       sessions: s.sessions || {},
       agents: s.agents || {},
+      wallets: s.wallets || {},
+      walletChallenges: s.walletChallenges || {},
+      walletBackups: s.walletBackups || {},
     };
   } catch {
-    return { accounts: {}, sessions: {}, agents: {} };
+    return { accounts: {}, sessions: {}, agents: {}, wallets: {}, walletChallenges: {}, walletBackups: {} };
   }
 }
 
@@ -245,4 +253,270 @@ export function resolveAccountToken(dir, bearer) {
     return account ? { kind: "agent", account, agent } : null;
   }
   return null;
+}
+
+// ------------------------------------------------------- wallet identity binding
+//
+// The app's generated wallet starts life as a browser-LOCAL key with
+// no binding to the daemon account — a second browser would mint a
+// NEW wallet and strand the first. This section is the daemon half of
+// the fix (the architect's report, 2026-10-31):
+//
+//   - An account LINKS wallet addresses (kind "local" = the app's
+//     generated key, "phantom" = a Phantom wallet) by proving key
+//     ownership: the server issues a short-TTL, single-use challenge,
+//     the wallet signs it (ed25519), the server verifies before the
+//     link exists. An address links to exactly ONE account.
+//   - The account stores an ENCRYPTED backup of the local secret:
+//     the client encrypts in the browser with a password-derived key
+//     and PUTs an opaque blob + KDF metadata. The server never sees
+//     plaintext, never logs the blob, and returns it only to the
+//     owning account's session — so a fresh browser signs in and
+//     restores the SAME wallet instead of generating a new one.
+//   - /v1/accounts/me exposes the links + per-wallet hasBackup, the
+//     restore surface a new browser renders from.
+//
+// Address handling: EVM-style 0x addresses normalize to lowercase;
+// anything else (Solana base58) keeps its case. When an address
+// base58-decodes to exactly 32 bytes it IS an ed25519 public key
+// (the Phantom case) and the presented public key must equal it —
+// for 0x addresses the pair (address, publicKey) is bound as
+// presented, since a 0x address is not derived from an ed25519 key.
+
+export const WALLET_KINDS = ["local", "phantom"];
+const WALLET_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const BACKUP_MAX_BLOB_CHARS = 16384;
+const BACKUP_MAX_KDF_CHARS = 1024;
+
+/**
+ * Normalize a wallet address for storage/uniqueness, or null when the
+ * value cannot be an address at all.
+ */
+export function normalizeWalletAddress(a) {
+  if (typeof a !== "string") return null;
+  const s = a.trim();
+  if (s.length < 8 || s.length > 128 || /[\s/\\]/.test(s)) return null;
+  return /^0x/i.test(s) ? s.toLowerCase() : s;
+}
+
+const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/** Base58 decode → Buffer, or null when the string is not base58. */
+function base58Decode(s) {
+  const bytes = [0];
+  for (const ch of s) {
+    const v = B58_ALPHABET.indexOf(ch);
+    if (v < 0) return null;
+    let carry = v;
+    for (let i = 0; i < bytes.length; i++) {
+      carry += bytes[i] * 58;
+      bytes[i] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) { bytes.push(carry & 0xff); carry >>= 8; }
+  }
+  let zeros = 0;
+  while (zeros < s.length && s[zeros] === "1") zeros++;
+  const body = Buffer.from(bytes.reverse());
+  return zeros ? Buffer.concat([Buffer.alloc(zeros), body]) : body;
+}
+
+/** Decode hex / base64 / base64url bytes; null when undecodable. */
+function decodeBytes(v) {
+  if (typeof v !== "string" || !v) return null;
+  const s = v.trim();
+  if (/^(0x)?[0-9a-fA-F]+$/.test(s) && s.replace(/^0x/i, "").length % 2 === 0) {
+    return Buffer.from(s.replace(/^0x/i, ""), "hex");
+  }
+  try {
+    const b = Buffer.from(s, "base64url");
+    return b.length ? b : null;
+  } catch {
+    return null;
+  }
+}
+
+function verifyEd25519(message, signature, publicKeyRaw) {
+  try {
+    const key = createPublicKey({
+      key: { kty: "OKP", crv: "Ed25519", x: publicKeyRaw.toString("base64url") },
+      format: "jwk",
+    });
+    return cryptoVerify(null, Buffer.from(message, "utf8"), key, signature);
+  } catch {
+    return false;
+  }
+}
+
+/** The wallet shape that may leave the daemon (the public key is public). */
+export function walletPublic(w, hasBackup = false) {
+  return {
+    address: w.address, kind: w.kind, publicKey: w.publicKey,
+    createdAt: w.createdAt, hasBackup,
+  };
+}
+
+function pruneChallenges(store, now) {
+  for (const [id, c] of Object.entries(store.walletChallenges)) {
+    if (Date.parse(c.expiresAt) <= now) delete store.walletChallenges[id];
+  }
+}
+
+/**
+ * Issue a link challenge for (account, address). The returned message
+ * is the exact string the wallet must sign. One live challenge per
+ * account+address — re-issuing replaces the previous one.
+ * `opts.ttlMs` exists for tests; the HTTP route uses the default.
+ */
+export function issueWalletChallenge(dir, accountId, address, opts = {}) {
+  const addr = normalizeWalletAddress(address);
+  if (!addr) throw new AccountsError(400, "address must be a wallet address string (8–128 chars, no spaces)");
+  const store = loadStore(dir);
+  if (!store.accounts[accountId]) throw new AccountsError(404, "no such account");
+  const now = Date.now();
+  pruneChallenges(store, now);
+  for (const [id, c] of Object.entries(store.walletChallenges)) {
+    if (c.accountId === accountId && c.address === addr) delete store.walletChallenges[id];
+  }
+  const account = store.accounts[accountId];
+  const id = `wch_${randomBytes(9).toString("hex")}`;
+  const nonce = randomBytes(24).toString("hex");
+  const expiresAt = new Date(now + (opts.ttlMs || WALLET_CHALLENGE_TTL_MS)).toISOString();
+  const message = [
+    "kiln-wallet-link",
+    `account:${account.owner}`,
+    `address:${addr}`,
+    `nonce:${nonce}`,
+    `expires:${expiresAt}`,
+  ].join("\n");
+  store.walletChallenges[id] = { id, accountId, address: addr, message, expiresAt, createdAt: new Date(now).toISOString() };
+  saveStore(dir, store);
+  return { challengeId: id, message, expiresAt };
+}
+
+/**
+ * Verify a signed challenge and link the wallet. The challenge is
+ * consumed by ANY attempt — success, bad signature, or mismatch —
+ * so a captured (challenge, signature) pair can never be replayed.
+ * Order is deliberate: proof first, conflict last (an address's link
+ * state is never revealed to someone who cannot sign for it).
+ */
+export function linkWallet(dir, accountId, { address, kind, publicKey, challengeId, signature } = {}) {
+  const addr = normalizeWalletAddress(address);
+  if (!addr) throw new AccountsError(400, "address must be a wallet address string (8–128 chars, no spaces)");
+  if (!WALLET_KINDS.includes(kind)) {
+    throw new AccountsError(400, `kind must be one of: ${WALLET_KINDS.join(", ")}`);
+  }
+  const pub = decodeBytes(publicKey);
+  if (!pub || pub.length !== 32) {
+    throw new AccountsError(400, "publicKey must be a 32-byte ed25519 public key (hex, base64, or base64url)");
+  }
+  const sig = decodeBytes(signature);
+  if (!sig || sig.length !== 64) {
+    throw new AccountsError(400, "signature must be a 64-byte ed25519 signature (hex, base64, or base64url)");
+  }
+  if (typeof challengeId !== "string" || !challengeId) {
+    throw new AccountsError(400, "challengeId is required — request one from POST /v1/accounts/me/wallets/challenge first");
+  }
+  const store = loadStore(dir);
+  if (!store.accounts[accountId]) throw new AccountsError(404, "no such account");
+  const challenge = store.walletChallenges[challengeId];
+  if (!challenge || challenge.accountId !== accountId) {
+    throw new AccountsError(404, "challenge not found (never issued, already used, or another account's)");
+  }
+  // Consume now — every outcome below burns the challenge.
+  delete store.walletChallenges[challengeId];
+  if (Date.parse(challenge.expiresAt) <= Date.now()) {
+    saveStore(dir, store);
+    throw new AccountsError(410, "challenge expired — request a fresh one and sign again");
+  }
+  if (challenge.address !== addr) {
+    saveStore(dir, store);
+    throw new AccountsError(400, "address does not match the challenged address");
+  }
+  const decoded = base58Decode(addr);
+  if (decoded && decoded.length === 32 && !decoded.equals(pub)) {
+    saveStore(dir, store);
+    throw new AccountsError(400, "publicKey does not match this address (a base58 address IS its ed25519 public key)");
+  }
+  if (!verifyEd25519(challenge.message, sig, pub)) {
+    saveStore(dir, store);
+    throw new AccountsError(403, "signature does not verify against the claimed public key");
+  }
+  const existing = store.wallets[addr];
+  if (existing && existing.accountId !== accountId) {
+    saveStore(dir, store);
+    throw new AccountsError(409, "this wallet address is already linked to another account");
+  }
+  const record = existing && existing.accountId === accountId
+    ? { ...existing, kind, publicKey: pub.toString("base64url") }
+    : {
+        address: addr, accountId, kind,
+        publicKey: pub.toString("base64url"),
+        createdAt: new Date().toISOString(),
+      };
+  store.wallets[addr] = record;
+  saveStore(dir, store);
+  return walletPublic(record, !!store.walletBackups[accountId] && record.kind === "local");
+}
+
+/** The account's linked wallets, each with its restore flag. */
+export function listWallets(dir, accountId) {
+  const store = loadStore(dir);
+  const hasBackup = !!store.walletBackups[accountId];
+  return Object.values(store.wallets)
+    .filter((w) => w.accountId === accountId)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .map((w) => walletPublic(w, hasBackup && w.kind === "local"));
+}
+
+/** Unlink one of the account's wallets. Another account's link reads as missing. */
+export function unlinkWallet(dir, accountId, address) {
+  const addr = normalizeWalletAddress(address);
+  if (!addr) throw new AccountsError(400, "address must be a wallet address string");
+  const store = loadStore(dir);
+  const w = store.wallets[addr];
+  if (!w || w.accountId !== accountId) {
+    throw new AccountsError(404, "no such linked wallet on your account");
+  }
+  delete store.wallets[addr];
+  saveStore(dir, store);
+  return walletPublic(w, !!store.walletBackups[accountId] && w.kind === "local");
+}
+
+// ------------------------------------------------------- encrypted wallet backup
+//
+// The blob is OPAQUE: produced by the client encrypting the local
+// secret with a password-derived key in the browser. The server
+// stores blob + the client's KDF metadata verbatim and returns them
+// only to the owning account's session. The blob is never written to
+// a log line, an audit record, or any other response.
+
+export function putWalletBackup(dir, accountId, { blob, kdf } = {}) {
+  if (typeof blob !== "string" || !blob || blob.length > BACKUP_MAX_BLOB_CHARS) {
+    throw new AccountsError(400, `blob must be a non-empty string of at most ${BACKUP_MAX_BLOB_CHARS} characters (the client-encrypted secret)`);
+  }
+  if (kdf === undefined || kdf === null || typeof kdf !== "object" || Array.isArray(kdf)) {
+    throw new AccountsError(400, "kdf metadata is required (a small JSON object: algorithm, salt, parameters — the server stores it opaquely)");
+  }
+  if (JSON.stringify(kdf).length > BACKUP_MAX_KDF_CHARS) {
+    throw new AccountsError(400, `kdf metadata exceeds ${BACKUP_MAX_KDF_CHARS} characters`);
+  }
+  for (const v of Object.values(kdf)) {
+    if (!["string", "number", "boolean"].includes(typeof v)) {
+      throw new AccountsError(400, "kdf metadata values must be strings, numbers, or booleans");
+    }
+  }
+  const store = loadStore(dir);
+  if (!store.accounts[accountId]) throw new AccountsError(404, "no such account");
+  const record = { blob, kdf, updatedAt: new Date().toISOString() };
+  store.walletBackups[accountId] = record;
+  saveStore(dir, store);
+  return { updatedAt: record.updatedAt };
+}
+
+/** The account's backup record ({blob, kdf, updatedAt}) or null. */
+export function getWalletBackup(dir, accountId) {
+  const store = loadStore(dir);
+  return store.walletBackups[accountId] || null;
 }

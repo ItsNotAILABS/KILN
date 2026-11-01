@@ -64,6 +64,44 @@ registries, mode 0600. At rest it holds only hashes: scrypt password
 hashes, sha256 session/agent token hashes. No hash, salt, password,
 or raw token ever appears in a response or a log.
 
+## Wallet identity binding + encrypted backup
+
+An account can bind **wallet addresses** to itself — the fix for the
+app's generated wallet being a browser-local key with no daemon
+identity (a second browser used to force a brand-new wallet):
+
+- **Linking is proof, not assertion.** `POST
+  /v1/accounts/me/wallets/challenge` issues a short-TTL (5 min),
+  single-use challenge naming the account + address; the wallet
+  signs it with its ed25519 key; `POST /v1/accounts/me/wallets`
+  verifies before linking. Any attempt consumes the challenge
+  (replays answer 404, expiry 410, bad signature 403). Kinds:
+  `local` (the app's generated key) and `phantom`. A base58 address
+  must present its own public key (the address *is* the key); a `0x`
+  address binds to the presented key as a pair. **An address links
+  to exactly one account** — a second account's valid proof answers
+  409, and only after its own signature verifies (link state is
+  never revealed to someone who cannot sign for the address).
+- **Encrypted backup.** `PUT /v1/accounts/me/wallet-backup` stores
+  an opaque blob + KDF metadata: the client encrypts the local
+  secret with a password-derived key **in the browser**; the server
+  never sees plaintext, never logs the blob, and returns it only to
+  the owning account's **session** (`GET …/wallet-backup`; agent
+  tokens are refused). This is what lets a fresh browser restore the
+  same wallet after sign-in.
+- **Restore surface.** `GET /v1/accounts/me` and `GET
+  /v1/accounts/me/wallets` carry the links with per-wallet
+  `hasBackup` (local wallets only), so a new browser renders "wallet
+  0x… is linked to this account — restore" instead of "generate a
+  new wallet".
+- Linking/unlinking and backup writes are **session-only** — agent
+  tokens cannot manage who the account *is*, the same rule as agent
+  management. Unlinking frees the address for another account.
+
+The daemon surface is the whole of this piece; the app-side restore
+UX (restore flow, backup prompt at generation, Phantom link in
+profile settings) is a separate lane in kiln-workspace.
+
 ## Known limits (named, not hidden)
 
 - No rate limiting on login/signup yet — the forge is

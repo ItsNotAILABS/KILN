@@ -36,6 +36,13 @@ const EXPECTED = [
   ["POST", "/v1/accounts/me/agents"],
   ["GET", "/v1/accounts/me/agents"],
   ["DELETE", "/v1/accounts/me/agents/{id}"],
+  // wallet identity binding + encrypted backup
+  ["POST", "/v1/accounts/me/wallets/challenge"],
+  ["POST", "/v1/accounts/me/wallets"],
+  ["GET", "/v1/accounts/me/wallets"],
+  ["DELETE", "/v1/accounts/me/wallets/{address}"],
+  ["PUT", "/v1/accounts/me/wallet-backup"],
+  ["GET", "/v1/accounts/me/wallet-backup"],
   // repo lifecycle + project details
   ["POST", "/v1/repos"],
   ["DELETE", "/v1/repos/{owner}/{repo}"],
