@@ -43,6 +43,8 @@ const EXPECTED = [
   ["DELETE", "/v1/accounts/me/wallets/{address}"],
   ["PUT", "/v1/accounts/me/wallet-backup"],
   ["GET", "/v1/accounts/me/wallet-backup"],
+  // encrypted email binding
+  ["PUT", "/v1/accounts/me/email"],
   // repo lifecycle + project details
   ["POST", "/v1/repos"],
   ["DELETE", "/v1/repos/{owner}/{repo}"],
@@ -89,6 +91,14 @@ const EXPECTED = [
   ["GET", "/v1/workspaces/{id}"],
   ["PATCH", "/v1/workspaces/{id}"],
   ["DELETE", "/v1/workspaces/{id}"],
+  // workspace invites by email + acceptance
+  ["POST", "/v1/workspaces/{id}/invites"],
+  ["GET", "/v1/workspaces/{id}/invites"],
+  ["DELETE", "/v1/workspaces/{id}/invites/{inviteId}"],
+  ["POST", "/v1/invites/{token}/accept"],
+  // mail outbox
+  ["GET", "/v1/mail/outbox"],
+  ["POST", "/v1/mail/send"],
   // sites
   ["POST", "/v1/sites"],
   ["GET", "/v1/sites"],

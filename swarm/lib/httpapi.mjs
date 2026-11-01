@@ -180,6 +180,33 @@
  *                                    updatedAt} | null}   (session only;
  *                                    blob is opaque client ciphertext —
  *                                    never logged, never audited)
+ *   Encrypted email binding (lib/accounts.mjs + lib/emailcrypto.mjs):
+ *   PUT  /v1/accounts/me/email      {email} -> {ok, account}  (session
+ *                                    only; the address rests ONLY as
+ *                                    AES-256-GCM ciphertext + HMAC tag
+ *                                    + masked form; signup stores its
+ *                                    address through the same path and
+ *                                    /v1/accounts/me reports the masked
+ *                                    form + emailBound once bound)
+ *   Workspace invites by email (lib/invites.mjs; owner/admin only):
+ *   POST /v1/workspaces/:id/invites {email, role} -> 201 {ok, invite,
+ *                                    token, tokenShownOnce, delivery}
+ *                                    (the plaintext token is shown
+ *                                    ONCE — there is no mail sender
+ *                                    guarantee; an invite email is
+ *                                    also enqueued via the mailer)
+ *   GET  /v1/workspaces/:id/invites -> {invites:[...]}  (masked)
+ *   DELETE /v1/workspaces/:id/invites/:inviteId -> {ok, invite}
+ *   POST /v1/invites/:token/accept  -> {ok, workspace, member,
+ *                                    account, invite}   (session only;
+ *                                    consumed/revoked 404, expired
+ *                                    410, different bound email 409)
+ *   Mail (lib/mailer.mjs; operator only):
+ *   GET  /v1/mail/outbox            -> {ok, transport, counts, mail}
+ *                                    (masked recipients; queued means
+ *                                    UNSENT until a provider accepts)
+ *   POST /v1/mail/send              -> drain the outbox through the
+ *                                    env-configured transport
  * Discovery (bearer-gated like every /v1 route):
  *   GET  /v1/capabilities           -> {version, abilities, openapi, docs}
  *   GET  /v1/openapi.json           -> OpenAPI 3.1 document (lib/openapi.mjs)
@@ -225,6 +252,7 @@ import {
 import {
   WorkspacesError, createWorkspace, listWorkspaces, workspaceTree,
   updateWorkspace, deleteWorkspace, workspaceStatus, resolveWorkspace,
+  workspaceRoleFor, listWorkspacesForAccount,
 } from "./workspaces.mjs";
 import {
   RepoDetailsError, repoDetails, updateRepoDetails, repoVisibility,
@@ -245,7 +273,16 @@ import {
   createAgent, listAgents, revokeAgent, resolveAccountToken,
   issueWalletChallenge, linkWallet, listWallets, unlinkWallet,
   putWalletBackup, getWalletBackup,
+  bindAccountEmail, getEmailBinding,
 } from "./accounts.mjs";
+import {
+  InvitesError, createInvite, listInvites, revokeInvite, acceptInvite,
+  inviteBinding,
+} from "./invites.mjs";
+import {
+  MailerError, enqueueMail, listOutbox, outboxCounts, drainOutbox,
+  transportConfigFromEnv,
+} from "./mailer.mjs";
 import {
   TemplatesError, resolveTemplateFiles, getTemplate,
   createTemplate, listTemplates, getTemplatePublic, deleteTemplate,
@@ -255,6 +292,27 @@ import { buildCapabilities, buildOpenApiDocument } from "./openapi.mjs";
 // 4MB: the forge contents API carries base64-encoded files (1MB raw
 // file ≈ 1.4MB encoded) plus PR/release prose in one JSON body.
 const MAX_BODY = 4 * 1024 * 1024;
+
+/**
+ * Enqueue a welcome (introduction) email for an account against its
+ * stored encrypted binding. Mail is a side effect of identity acts:
+ * a failure is logged (never with an address or a token) and never
+ * allowed to break the act itself — the outbox is inspectable and
+ * the drain is retryable, exactly like CI on a push.
+ */
+function enqueueWelcomeMail(dir, account, context = {}) {
+  try {
+    const binding = getEmailBinding(dir, account.id);
+    if (!binding) return;
+    enqueueMail(dir, {
+      kind: "introduction",
+      to: binding,
+      context: { owner: account.owner, ...context },
+    });
+  } catch (e) {
+    console.error(`mail: welcome enqueue failed for ${account.owner}: ${e.message}`);
+  }
+}
 
 function nodeStatus(dir, cfg, node) {
   const alive = pidAlive(node.workerPid);
@@ -495,6 +553,9 @@ export function startApiServer(dir, cfg) {
           const account = createAccount(dir, {
             email: b.email, name: b.name, owner: b.owner, password: b.password,
           });
+          // The introduction email: signup binds the address through
+          // the encrypted path, and a fresh binding gets a welcome.
+          enqueueWelcomeMail(dir, account);
           return send(res, 201, { ok: true, account });
         } catch (e) {
           if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
@@ -616,6 +677,31 @@ export function startApiServer(dir, cfg) {
           hasWalletBackup: !!getWalletBackup(dir, principal.account.id),
         });
       }
+
+      // ---- account email binding: PUT /v1/accounts/me/email ----
+      // An identity act like agent management: the account's SESSION
+      // only. The address is stored exclusively as an encrypted
+      // binding (lib/emailcrypto.mjs); the response carries the
+      // masked account shape — the full address never comes back.
+      if (path === "/v1/accounts/me/email") {
+        if (principal.kind === "operator") {
+          return send(res, 403, { error: "the operator token is not an account — email binds to accounts; sign in with the account" });
+        }
+        if (principal.kind === "anonymous") return unauthorized(res);
+        if (req.method !== "PUT") return send(res, 404, { error: "not found" });
+        if (principal.kind !== "session") {
+          return send(res, 403, { error: "your account email is managed by the account owner — sign in with the account (a session), not an agent token" });
+        }
+        try {
+          const b = await readBody(req);
+          const r = bindAccountEmail(dir, principal.account.id, b.email);
+          if (r.bindingChanged) enqueueWelcomeMail(dir, principal.account);
+          return send(res, 200, { ok: true, account: r.account });
+        } catch (e) {
+          if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+      }
       if (path === "/v1/accounts/me/agents" || path.startsWith("/v1/accounts/me/agents/")) {
         if (principal.kind !== "session") {
           return send(res, 403, { error: "agent identities are managed by the account owner — sign in with the account (a session), not an agent token or the operator token" });
@@ -701,6 +787,39 @@ export function startApiServer(dir, cfg) {
           if (e instanceof AccountsError) return send(res, e.status, { error: e.message });
           throw e;
         }
+        return send(res, 404, { error: "not found" });
+      }
+
+      // ---- workspace invite acceptance: POST /v1/invites/:token/accept ----
+      // The token in the path IS the credential the invite issued;
+      // accepting is the invited account's own act — session only.
+      {
+        const im = path.match(/^\/v1\/invites\/([A-Za-z0-9_.-]+)\/accept$/);
+        if (im) {
+          if (req.method !== "POST") return send(res, 404, { error: "not found" });
+          if (principal.kind === "anonymous") return unauthorized(res);
+          if (principal.kind === "operator") {
+            return send(res, 403, { error: "the operator token is not an account — invites are accepted by the invited account's session" });
+          }
+          if (principal.kind !== "session") {
+            return send(res, 403, { error: "invites are accepted by the account owner — sign in with the account (a session), not an agent token" });
+          }
+          try {
+            const r = acceptInvite(dir, decodeURIComponent(im[1]), principal.account);
+            enqueueWelcomeMail(dir, principal.account, { workspaceName: r.workspace.name });
+            return send(res, 200, {
+              ok: true, workspace: r.workspace, member: r.member,
+              account: r.account, invite: r.invite,
+            });
+          } catch (e) {
+            if (e instanceof InvitesError || e instanceof AccountsError || e instanceof WorkspacesError) {
+              return send(res, e.status, { error: e.message });
+            }
+            throw e;
+          }
+        }
+      }
+      if (path === "/v1/invites" || path.startsWith("/v1/invites/")) {
         return send(res, 404, { error: "not found" });
       }
 
@@ -1267,21 +1386,93 @@ export function startApiServer(dir, cfg) {
         }
       }
       if (req.method === "GET" && path === "/v1/workspaces") {
-        // Owner scoping: account/agent principals see only their own.
+        // Owner scoping: account/agent principals see their own
+        // workspaces PLUS any they belong to as members (the flat
+        // list; the tree stays an owner-namespace forest).
         const owner = principal.kind === "operator"
           ? (url.searchParams.get("owner") || undefined)
           : principal.account.owner;
         if (url.searchParams.get("tree") === "1") {
           return send(res, 200, { workspaces: workspaceTree(dir, { owner }) });
         }
+        if (principal.kind !== "operator") {
+          return send(res, 200, { workspaces: listWorkspacesForAccount(dir, principal.account.owner) });
+        }
         return send(res, 200, { workspaces: listWorkspaces(dir, { owner }) });
+      }
+
+      // ---- workspace invites: by email, owner/admin only ----
+      {
+        const m = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_.-]+)\/invites(?:\/([A-Za-z0-9_.-]+))?$/);
+        if (m) {
+          try {
+            const ws = resolveWorkspace(dir, m[1]);
+            const role = principal.kind === "operator"
+              ? "owner"
+              : workspaceRoleFor(dir, ws.id, principal.account.owner);
+            if (role !== "owner" && role !== "admin") {
+              return send(res, 403, { error: "only the workspace owner or an admin member can manage invites" });
+            }
+            if (req.method === "POST" && !m[2]) {
+              const b = await readBody(req);
+              const r = createInvite(dir, ws, {
+                email: b.email, role: b.role,
+                createdBy: principal.kind === "operator" ? "operator" : principal.account.owner,
+              });
+              // The invite email goes out through the mailer (queued
+              // honestly until a transport is configured); the token
+              // below is ALSO the inviter's one out-of-band copy.
+              try {
+                const binding = inviteBinding(dir, r.invite.id);
+                if (binding) {
+                  enqueueMail(dir, {
+                    kind: "workspace-invite",
+                    to: binding,
+                    context: {
+                      workspaceName: ws.name,
+                      inviter: principal.kind === "operator" ? "The workspace owner" : principal.account.owner,
+                      role: r.invite.role,
+                      expiresAt: r.invite.expiresAt,
+                    },
+                    secret: r.token,
+                  });
+                }
+              } catch (e) {
+                console.error(`mail: invite enqueue failed for workspace ${ws.id}: ${e.message}`);
+              }
+              // The plaintext token is shown exactly once, in this
+              // response; only its sha256 is stored. There is no
+              // sender guarantee: `delivery` says how it travels.
+              return send(res, 201, {
+                ok: true, invite: r.invite, token: r.token, tokenShownOnce: true,
+                delivery: "an invite email is queued in the mail outbox (it sends when a transport is configured); you may also hand this token to the invitee out of band — it expires in 7 days and works once",
+              });
+            }
+            if (req.method === "GET" && !m[2]) {
+              return send(res, 200, { invites: listInvites(dir, ws.id) });
+            }
+            if (req.method === "DELETE" && m[2]) {
+              const invite = revokeInvite(dir, ws.id, m[2]);
+              return send(res, 200, { ok: true, invite });
+            }
+          } catch (e) {
+            if (e instanceof WorkspacesError || e instanceof InvitesError) {
+              return send(res, e.status, { error: e.message });
+            }
+            throw e;
+          }
+          return send(res, 404, { error: "not found" });
+        }
       }
       {
         const m = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_.-]+)$/);
         if (req.method === "GET" && m) {
           try {
+            // Read access: the owner, or any account holding a
+            // membership (admin/member) — membership is the point of
+            // the invite door. Writes below stay owner-only.
             if (principal.kind !== "operator" &&
-                resolveWorkspace(dir, m[1]).owner !== principal.account.owner) {
+                !workspaceRoleFor(dir, m[1], principal.account.owner)) {
               return send(res, 403, { error: "this workspace belongs to another account" });
             }
             return send(res, 200, workspaceStatus(dir, m[1]));
@@ -1681,6 +1872,29 @@ export function startApiServer(dir, cfg) {
             throw e;
           }
           return send(res, 404, { error: "not found" });
+        }
+      }
+
+      // ---- mail outbox (operator only — the scope guard keeps
+      // account/agent principals out: /v1/mail is on no allow-list) ----
+      if (req.method === "GET" && path === "/v1/mail/outbox") {
+        const cfg = transportConfigFromEnv(process.env);
+        return send(res, 200, {
+          ok: true,
+          transport: cfg
+            ? { configured: true, kind: cfg.kind }
+            : { configured: false, kind: null },
+          counts: outboxCounts(dir),
+          mail: listOutbox(dir),
+        });
+      }
+      if (req.method === "POST" && path === "/v1/mail/send") {
+        try {
+          const r = await drainOutbox(dir, {});
+          return send(res, 200, { ok: true, ...r });
+        } catch (e) {
+          if (e instanceof MailerError) return send(res, e.status, { error: e.message });
+          throw e;
         }
       }
 

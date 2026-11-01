@@ -267,13 +267,17 @@ export function buildCapabilities() {
     abilities: [
       {
         id: "workspaces",
-        title: "Workspaces — group repos + sites under one owner, nestable into trees",
+        title: "Workspaces — group repos + sites under one owner, nestable into trees. Workspaces also have ACCOUNT MEMBERS (admin | member) who join by EMAIL INVITE: an owner/admin invites an address (stored only as AES-256-GCM ciphertext + HMAC tag + masked form), the invite token is shown once for out-of-band delivery and also carried by the queued invite email, and accepting it (session) binds the invite's address to the account — refusing with 409 when the account is tied to a different address — and joins the workspace with the invite's role. Members can read the workspace; admins can also manage invites; edits stay owner-only",
         endpoints: [
           "POST /v1/workspaces",
           "GET /v1/workspaces",
           "GET /v1/workspaces/:id",
           "PATCH /v1/workspaces/:id",
           "DELETE /v1/workspaces/:id",
+          "POST /v1/workspaces/:id/invites",
+          "GET /v1/workspaces/:id/invites",
+          "DELETE /v1/workspaces/:id/invites/:inviteId",
+          "POST /v1/invites/:token/accept",
         ],
         mcpTools: [
           "kiln_workspace_create",
@@ -306,7 +310,7 @@ export function buildCapabilities() {
       },
       {
         id: "accounts",
-        title: "Accounts + agent identities — people sign up and log in (sessions), and mint scoped tokens for their own agents. Account/agent principals are owner-scoped: they act only under their own owner namespace, on workspaces + project details + the forge + their own account routes; everything else stays operator-only. Accounts also bind WALLET identities: link a wallet address (the app's local key, or Phantom) by signing a short-TTL single-use challenge with its ed25519 key — an address links to exactly one account — and store an opaque client-encrypted backup of the local secret (encrypted in the browser with a password-derived key; the server never sees plaintext), so signing in on a fresh browser restores the SAME wallet. GET /v1/accounts/me carries the linked wallets + hasBackup flags: the restore surface. Model: swarm/docs/ACCOUNTS.md",
+        title: "Accounts + agent identities — people sign up and log in (sessions), and mint scoped tokens for their own agents. Account/agent principals are owner-scoped: they act only under their own owner namespace, on workspaces + project details + the forge + their own account routes; everything else stays operator-only. Accounts also bind WALLET identities: link a wallet address (the app's local key, or Phantom) by signing a short-TTL single-use challenge with its ed25519 key — an address links to exactly one account — and store an opaque client-encrypted backup of the local secret (encrypted in the browser with a password-derived key; the server never sees plaintext), so signing in on a fresh browser restores the SAME wallet. GET /v1/accounts/me carries the linked wallets + hasBackup flags: the restore surface. Accounts also carry an ENCRYPTED EMAIL BINDING: the address rests only as AES-256-GCM ciphertext + an HMAC lookup tag + a masked form (signup stores it through the same path; login matches by HMAC; PUT /v1/accounts/me/email rebinds), and once bound the full address is never returned by any endpoint — /v1/accounts/me reports the masked form + emailBound. Binding an email (or accepting a workspace invite) enqueues the welcome/introduction email. Model: swarm/docs/ACCOUNTS.md",
         endpoints: [
           "POST /v1/accounts",
           "POST /v1/accounts/login",
@@ -320,6 +324,16 @@ export function buildCapabilities() {
           "DELETE /v1/accounts/me/wallets/:address",
           "PUT /v1/accounts/me/wallet-backup",
           "GET /v1/accounts/me/wallet-backup",
+          "PUT /v1/accounts/me/email",
+        ],
+        mcpTools: [],
+      },
+      {
+        id: "mail",
+        title: "Mail — the daemon sends email from a template registry (workspace invites, the welcome/introduction, generic account notices) through an outbox with an honest state machine: enqueue records intent as `queued`; only a provider acceptance moves a record to `sent` (with the provider id); failures keep the provider's reason and retry bounded times. Transport is env-configured (SMTP — Outlook-compatible — or an HTTPS relay API); with NO transport configured, mail queues and reports itself queued-unsent, never sent. Operator-only. Model: swarm/docs/MAIL.md",
+        endpoints: [
+          "GET /v1/mail/outbox",
+          "POST /v1/mail/send",
         ],
         mcpTools: [],
       },
@@ -536,6 +550,34 @@ export function buildOpenApiDocument() {
               required: ["ok", "account", "principal"],
             }),
             "403": errorResponse("Operator token is not an account"),
+          },
+        },
+      },
+      "/v1/accounts/me/email": {
+        put: {
+          operationId: "bindAccountEmail",
+          summary: "Bind (or rebind) your account's email (session required — agent tokens cannot manage who the account is). The address is stored ONLY as an encrypted binding (AES-256-GCM ciphertext + HMAC lookup tag + masked form); the response carries the masked account shape and the full address is never returned by any endpoint from here on. One address ties to exactly one account. A changed binding enqueues the welcome email",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { email: { type: "string", format: "email" } },
+                  required: ["email"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": jsonResponse("Bound", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, account: { $ref: "#/components/schemas/Account" } },
+              required: ["ok", "account"],
+            }),
+            "400": errorResponse("Not a valid email address"),
+            "403": errorResponse("Operator token is not an account, or an agent token was used"),
+            "409": errorResponse("This email is already tied to another account"),
           },
         },
       },
@@ -864,6 +906,157 @@ export function buildOpenApiDocument() {
             "400": errorResponse("confirm missing or not equal to the workspace slug"),
             "404": errorResponse("No such workspace"),
             "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/workspaces/{id}/invites": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" }, description: "Workspace id (ws_…)" },
+        ],
+        post: {
+          operationId: "createWorkspaceInvite",
+          summary: "Invite an email address to the workspace (workspace owner or admin member only). The address is stored encrypted; an invite email carrying the accept link + token is queued in the mail outbox. The plaintext token is ALSO returned once in this response for out-of-band delivery — there is no sender guarantee: the email sends only when a mail transport is configured. Invites expire in 7 days and are single-use",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    email: { type: "string", format: "email" },
+                    role: { type: "string", enum: ["admin", "member"] },
+                  },
+                  required: ["email", "role"],
+                },
+              },
+            },
+          },
+          responses: {
+            "201": jsonResponse("Invite created — the token in this response is shown exactly once", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                invite: { $ref: "#/components/schemas/WorkspaceInvite" },
+                token: { type: "string", description: "The plaintext invite token — shown once; only its sha256 is stored" },
+                tokenShownOnce: { type: "boolean" },
+                delivery: { type: "string", description: "How the invite travels: the queued email and/or the inviter's out-of-band copy" },
+              },
+              required: ["ok", "invite", "token"],
+            }),
+            "400": errorResponse("Invalid email, or a role other than admin/member"),
+            "403": errorResponse("Only the workspace owner or an admin member manages invites"),
+            "404": errorResponse("No such workspace"),
+            "409": errorResponse("A pending invite for this email already exists on this workspace"),
+          },
+        },
+        get: {
+          operationId: "listWorkspaceInvites",
+          summary: "List the workspace's invites (owner/admin only), masked addresses only",
+          responses: {
+            "200": jsonResponse("Invites", {
+              type: "object",
+              properties: { invites: { type: "array", items: { $ref: "#/components/schemas/WorkspaceInvite" } } },
+              required: ["invites"],
+            }),
+            "403": errorResponse("Only the workspace owner or an admin member manages invites"),
+            "404": errorResponse("No such workspace"),
+          },
+        },
+      },
+      "/v1/workspaces/{id}/invites/{inviteId}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" }, description: "Workspace id (ws_…)" },
+          { name: "inviteId", in: "path", required: true, schema: { type: "string" }, description: "Invite id (inv_…)" },
+        ],
+        delete: {
+          operationId: "revokeWorkspaceInvite",
+          summary: "Revoke a pending invite (owner/admin only); a revoked token answers 404 at accept, indistinguishable from an unknown one",
+          responses: {
+            "200": jsonResponse("Revoked", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, invite: { $ref: "#/components/schemas/WorkspaceInvite" } },
+              required: ["ok", "invite"],
+            }),
+            "403": errorResponse("Only the workspace owner or an admin member manages invites"),
+            "404": errorResponse("No such workspace, or no such invite on it"),
+            "409": errorResponse("The invite is already accepted/expired — only a pending invite can be revoked"),
+          },
+        },
+      },
+      "/v1/invites/{token}/accept": {
+        parameters: [
+          { name: "token", in: "path", required: true, schema: { type: "string" }, description: "The plaintext invite token (kiln_inv_…) from the invite email or the inviter" },
+        ],
+        post: {
+          operationId: "acceptWorkspaceInvite",
+          summary: "Accept a workspace invite with the invited account's session. If the account has no email, the invite's address becomes its encrypted binding; if it is tied to a DIFFERENT address the accept is refused (409). On success the account joins the workspace with the invite's role and the invite is consumed (single-use). Accepting also enqueues the welcome email",
+          responses: {
+            "200": jsonResponse("Accepted — the account is now a workspace member (or the owner confirming their own invite)", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                workspace: { $ref: "#/components/schemas/Workspace" },
+                member: { type: ["object", "null"], description: "{owner, role} — null when the accepting account owns the workspace" },
+                account: { $ref: "#/components/schemas/Account" },
+                invite: { $ref: "#/components/schemas/WorkspaceInvite" },
+              },
+              required: ["ok", "workspace", "account", "invite"],
+            }),
+            "403": errorResponse("Operator token or agent token used — acceptance is the account owner's session act"),
+            "404": errorResponse("Invite not found (never issued, already used, or revoked)"),
+            "409": errorResponse("The invite was issued to a different email than the one tied to your account"),
+            "410": errorResponse("The invite has expired — ask for a fresh one"),
+          },
+        },
+      },
+      "/v1/mail/outbox": {
+        get: {
+          operationId: "getMailOutbox",
+          summary: "The mail outbox (operator only): transport configuration state, per-status counts, and every record with a MASKED recipient. `queued` means unsent — nothing is marked sent without a provider acceptance",
+          responses: {
+            "200": jsonResponse("Outbox", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                transport: {
+                  type: "object",
+                  properties: { configured: { type: "boolean" }, kind: { type: ["string", "null"], enum: ["smtp", "https", null] } },
+                  required: ["configured", "kind"],
+                },
+                counts: {
+                  type: "object",
+                  properties: {
+                    queued: { type: "integer" }, sent: { type: "integer" },
+                    failed: { type: "integer" }, total: { type: "integer" },
+                  },
+                  required: ["queued", "sent", "failed", "total"],
+                },
+                mail: { type: "array", items: { $ref: "#/components/schemas/OutboxMail" } },
+              },
+              required: ["ok", "transport", "counts", "mail"],
+            }),
+            "403": errorResponse("The mail outbox is operator-only"),
+          },
+        },
+      },
+      "/v1/mail/send": {
+        post: {
+          operationId: "drainMailOutbox",
+          summary: "Attempt delivery of every queued outbox record through the env-configured transport (operator only). With no transport configured the answer says so (configured:false) and every record stays queued — mail is never marked sent without a provider acceptance. Failures record the provider's reason and stop after 3 attempts",
+          responses: {
+            "200": jsonResponse("Drain outcome", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                configured: { type: "boolean" },
+                attempted: { type: "integer" },
+                sent: { type: "integer" },
+                failed: { type: "integer", description: "Records that reached the terminal failed state on this drain" },
+                queued: { type: "integer", description: "Records still queued (unsent) after the drain" },
+              },
+              required: ["ok", "configured", "attempted", "sent", "failed", "queued"],
+            }),
+            "403": errorResponse("Draining the outbox is operator-only"),
           },
         },
       },
@@ -1978,15 +2171,48 @@ export function buildOpenApiDocument() {
         Error: ERROR_SCHEMA,
         Account: {
           type: "object",
-          description: "A forge account. Password hashes and token hashes are never part of any response.",
+          description: "A forge account. Password hashes and token hashes are never part of any response. The email address rests ONLY as an encrypted binding (AES-256-GCM ciphertext + HMAC lookup tag, lib/emailcrypto.mjs): once bound, `email` carries the masked form and the full address is never returned by any endpoint.",
           properties: {
             id: { type: "string" },
-            email: { type: "string", format: "email" },
+            email: { type: ["string", "null"], description: "The masked address (\"a•••@example.com\") once an email is bound; a legacy pre-binding record may report its stored address until its first login or bind migrates it" },
+            emailBound: { type: "boolean", description: "Whether the account holds an encrypted email binding" },
+            emailMasked: { type: ["string", "null"], description: "The masked form of the account's email address" },
             name: { type: "string" },
             owner: { type: "string", description: "The account's namespace on the forge — its workspaces and repos live under this owner" },
             createdAt: { type: "string", format: "date-time" },
           },
           required: ["id", "email", "name", "owner", "createdAt"],
+        },
+        WorkspaceInvite: {
+          type: "object",
+          description: "A workspace invite issued to an email address. The address is stored encrypted (ciphertext + HMAC tag) and only its masked form is ever shown; the invite token is stored as a sha256 and shown exactly once, at creation.",
+          properties: {
+            id: { type: "string" },
+            workspaceId: { type: "string" },
+            email: { type: "string", description: "The masked invited address" },
+            role: { type: "string", enum: ["admin", "member"] },
+            status: { type: "string", enum: ["pending", "accepted", "revoked", "expired"] },
+            createdBy: { type: "string" },
+            createdAt: { type: "string", format: "date-time" },
+            expiresAt: { type: "string", format: "date-time" },
+          },
+          required: ["id", "workspaceId", "email", "role", "status", "createdAt", "expiresAt"],
+        },
+        OutboxMail: {
+          type: "object",
+          description: "One outbox record from the daemon mailer. `queued` means UNSENT — a record becomes `sent` only with a provider acceptance (whose id is providerId); failures carry the provider's reason in lastError and retry up to a bounded attempt count.",
+          properties: {
+            id: { type: "string" },
+            kind: { type: "string", enum: ["workspace-invite", "introduction", "account-notice"] },
+            to: { type: "string", description: "The masked recipient address" },
+            status: { type: "string", enum: ["queued", "sent", "failed"] },
+            attempts: { type: "integer" },
+            providerId: { type: ["string", "null"] },
+            lastError: { type: ["string", "null"] },
+            createdAt: { type: "string", format: "date-time" },
+            sentAt: { type: ["string", "null"], format: "date-time" },
+          },
+          required: ["id", "kind", "to", "status", "attempts"],
         },
         WalletLink: {
           type: "object",
