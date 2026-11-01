@@ -5,7 +5,11 @@
  *
  *   GET /v1/capabilities  → buildCapabilities(): the ability index.
  *   GET /v1/openapi.json  → buildOpenApiDocument(): OpenAPI 3.1 for the
- *                           workspace, repo-details, and discovery routes.
+ *                           daemon's whole /v1 surface (accounts, forge,
+ *                           packages, workspaces, sites, compute, promote,
+ *                           discovery). test/openapi-drift.test.mjs pins
+ *                           this document + the ability index to the
+ *                           routes lib/httpapi.mjs actually registers.
  *
  * Both are served bearer-gated like every other /v1 route (the forge
  * idiom — see docs/WORKSPACES.md). The documents describe the routes
@@ -291,10 +295,12 @@ export function buildCapabilities() {
       },
       {
         id: "sites",
-        title: "Sites — first-class frontend+backend repo pairings. Read-only here: list sites to discover the site ids that workspace create/link calls require",
+        title: "Sites — first-class frontend+backend repo pairings: create links two repos (and optionally a published artifact + a compute app) into one site and writes the linkage into both repos' KILN Memory; status aggregates both repo HEADs, the compute app, and the memory linkage live. List sites to discover the site ids that workspace create/link calls require. Deleting a site removes only the registry entry — repos, apps, and memory are untouched. Operator-only (account/agent tokens do not reach this surface)",
         endpoints: [
+          "POST /v1/sites",
           "GET /v1/sites",
           "GET /v1/sites/:id",
+          "DELETE /v1/sites/:id",
         ],
         mcpTools: [],
       },
@@ -379,6 +385,33 @@ export function buildCapabilities() {
         ],
         mcpTools: ["kiln_forge_packages_list", "kiln_forge_package_get", "kiln_forge_package_version_get", "kiln_forge_package_publish", "kiln_forge_package_download"],
       },
+      {
+        id: "compute",
+        title: "Compute — serverless functions on the swarm: invoke one function (optionally blocking with waitMs), fan one function over many items with map, read scheduler capacity, and host repo apps as supervised persistent services (with opt-in public preview URLs when a relay is configured). Operator-only. Programmatic access is the ComputeClient SDK (lib/compute-client.mjs), not MCP",
+        endpoints: [
+          "POST /v1/compute/invoke",
+          "GET /v1/compute/invocations/:id",
+          "POST /v1/compute/map",
+          "GET /v1/compute/map/:id",
+          "GET /v1/compute/capacity",
+          "POST /v1/compute/apps",
+          "GET /v1/compute/apps",
+          "GET /v1/compute/apps/:id",
+          "DELETE /v1/compute/apps/:id",
+          "GET /v1/compute/apps/:id/logs",
+          "POST /v1/compute/apps/:id/preview",
+          "DELETE /v1/compute/apps/:id/preview",
+        ],
+        mcpTools: [],
+      },
+      {
+        id: "promote",
+        title: "Promote — push a KILN-native repo to GitHub (Git Data API rebuild) with a structured receipt that never throws: stages name exactly where a promotion stopped (no_target, not_fast_forward, no_github_credential, github_*, …). Operator-only",
+        endpoints: [
+          "POST /v1/promote",
+        ],
+        mcpTools: [],
+      },
     ],
     openapi: "/v1/openapi.json",
     docs: "swarm/docs/WORKSPACES.md",
@@ -390,10 +423,10 @@ export function buildOpenApiDocument() {
   return {
     openapi: "3.1.0",
     info: {
-      title: "KILN Swarm API — workspaces & project details",
+      title: "KILN Swarm API",
       version: "1.0.0",
       description:
-        "Discovery surface for the KILN forge daemon: nested workspaces (groupings of repos + sites under one owner) and live per-repo project details. All routes require the daemon bearer token (Authorization: Bearer <token from <stateDir>/api.token>). Errors are {error} objects whose message says what to do next.",
+        "The KILN forge daemon's full /v1 surface: accounts + scoped agent identities, the GitHub-shaped forge (branches, contents-as-commits, pull requests, tags, releases, repo create/delete), packages, nested workspaces, sites, compute (serverless functions + app hosting), and GitHub promotion. Principals: the operator bearer token (root), account sessions (kiln_sess_…), and agent tokens (kiln_agt_…, scope-gated, owner-walled). Public repos additionally answer anonymous GETs. Errors are {error} objects whose message says what to do next. (The non-/v1 operator plane — /jobs, /nodes, /receipts/verify, the /git smart-HTTP + memory routes — is documented in lib/httpapi.mjs's header and swarm/README.md, not here.)",
     },
     // Relative on purpose: this document is served by the instance it
     // describes, whose port/base is deployment-specific (daemon.json's
@@ -498,7 +531,7 @@ export function buildOpenApiDocument() {
                   type: "object",
                   properties: {
                     name: { type: "string", maxLength: 120 },
-                    scopes: { type: "array", items: { type: "string", enum: ["workspaces", "project-details"] }, description: "Default: both scopes" },
+                    scopes: { type: "array", items: { type: "string", enum: ["workspaces", "project-details", "forge"] }, description: "Default: all scopes" },
                   },
                   required: ["name"],
                 },
@@ -679,6 +712,39 @@ export function buildOpenApiDocument() {
         },
       },
       "/v1/sites": {
+        post: {
+          operationId: "createSite",
+          summary: "Create a site: link a frontend repo + a backend repo (both must exist) into one site record, optionally with a published-artifact slug and a compute app ref. Also writes the linkage core blocks into both repos' KILN Memory; the registry entry is saved only after those writes succeed. Operator-only",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$" },
+                    frontend: { type: "string", description: "\"owner/repo\" of the site's UI repo" },
+                    backend: { type: "string", description: "\"owner/repo\" of the site's API/service repo" },
+                    artifact: { type: ["string", "null"], description: "Published web-artifact slug, if any" },
+                    computeApp: { type: ["string", "null"], description: "Compute app name or appId running the backend, if KILN-hosted" },
+                  },
+                  required: ["name", "frontend", "backend"],
+                },
+              },
+            },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, site: { $ref: "#/components/schemas/Site" } },
+              required: ["ok", "site"],
+            }),
+            "400": errorResponse("Malformed name/refs/artifact"),
+            "404": errorResponse("The frontend or backend repo does not exist"),
+            "409": errorResponse("A site with this name already exists"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
         get: {
           operationId: "listSites",
           summary: "List site registry records — the discovery read for site ids (workspace create/link validates ids; this is where they come from)",
@@ -720,6 +786,19 @@ export function buildOpenApiDocument() {
             "200": jsonResponse("Site status", { type: "object" }),
             "404": errorResponse("No such site"),
             "401": errorResponse("Missing or invalid bearer <redacted>"),
+          },
+        },
+        delete: {
+          operationId: "deleteSite",
+          summary: "Delete a site — the registry entry only; repos, compute apps, and memory linkage are untouched. Operator-only",
+          responses: {
+            "200": jsonResponse("Deleted", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, id: { type: "string" } },
+              required: ["ok", "id"],
+            }),
+            "404": errorResponse("No such site"),
+            "401": errorResponse("Missing or invalid bearer token"),
           },
         },
       },
@@ -796,6 +875,821 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      "/v1/repos/{owner}/{repo}/branches": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "listBranches",
+          summary: "List branches with tip shas (forge; public repos answer anyone, private repos owner-namespace only)",
+          responses: {
+            "200": jsonResponse("Branches", {
+              type: "object",
+              properties: { branches: { type: "array", items: { $ref: "#/components/schemas/Branch" } } },
+              required: ["branches"],
+            }),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        post: {
+          operationId: "createBranch",
+          summary: "Create a branch from a ref (default: the default branch's tip). Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                from: { type: "string", description: "Source ref/sha; defaults to the default branch" },
+              },
+              required: ["name"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, branch: { $ref: "#/components/schemas/Branch" } },
+              required: ["ok", "branch"],
+            }),
+            "400": errorResponse("Invalid branch name or source ref"),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/branches/{name}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "name", in: "path", required: true, schema: { type: "string" }, description: "Branch name, percent-encoded (slash-named branches encode as %2F)" },
+        ],
+        delete: {
+          operationId: "deleteBranch",
+          summary: "Delete a branch (the default branch is refused). Owner namespace / operator only",
+          responses: {
+            "200": jsonResponse("Deleted", { type: "object" }),
+            "400": errorResponse("Refused (e.g. the default branch)"),
+            "404": errorResponse("No such repo or branch"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/tree": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "readTree",
+          summary: "Read one directory level of a ref's tree",
+          parameters: [
+            { name: "ref", in: "query", required: false, schema: { type: "string" }, description: "Branch, tag, or sha; defaults to the default branch" },
+            { name: "path", in: "query", required: false, schema: { type: "string" }, description: "Directory path within the tree (default: root)" },
+          ],
+          responses: {
+            "200": jsonResponse("Tree level", { $ref: "#/components/schemas/Tree" }),
+            "404": errorResponse("No such repo, ref, or path"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/contents": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "getContents",
+          summary: "Read one file at a ref. Default response is base64 JSON; ?raw=1 returns the raw bytes with an x-kiln-sha header",
+          parameters: [
+            { name: "path", in: "query", required: false, schema: { type: "string" } },
+            { name: "ref", in: "query", required: false, schema: { type: "string" } },
+            { name: "raw", in: "query", required: false, schema: { type: "string", enum: ["1"] } },
+          ],
+          responses: {
+            "200": jsonResponse("File contents (base64) or raw bytes", { $ref: "#/components/schemas/Contents" }),
+            "404": errorResponse("No such repo, ref, or file"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        put: {
+          operationId: "putContents",
+          summary: "Write a file — a REAL git commit authored by the acting principal (the agent write path; git push stays operator-only). Pass the current blob sha to guard against overwriting someone else's change. Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                path: { type: "string" },
+                content: { type: "string", description: "File content (base64 when encoding is base64; plain text otherwise)" },
+                encoding: { type: "string", enum: ["base64", "utf8"], description: "Default utf8" },
+                message: { type: "string", description: "Commit message (required)" },
+                branch: { type: "string", description: "Target branch; defaults to the default branch" },
+                sha: { type: "string", description: "Expected current blob sha (optimistic concurrency)" },
+              },
+              required: ["path", "content", "message"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Committed", { type: "object" }),
+            "400": errorResponse("Malformed write"),
+            "404": errorResponse("No such repo or branch"),
+            "409": errorResponse("Sha mismatch — the file changed underneath you"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "deleteContents",
+          summary: "Delete a file — also a real commit by the acting principal. Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                path: { type: "string" },
+                message: { type: "string" },
+                branch: { type: "string" },
+                sha: { type: "string" },
+              },
+              required: ["path", "message"],
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Committed", { type: "object" }),
+            "404": errorResponse("No such repo, branch, or file"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/commits": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "listCommits",
+          summary: "Commit history for a ref, newest first",
+          parameters: [
+            { name: "ref", in: "query", required: false, schema: { type: "string" } },
+            { name: "limit", in: "query", required: false, schema: { type: "string" } },
+            { name: "path", in: "query", required: false, schema: { type: "string" }, description: "Only commits touching this path" },
+          ],
+          responses: {
+            "200": jsonResponse("Commits", { type: "object" }),
+            "404": errorResponse("No such repo or ref"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/commits/{sha}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "sha", in: "path", required: true, schema: { type: "string" }, description: "Full or abbreviated (≥4 hex) commit sha" },
+        ],
+        get: {
+          operationId: "getCommit",
+          summary: "One commit with its file stats",
+          responses: {
+            "200": jsonResponse("Commit", { type: "object" }),
+            "404": errorResponse("No such repo or commit"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/compare": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "compareRefs",
+          summary: "Compare two refs: ahead/behind counts, changed files, and a capped patch",
+          parameters: [
+            { name: "base", in: "query", required: true, schema: { type: "string" } },
+            { name: "head", in: "query", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": jsonResponse("Comparison", { type: "object" }),
+            "400": errorResponse("base/head missing or unresolvable"),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/tags": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "listTags",
+          summary: "List tags with their target shas",
+          responses: {
+            "200": jsonResponse("Tags", {
+              type: "object",
+              properties: { tags: { type: "array", items: { type: "object" } } },
+              required: ["tags"],
+            }),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/releases": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "listReleases",
+          summary: "List releases (tag + markdown notes, stored in the forge registry)",
+          responses: {
+            "200": jsonResponse("Releases", {
+              type: "object",
+              properties: { releases: { type: "array", items: { $ref: "#/components/schemas/Release" } } },
+              required: ["releases"],
+            }),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        post: {
+          operationId: "createRelease",
+          summary: "Create a release: tags the target ref and stores the notes. Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                tag: { type: "string" },
+                name: { type: "string" },
+                notes: { type: "string", description: "Markdown release notes" },
+                target: { type: "string", description: "Ref to tag; defaults to the default branch" },
+              },
+              required: ["tag"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, release: { $ref: "#/components/schemas/Release" } },
+              required: ["ok", "release"],
+            }),
+            "400": errorResponse("Invalid tag or target"),
+            "404": errorResponse("No such repo"),
+            "409": errorResponse("Tag or release already exists"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/releases/{tag}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "tag", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "getRelease",
+          summary: "One release by tag",
+          responses: {
+            "200": jsonResponse("Release", {
+              type: "object",
+              properties: { release: { $ref: "#/components/schemas/Release" } },
+              required: ["release"],
+            }),
+            "404": errorResponse("No such repo or release"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        patch: {
+          operationId: "updateRelease",
+          summary: "Edit a release's name/notes. Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: { name: { type: "string" }, notes: { type: "string" } },
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Updated", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, release: { $ref: "#/components/schemas/Release" } },
+              required: ["ok", "release"],
+            }),
+            "404": errorResponse("No such repo or release"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "deleteRelease",
+          summary: "Delete a release record; deleteTag:true also deletes the git tag. Owner namespace / operator only",
+          requestBody: {
+            required: false,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: { deleteTag: { type: "boolean" } },
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Deleted", { type: "object" }),
+            "404": errorResponse("No such repo or release"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/pulls": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "listPulls",
+          summary: "List pull requests, optionally filtered by ?state (open/closed/merged)",
+          parameters: [
+            { name: "state", in: "query", required: false, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": jsonResponse("Pull requests", {
+              type: "object",
+              properties: { pulls: { type: "array", items: { $ref: "#/components/schemas/Pull" } } },
+              required: ["pulls"],
+            }),
+            "404": errorResponse("No such repo"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        post: {
+          operationId: "createPull",
+          summary: "Open a pull request (head → base). On a repo whose base has no commits yet (pre-lifecycle legacy repos only — new repos are born with an initial commit) this answers an explicit 409 naming the state and the way out. Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                title: { type: "string" },
+                body: { type: "string" },
+                head: { type: "string", description: "Head branch" },
+                base: { type: "string", description: "Base branch; defaults to the default branch" },
+              },
+              required: ["title", "head"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, pull: { $ref: "#/components/schemas/Pull" } },
+              required: ["ok", "pull"],
+            }),
+            "400": errorResponse("Malformed pull (missing head/base, same branch)"),
+            "404": errorResponse("No such repo or branch"),
+            "409": errorResponse("Base branch has no commits yet (legacy unborn repo)"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/pulls/{n}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "n", in: "path", required: true, schema: { type: "integer" }, description: "Pull request number" },
+        ],
+        get: {
+          operationId: "getPull",
+          summary: "One pull request with comments + reviews",
+          responses: {
+            "200": jsonResponse("Pull request", {
+              type: "object",
+              properties: { pull: { $ref: "#/components/schemas/Pull" } },
+              required: ["pull"],
+            }),
+            "404": errorResponse("No such repo or pull"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        patch: {
+          operationId: "updatePull",
+          summary: "Edit title/body, or close/reopen (state). Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                title: { type: "string" },
+                body: { type: "string" },
+                state: { type: "string", enum: ["open", "closed"] },
+              },
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Updated", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, pull: { $ref: "#/components/schemas/Pull" } },
+              required: ["ok", "pull"],
+            }),
+            "404": errorResponse("No such repo or pull"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/pulls/{n}/comments": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "n", in: "path", required: true, schema: { type: "integer" } },
+        ],
+        post: {
+          operationId: "commentPull",
+          summary: "Comment on a pull request. Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: { body: { type: "string" } },
+              required: ["body"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Commented", { type: "object" }),
+            "404": errorResponse("No such repo or pull"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/pulls/{n}/reviews": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "n", in: "path", required: true, schema: { type: "integer" } },
+        ],
+        post: {
+          operationId: "reviewPull",
+          summary: "Review a pull request (approve / request_changes / comment). Owner namespace / operator only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                state: { type: "string", enum: ["approved", "changes_requested", "commented"] },
+                body: { type: "string" },
+              },
+              required: ["state"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Reviewed", { type: "object" }),
+            "400": errorResponse("Invalid review state"),
+            "404": errorResponse("No such repo or pull"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos/{owner}/{repo}/pulls/{n}/merge": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "repo", in: "path", required: true, schema: { type: "string" } },
+          { name: "n", in: "path", required: true, schema: { type: "integer" } },
+        ],
+        post: {
+          operationId: "mergePull",
+          summary: "Merge a pull request: method \"merge\" (merge commit) or \"ff\" (fast-forward only). deleteBranch:true deletes the head branch after a successful merge (default off; a branch that must stay never fails the merge — the answer reports headBranchDeleted/headBranchKept). CI is enqueued on the base branch after merge, best-effort. Owner namespace / operator only",
+          requestBody: {
+            required: false,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                method: { type: "string", enum: ["merge", "ff"] },
+                message: { type: "string", description: "Merge commit message override" },
+                deleteBranch: { type: "boolean" },
+              },
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Merged", { type: "object" }),
+            "400": errorResponse("Pull is not open, or method invalid"),
+            "404": errorResponse("No such repo or pull"),
+            "409": errorResponse("Merge conflict, or ff requested but not fast-forwardable"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/packages": {
+        get: {
+          operationId: "listPackages",
+          summary: "List packages (operator: any owner or ?owner= filter; account/agent principals: only their own namespace)",
+          parameters: [
+            { name: "owner", in: "query", required: false, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": jsonResponse("Packages", {
+              type: "object",
+              properties: { packages: { type: "array", items: { $ref: "#/components/schemas/Package" } } },
+              required: ["packages"],
+            }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/packages/{owner}/{name}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "name", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "getPackage",
+          summary: "One package with its versions",
+          responses: {
+            "200": jsonResponse("Package", {
+              type: "object",
+              properties: { package: { $ref: "#/components/schemas/Package" } },
+              required: ["package"],
+            }),
+            "404": errorResponse("No such package"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/packages/{owner}/{name}/{version}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "name", in: "path", required: true, schema: { type: "string" } },
+          { name: "version", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "getPackageVersion",
+          summary: "One package version with its files",
+          responses: {
+            "200": jsonResponse("Package version", { type: "object" }),
+            "404": errorResponse("No such package or version"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/packages/{owner}/{name}/{version}/{filename}": {
+        parameters: [
+          { name: "owner", in: "path", required: true, schema: { type: "string" } },
+          { name: "name", in: "path", required: true, schema: { type: "string" } },
+          { name: "version", in: "path", required: true, schema: { type: "string" } },
+          { name: "filename", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "downloadPackageFile",
+          summary: "Download a published file (raw bytes; x-kiln-sha256 header carries its digest)",
+          responses: {
+            "200": { description: "The file bytes", content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } } },
+            "404": errorResponse("No such package, version, or file"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        put: {
+          operationId: "publishPackageFile",
+          summary: "Publish a file (raw request body) under an immutable version: re-publishing identical bytes is idempotent (200); different bytes under the same version+file answer 409. ?description= and ?repo= attach metadata. Owner namespace / operator only",
+          parameters: [
+            { name: "description", in: "query", required: false, schema: { type: "string" } },
+            { name: "repo", in: "query", required: false, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } },
+          },
+          responses: {
+            "201": jsonResponse("Published", { type: "object" }),
+            "200": jsonResponse("Idempotent re-publish (same bytes)", { type: "object" }),
+            "409": errorResponse("Different bytes already published under this version+file"),
+            "413": errorResponse("File too large"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/promote": {
+        post: {
+          operationId: "promoteRepo",
+          summary: "Promote a KILN-native repo to GitHub (Git Data API rebuild). The receipt never throws: failures arrive as a receipt whose error.stage names where it stopped. Operator-only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                repo: { type: "string", description: "\"owner/repo\" of the KILN repo" },
+                github: { type: "string", description: "\"owner/repo\" on GitHub; defaults to the same owner/repo" },
+                branch: { type: "string" },
+                rebase: { type: "boolean" },
+                force: { type: "boolean" },
+              },
+              required: ["repo"],
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("Promotion receipt (ok:true)", { type: "object" }),
+            "400": errorResponse("Malformed repo/github (or receipt stage no_target/bad_target)"),
+            "404": errorResponse("Receipt stage repo_not_found / github_repo_not_found"),
+            "409": errorResponse("Receipt stage not_fast_forward / rebase_needs_root"),
+            "412": errorResponse("Receipt stage no_github_credential"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/invoke": {
+        post: {
+          operationId: "computeInvoke",
+          summary: "Invoke a serverless function (code must export main(args)). Without waitMs: 201 + poll the invocation. With waitMs (1000..300000): blocks and returns the full result. Operator-only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                code: { type: "string", description: "Module source, ≤256KB" },
+                args: { description: "JSON arguments for main(args)" },
+                timeoutMs: { type: "integer", minimum: 100, maximum: 300000 },
+                memoryMB: { type: "integer" },
+                network: { type: "boolean" },
+                retries: { type: "integer" },
+                waitMs: { type: "integer", minimum: 1000, maximum: 300000 },
+              },
+              required: ["code"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Accepted (no waitMs)", {
+              type: "object",
+              properties: {
+                invocationId: { type: "string" }, jobId: { type: "string" }, status: { type: "string" },
+              },
+              required: ["invocationId", "jobId", "status"],
+            }),
+            "200": jsonResponse("Completed result (waitMs set)", { type: "object" }),
+            "400": errorResponse("Malformed invocation or waitMs out of range"),
+            "429": errorResponse("Compute admission limit — retry shortly"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/invocations/{id}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "computeGetInvocation",
+          summary: "One invocation's status/result/logs",
+          responses: {
+            "200": jsonResponse("Invocation", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/map": {
+        post: {
+          operationId: "computeMap",
+          summary: "Fan one function over many items (max 64); each item is its own job spread across idle workers. Operator-only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                code: { type: "string" },
+                items: { type: "array", maxItems: 64 },
+                timeoutMs: { type: "integer" },
+                memoryMB: { type: "integer" },
+                network: { type: "boolean" },
+                retries: { type: "integer" },
+              },
+              required: ["code", "items"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Map accepted", { type: "object" }),
+            "400": errorResponse("Malformed map"),
+            "429": errorResponse("Compute admission limit — retry shortly"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/map/{id}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "computeGetMap",
+          summary: "One map's counts + per-item results",
+          responses: {
+            "200": jsonResponse("Map", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/capacity": {
+        get: {
+          operationId: "computeCapacity",
+          summary: "Scheduler capacity telemetry (Little's-law admission view)",
+          responses: {
+            "200": jsonResponse("Capacity", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/apps": {
+        post: {
+          operationId: "computeDeployApp",
+          summary: "Deploy a repo as a persistent supervised app (the worker boots the command, restarts it on crash; survives daemon restarts). public:true also enables a public preview URL when a relay is configured. Operator-only",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                repo: { type: "string", description: "Clone URL of the app repo" },
+                command: { type: "string" },
+                args: { type: "array", items: { type: "string" } },
+                env: { type: "object", additionalProperties: { type: "string" } },
+                port: { type: "integer" },
+                memoryMB: { type: "integer" },
+                public: { type: "boolean" },
+              },
+              required: ["name", "repo", "command"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Deployed", { type: "object" }),
+            "400": errorResponse("Malformed app spec"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        get: {
+          operationId: "computeListApps",
+          summary: "List deployed apps, each with its preview state",
+          responses: {
+            "200": jsonResponse("Apps", {
+              type: "object",
+              properties: { apps: { type: "array", items: { type: "object" } } },
+              required: ["apps"],
+            }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/apps/{id}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "computeGetApp",
+          summary: "One app's status + preview state",
+          responses: {
+            "200": jsonResponse("App status", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "computeUndeployApp",
+          summary: "Undeploy an app (stops it for good; its preview is torn down first). Operator-only",
+          responses: {
+            "200": jsonResponse("Undeployed", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/apps/{id}/logs": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          operationId: "computeAppLogs",
+          summary: "An app's log tail (?tail=N, default 100)",
+          parameters: [
+            { name: "tail", in: "query", required: false, schema: { type: "integer" } },
+          ],
+          responses: {
+            "200": jsonResponse("Logs", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/compute/apps/{id}/preview": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        post: {
+          operationId: "computeEnablePreview",
+          summary: "Enable the app's public preview URL (needs a configured relay; the answer says so when there is none)",
+          responses: {
+            "200": jsonResponse("Preview state", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "computeDisablePreview",
+          summary: "Disable the app's public preview URL",
+          responses: {
+            "200": jsonResponse("Preview state", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
       "/v1/capabilities": {
         get: {
           operationId: "getCapabilities",
@@ -842,11 +1736,112 @@ export function buildOpenApiDocument() {
             id: { type: "string" },
             accountId: { type: "string" },
             name: { type: "string" },
-            scopes: { type: "array", items: { type: "string", enum: ["workspaces", "project-details"] } },
+            scopes: { type: "array", items: { type: "string", enum: ["workspaces", "project-details", "forge"] } },
             createdAt: { type: "string", format: "date-time" },
             revoked: { type: "boolean" },
           },
           required: ["id", "accountId", "name", "scopes", "createdAt", "revoked"],
+        },
+        Site: {
+          type: "object",
+          properties: {
+            id: { type: "string", pattern: "^site_" },
+            name: { type: "string" },
+            frontend: { type: "string", description: "\"owner/repo\"" },
+            backend: { type: "string", description: "\"owner/repo\"" },
+            artifact: { type: ["string", "null"] },
+            computeApp: { type: ["string", "null"] },
+            createdAt: { type: "string", format: "date-time" },
+          },
+          required: ["id", "name", "frontend", "backend", "artifact", "computeApp", "createdAt"],
+        },
+        Branch: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            sha: { type: "string" },
+            shortSha: { type: "string" },
+            isDefault: { type: "boolean" },
+          },
+          required: ["name", "sha"],
+        },
+        Tree: {
+          type: "object",
+          properties: {
+            ref: { type: "string" },
+            path: { type: "string" },
+            entries: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  path: { type: "string" },
+                  type: { type: "string", enum: ["blob", "tree"] },
+                  sha: { type: "string" },
+                  size: { type: ["integer", "null"] },
+                },
+                required: ["name", "path", "type", "sha"],
+              },
+            },
+          },
+          required: ["ref", "path", "entries"],
+        },
+        Contents: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            ref: { type: "string" },
+            commit: { type: "string" },
+            sha: { type: "string", description: "Blob sha" },
+            size: { type: "integer" },
+            encoding: { type: "string", enum: ["base64"] },
+            content: { type: "string", description: "Base64 file bytes (absent when ?raw=1 streams the bytes instead)" },
+          },
+          required: ["path", "sha", "size"],
+        },
+        Pull: {
+          type: "object",
+          properties: {
+            number: { type: "integer" },
+            title: { type: "string" },
+            body: { type: "string" },
+            state: { type: "string", enum: ["open", "closed", "merged"] },
+            head: { type: "string" },
+            base: { type: "string" },
+            author: { type: "object" },
+            createdAt: { type: "string", format: "date-time" },
+            updatedAt: { type: "string", format: "date-time" },
+            comments: { type: "array", items: { type: "object" } },
+            reviews: { type: "array", items: { type: "object" } },
+          },
+          required: ["number", "title", "state", "head", "base"],
+        },
+        Release: {
+          type: "object",
+          properties: {
+            tag: { type: "string" },
+            name: { type: "string" },
+            notes: { type: "string" },
+            target: { type: "string" },
+            sha: { type: "string" },
+            author: { type: "object" },
+            createdAt: { type: "string", format: "date-time" },
+            updatedAt: { type: "string", format: "date-time" },
+          },
+          required: ["tag"],
+        },
+        Package: {
+          type: "object",
+          properties: {
+            owner: { type: "string" },
+            name: { type: "string" },
+            versions: { type: "array", items: { type: "string" } },
+            description: { type: ["string", "null"] },
+            repo: { type: ["string", "null"] },
+            updatedAt: { type: ["string", "null"], format: "date-time" },
+          },
+          required: ["owner", "name"],
         },
         Workspace: WORKSPACE_SCHEMA,
         WorkspaceTreeNode: WORKSPACE_TREE_NODE_SCHEMA,
