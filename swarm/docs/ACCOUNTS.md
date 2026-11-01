@@ -102,6 +102,38 @@ The daemon surface is the whole of this piece; the app-side restore
 UX (restore flow, backup prompt at generation, Phantom link in
 profile settings) is a separate lane in kiln-workspace.
 
+## Encrypted email binding
+
+An account can be tied to its email — the business identity and the
+recovery path — under the architect's rule (2026-10-31): *"encrypt
+my email and stuff."* The binding (`lib/emailcrypto.mjs`) is the
+**only** storage an address gets:
+
+- At rest an address is an **AES-256-GCM ciphertext** plus an
+  **HMAC-SHA256 lookup tag** over the normalized (trim + lowercase)
+  address, plus its **masked form** (`a•••@example.com`). The master
+  key lives in `<stateDir>/email.key` (mode 0600, generated on first
+  use, never committed, never logged); encryption and HMAC keys are
+  HKDF-derived from it under separate labels.
+- **Matching never decrypts.** Login, duplicate checks, and invite
+  acceptance all compare HMAC tags. Decryption exists only for
+  in-memory internal uses (forge commit authorship; the mailer's
+  send moment) — **no endpoint returns a full address once a binding
+  exists**: `GET /v1/accounts/me` carries `emailMasked` and
+  `emailBound: true`.
+- **Signup binds** through this same path (no plaintext address is
+  stored for a new account). A legacy record from before the binding
+  era keeps its plaintext address until its first successful login
+  or a bind migrates it — the plaintext is deleted in the same write.
+- `PUT /v1/accounts/me/email` (session-only) binds or rebinds. **One
+  address ties to exactly one account** — an address held by another
+  account answers 409. A binding *change* enqueues the introduction
+  email (see `docs/MAIL.md`); re-saving the same address stays quiet.
+- **Workspace invites adopt bindings** (see `docs/WORKSPACES.md`):
+  accepting an invite copies the invite's encrypted binding onto an
+  unbound account; an account bound to a *different* address is
+  refused 409 — an invite can never silently re-tie an account.
+
 ## Known limits (named, not hidden)
 
 - No rate limiting on login/signup yet — the forge is

@@ -248,6 +248,45 @@ swarm.mjs workspaces remove dfw-haul --confirm dfw-haul
 The CLI works directly on local state (registry + git + memory), like
 `swarm.mjs sites` — no daemon needs to be running.
 
+## Members + invites by email
+
+A workspace has exactly one **owner** (the account whose namespace it
+lives in — full control, never a "member") plus **member accounts**
+with a role, stored on the record as `members[]` (records written
+before membership existed read as an empty list — no migration):
+
+- **admin** — can read the workspace and manage email invites
+- **member** — can read the workspace
+
+Workspace edits (PATCH) and deletion stay owner-only in this slice;
+member access is read + (for admins) invite management, enforced at
+the routes. `GET /v1/workspaces` for an account principal lists the
+workspaces it owns **or belongs to**.
+
+The one door in is an **email invite** (the architect's order,
+2026-10-31: *"create a workspace and be able to add me by email"*),
+implemented in `lib/invites.mjs`:
+
+- `POST /v1/workspaces/:id/invites` `{email, role}` — owner/admin
+  only. The address is stored **encrypted** (the binding shape of
+  `lib/emailcrypto.mjs`: ciphertext + HMAC tag + masked form); the
+  invite list (`GET …/invites`) shows masked addresses only.
+- The invite carries a random **single-use token**; only its sha256
+  is stored. The plaintext token is returned **exactly once**, in the
+  create response — and it is also enqueued as a `workspace-invite`
+  email through the mailer (see `docs/MAIL.md`), traveling as
+  ciphertext in the outbox until a transport sends it.
+- `POST /v1/invites/:token/accept` (an account **session** — not an
+  agent token, not the operator) binds identity to the invite: an
+  unbound account adopts the invite's encrypted email binding; an
+  account bound to a **different** address answers **409**. The
+  account then joins with the invite's role and the invite is
+  consumed; the workspace's own owner accepting simply confirms the
+  binding (the owner is never written as a member). Expired invites
+  answer **410**; consumed, revoked, and unknown tokens answer an
+  indistinguishable **404**. `DELETE …/invites/:inviteId` revokes a
+  pending invite. Invites live 7 days.
+
 ## On-chain anchoring: deliberately not faked
 
 Sites set the precedent: registry objects are forge-native, and nothing
