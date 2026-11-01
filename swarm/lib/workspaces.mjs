@@ -82,9 +82,19 @@ function parentIdOf(workspace) {
   return workspace.parentId ?? null;
 }
 
-/** Public view of a record: parentId always present (null for roots). */
+/**
+ * Account members of a workspace (see the members section below).
+ * Records written before membership existed carry no members field;
+ * they read as an empty member list everywhere — no migration write
+ * is ever needed.
+ */
+function membersOf(workspace) {
+  return Array.isArray(workspace.members) ? workspace.members : [];
+}
+
+/** Public view of a record: parentId + members always present. */
 function recordView(workspace) {
-  return { ...workspace, parentId: parentIdOf(workspace) };
+  return { ...workspace, parentId: parentIdOf(workspace), members: membersOf(workspace) };
 }
 
 /** The {id, owner, slug, name} summary used for parent/children links. */
@@ -275,6 +285,7 @@ export function createWorkspace(dir, { owner, slug, name, description, repos, si
     repos: repoRefs,
     siteIds: siteIdList,
     parentId: parent ? parent.id : null,
+    members: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -350,6 +361,7 @@ export function updateWorkspace(dir, id, patch = {}, { actor } = {}) {
   const next = {
     ...workspace, parentId: parentIdOf(workspace),
     repos: [...workspace.repos], siteIds: [...workspace.siteIds],
+    members: [...membersOf(workspace)],
   };
   if (patch.name !== undefined) next.name = validName(patch.name);
   if (patch.description !== undefined) next.description = validDescription(patch.description);
@@ -426,6 +438,75 @@ export function deleteWorkspace(dir, id, { confirm } = {}) {
   delete store.workspaces[id];
   saveStore(dir, store);
   return { ok: true, id };
+}
+
+// ---------------------------------------------------------------- members
+//
+// Membership is the account-level access layer on top of the owner
+// model: a workspace has exactly one OWNER (the account whose
+// namespace it lives in — full control, never a "member"), plus
+// member accounts with a role:
+//
+//   admin  — can read the workspace and manage email invites
+//   member — can read the workspace
+//
+// Members join through email invites (lib/invites.mjs) — accepting an
+// invite is the one door in, and addWorkspaceMember is the one write
+// path, so every membership carries its provenance (`via`). Workspace
+// edits (PATCH) and deletion stay owner-only in this slice; member
+// access is read + (for admins) invite management, enforced at the
+// routes.
+
+export const WORKSPACE_MEMBER_ROLES = ["admin", "member"];
+
+/** "owner" | "admin" | "member" | null for an account owner name. */
+export function workspaceRoleFor(dir, idOrSlug, owner) {
+  const workspace = resolveWorkspace(dir, idOrSlug);
+  if (workspace.owner === owner) return "owner";
+  const m = membersOf(workspace).find((x) => x.owner === owner);
+  return m ? m.role : null;
+}
+
+/**
+ * Add (or re-role) a member. Upsert by owner namespace: accepting a
+ * second invite updates the role instead of duplicating the row.
+ * The workspace's own owner can never be a member (400).
+ */
+export function addWorkspaceMember(dir, id, { owner, accountId, role, via } = {}) {
+  validOwner(owner);
+  if (!WORKSPACE_MEMBER_ROLES.includes(role)) {
+    throw new WorkspacesError(400, `role must be one of: ${WORKSPACE_MEMBER_ROLES.join(", ")}`);
+  }
+  const store = loadStore(dir);
+  const workspace = store.workspaces[id];
+  if (!workspace) throw new WorkspacesError(404, `no such workspace: ${id}`);
+  if (workspace.owner === owner) {
+    throw new WorkspacesError(400, `"${owner}" owns this workspace — the owner is never a member of their own workspace`);
+  }
+  const members = [...membersOf(workspace)];
+  const existing = members.find((m) => m.owner === owner);
+  if (existing) {
+    existing.role = role;
+    if (accountId) existing.accountId = accountId;
+  } else {
+    members.push({
+      owner, accountId: accountId || null, role,
+      via: via || "invite", joinedAt: new Date().toISOString(),
+    });
+  }
+  const next = {
+    ...workspace, parentId: parentIdOf(workspace), members,
+    updatedAt: new Date().toISOString(),
+  };
+  store.workspaces[id] = next;
+  saveStore(dir, store);
+  return recordView(next);
+}
+
+/** Every workspace an account owns OR belongs to as a member. */
+export function listWorkspacesForAccount(dir, owner) {
+  return listWorkspaces(dir).filter(
+    (w) => w.owner === owner || membersOf(w).some((m) => m.owner === owner));
 }
 
 // ---------------------------------------------------------------- live status
