@@ -330,7 +330,7 @@ export function buildCapabilities() {
       },
       {
         id: "mail",
-        title: "Mail — the daemon sends email from a template registry (workspace invites, the welcome/introduction, generic account notices) through an outbox with an honest state machine: enqueue records intent as `queued`; only a provider acceptance moves a record to `sent` (with the provider id); failures keep the provider's reason and retry bounded times. Transport is env-configured (SMTP — Outlook-compatible — or an HTTPS relay API); with NO transport configured, mail queues and reports itself queued-unsent, never sent. Operator-only. Model: swarm/docs/MAIL.md",
+        title: "Mail — the daemon sends email from a template registry (workspace invites, the welcome/introduction, generic account notices) through an outbox with an honest state machine: enqueue records intent as `queued`; only a provider acceptance moves a record to `sent` (with the provider id); failures keep the provider's reason and retry bounded times. Transport is env-configured (Cloudflare Email Sending — the ratified transport, gated on a scoped token + domain onboarding — SMTP, or an HTTPS relay API); with NO transport configured, mail queues and reports itself queued-unsent, never sent. Operator-only. Model: swarm/docs/MAIL.md",
         endpoints: [
           "GET /v1/mail/outbox",
           "POST /v1/mail/send",
