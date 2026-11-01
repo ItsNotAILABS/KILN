@@ -37,7 +37,13 @@ const EXPECTED = [
   ["GET", "/v1/accounts/me/agents"],
   ["DELETE", "/v1/accounts/me/agents/{id}"],
   // repo lifecycle + project details
+  ["POST", "/v1/repos"],
   ["DELETE", "/v1/repos/{owner}/{repo}"],
+  // creation templates (per-account)
+  ["POST", "/v1/templates"],
+  ["GET", "/v1/templates"],
+  ["GET", "/v1/templates/{id}"],
+  ["DELETE", "/v1/templates/{id}"],
   ["GET", "/v1/repos/{owner}/{repo}/details"],
   ["PATCH", "/v1/repos/{owner}/{repo}/details"],
   // forge

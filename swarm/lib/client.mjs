@@ -117,6 +117,32 @@ export class SwarmClient {
     if (!owner || !repo) throw new Error("deleteRepo: owner and repo are required");
     return this._req("DELETE", `/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
   }
+  /**
+   * Canonical repo creation under /v1 (POST /v1/repos): owners create
+   * under their own namespace with an account session or forge-scoped
+   * agent token (construct this client with that token — connect()
+   * reads the operator token); the operator creates anywhere. The
+   * optional template scaffolds the initial commit:
+   * {license?, licenseText?, readme?, gitignore?, templateId?}.
+   * Returns {ok, owner, repo, cloneUrl, initialCommit, files, template}.
+   */
+  async createRepoV1({ owner, repo, description, visibility, template }) {
+    if (!owner || !repo) throw new Error("createRepoV1: owner and repo are required");
+    return this._req("POST", "/v1/repos", { owner, repo, description, visibility, template });
+  }
+  // ---- creation templates (per-account; need an account principal) ----
+  async createTemplate(body) {
+    return (await this._req("POST", "/v1/templates", body)).template;
+  }
+  async listTemplates() {
+    return (await this._req("GET", "/v1/templates")).templates;
+  }
+  async getTemplate(id) {
+    return (await this._req("GET", `/v1/templates/${encodeURIComponent(id)}`)).template;
+  }
+  async deleteTemplate(id) {
+    return this._req("DELETE", `/v1/templates/${encodeURIComponent(id)}`);
+  }
 
   // ---- per-repo memory (refs/kiln/memory; see lib/memory.mjs) ----
   _memBase(owner, repo) {

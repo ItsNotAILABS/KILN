@@ -36,6 +36,23 @@
  *   POST /git/:owner/:repo            create repo (operator only; the repo
  *                                     is born with an initial commit on
  *                                     main, authored by the creator)
+ *   POST /v1/repos                    canonical repo create under /v1:
+ *                                     {owner, repo, description?,
+ *                                     visibility?, template?} -> 201.
+ *                                     Owners create under their own
+ *                                     namespace (session or forge-scoped
+ *                                     agent); the operator anywhere.
+ *                                     template {license, licenseText?,
+ *                                     readme?, gitignore?, templateId?}
+ *                                     scaffolds the initial commit
+ *                                     (lib/templates.mjs).
+ *   /v1/templates                     per-account saved creation
+ *                                     templates: POST create, GET list,
+ *                                     GET /:id, DELETE /:id — always the
+ *                                     CALLER's account's templates
+ *                                     (session or forge-scoped agent;
+ *                                     the operator has no account and
+ *                                     gets a 403 saying so).
  *   DELETE /v1/repos/:owner/:repo     delete repo outright (the owner's
  *                                     account session or the operator;
  *                                     agent tokens can NEVER delete)
@@ -208,6 +225,10 @@ import {
   AccountsError, accountPublic, agentPublic, createAccount, login,
   createAgent, listAgents, revokeAgent, resolveAccountToken,
 } from "./accounts.mjs";
+import {
+  TemplatesError, resolveTemplateFiles, getTemplate,
+  createTemplate, listTemplates, getTemplatePublic, deleteTemplate,
+} from "./templates.mjs";
 import { buildCapabilities, buildOpenApiDocument } from "./openapi.mjs";
 
 // 4MB: the forge contents API carries base64-encoded files (1MB raw
@@ -657,17 +678,19 @@ export function startApiServer(dir, cfg) {
         }
         const forgeRepoRoute = /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(branches|tree|contents|commits|compare|pulls|tags|releases)(\/.*)?$/.test(path);
         const packageRoute = path === "/v1/packages" || path.startsWith("/v1/packages/");
+        const repoCreateRoute = req.method === "POST" && path === "/v1/repos";
+        const templatesRoute = path === "/v1/templates" || path.startsWith("/v1/templates/");
         const allowed =
           path === "/v1/capabilities" || path === "/v1/openapi.json" ||
           path === "/v1/workspaces" || path.startsWith("/v1/workspaces/") ||
           /^\/v1\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/details$/.test(path) ||
-          forgeRepoRoute || packageRoute;
+          forgeRepoRoute || packageRoute || repoCreateRoute || templatesRoute;
         if (!allowed) {
-          return send(res, 403, { error: "this surface is operator-only — account and agent tokens cover workspaces, project details, the forge (branches/contents/pulls/releases/packages), and their own account routes (see swarm/docs/ACCOUNTS.md)" });
+          return send(res, 403, { error: "this surface is operator-only — account and agent tokens cover workspaces, project details, the forge (branches/contents/pulls/releases/packages), repo creation + their creation templates, and their own account routes (see swarm/docs/ACCOUNTS.md)" });
         }
         if (principal.kind === "agent") {
           const ability = path.startsWith("/v1/workspaces") ? "workspaces"
-            : (forgeRepoRoute || packageRoute) ? "forge"
+            : (forgeRepoRoute || packageRoute || repoCreateRoute || templatesRoute) ? "forge"
             : path.startsWith("/v1/repos/") ? "project-details" : null;
           if (ability && !principal.agent.scopes.includes(ability)) {
             return send(res, 403, { error: `this agent token lacks the "${ability}" scope` });
@@ -1214,6 +1237,108 @@ export function startApiServer(dir, cfg) {
             throw e;
           }
         }
+      }
+
+      // ---- repo create: POST /v1/repos (canonical, under /v1) ----
+      // The POST /git/:owner/:repo route above stays (operator-only,
+      // the CLI's door); this is the account-era door: an owner creates
+      // under their own namespace with a session or a forge-scoped
+      // agent token, the operator anywhere. The optional template
+      // scaffolds the born-PR-ready initial commit — LICENSE / README /
+      // .gitignore / a saved template's files land IN that commit
+      // (lib/templates.mjs), not a follow-up.
+      if (req.method === "POST" && path === "/v1/repos") {
+        const b = await readBody(req);
+        const actor = actorOf(principal);
+        try {
+          const { owner, repo } = b;
+          if (principal.kind !== "operator" && owner !== principal.account?.owner) {
+            return send(res, 403, { error: `account principals may create repos only under their own owner namespace ("${principal.account?.owner}")` });
+          }
+          if (!validRepoName(owner) || !validRepoName(repo)) {
+            return send(res, 400, { error: `invalid owner/repo name: ${owner}/${repo}` });
+          }
+          if (b.description !== undefined && (typeof b.description !== "string" || b.description.length > 1024)) {
+            return send(res, 400, { error: "description must be a string of at most 1024 characters" });
+          }
+          if (b.visibility !== undefined && !["private", "public"].includes(b.visibility)) {
+            return send(res, 400, { error: 'visibility must be "private" or "public"' });
+          }
+          const retry = writeRateLimited(principal);
+          if (retry) return send(res, 429, { error: "forge write rate limit (120/min per principal) — slow down" }, { "retry-after": String(retry) });
+          let saved = null;
+          const spec = b.template || null;
+          if (spec && spec.templateId !== undefined && spec.templateId !== null) {
+            if (principal.kind === "operator") {
+              throw new TemplatesError(400, "templateId names one of your account's saved templates — the operator token has no account; pass the template inline instead");
+            }
+            saved = getTemplate(dir, principal.account.id, spec.templateId);
+            if (!saved) throw new TemplatesError(404, `no such template: ${spec.templateId}`);
+          }
+          const { files, template } = resolveTemplateFiles({
+            owner, repo, description: b.description, spec, saved,
+          });
+          const r = createRepo(dir, owner, repo, {
+            author: { name: actor.name, email: actor.email },
+            files,
+          });
+          if (b.description !== undefined || b.visibility !== undefined) {
+            updateRepoDetails(dir, owner, repo, {
+              description: b.description, visibility: b.visibility,
+            });
+          }
+          appendAudit(dir, actor, "repo.create", `${owner}/${repo}`, { template, files: files.map((f) => f.path) });
+          return send(res, 201, {
+            ok: true, owner, repo,
+            cloneUrl: `http://127.0.0.1:${apiPort}/git/${owner}/${repo}`,
+            initialCommit: r.initialCommit,
+            files: files.map((f) => f.path),
+            template,
+          });
+        } catch (e) {
+          if (e instanceof TemplatesError || e instanceof RepoDetailsError) {
+            return send(res, e.status, { error: e.message });
+          }
+          if (e.code === "EXISTS") return send(res, 409, { error: e.message });
+          return send(res, 400, { error: e.message });
+        }
+      }
+
+      // ---- creation templates: the caller's own saved templates ----
+      // Per-account records (lib/templates.mjs). Sessions and agents
+      // manage their own account's; a template id from another account
+      // is a 404, never a borrow. The operator token has no account —
+      // a 403 says so rather than inventing an operator template book.
+      if (path === "/v1/templates" || path.startsWith("/v1/templates/")) {
+        if (principal.kind === "anonymous") return unauthorized(res);
+        if (principal.kind === "operator") {
+          return send(res, 403, { error: "creation templates belong to accounts — sign in with an account session (or use one of its agent tokens) to manage them" });
+        }
+        const accountId = principal.account.id;
+        try {
+          if (req.method === "POST" && path === "/v1/templates") {
+            const b = await readBody(req);
+            const retry = writeRateLimited(principal);
+            if (retry) return send(res, 429, { error: "forge write rate limit (120/min per principal) — slow down" }, { "retry-after": String(retry) });
+            return send(res, 201, { ok: true, template: createTemplate(dir, accountId, b) });
+          }
+          if (req.method === "GET" && path === "/v1/templates") {
+            return send(res, 200, { templates: listTemplates(dir, accountId) });
+          }
+          const tm = path.match(/^\/v1\/templates\/([A-Za-z0-9_.-]+)$/);
+          if (req.method === "GET" && tm) {
+            return send(res, 200, { template: getTemplatePublic(dir, accountId, tm[1]) });
+          }
+          if (req.method === "DELETE" && tm) {
+            const retry = writeRateLimited(principal);
+            if (retry) return send(res, 429, { error: "forge write rate limit (120/min per principal) — slow down" }, { "retry-after": String(retry) });
+            return send(res, 200, deleteTemplate(dir, accountId, tm[1]));
+          }
+        } catch (e) {
+          if (e instanceof TemplatesError) return send(res, e.status, { error: e.message });
+          throw e;
+        }
+        return send(res, 404, { error: "not found" });
       }
 
       // ---- project details: live per-repo facts + editable metadata ----

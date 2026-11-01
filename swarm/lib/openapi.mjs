@@ -319,8 +319,9 @@ export function buildCapabilities() {
       },
       {
         id: "forge",
-        title: "Forge — the GitHub-shaped repo surface: branches, tree/contents (files written as real git commits by the acting principal — no local clone needed), commit history, compare/diff, pull requests (open, comment, review, merge: fast-forward or merge-commit, optional deleteBranch on merge, CI enqueued on the base), tags and releases with markdown notes. Repos are born with an initial commit on main (authored by the creator), so branch → PR → merge works immediately — no client-side seed commit. A repo can be deleted outright (DELETE /v1/repos/:owner/:repo) by its owner's account session or the operator only — agent tokens can never delete. Account/agent principals are walled to their own owner namespace; agents need the \"forge\" scope. Every mutation lands in the forge audit log",
+        title: "Forge — the GitHub-shaped repo surface: branches, tree/contents (files written as real git commits by the acting principal — no local clone needed), commit history, compare/diff, pull requests (open, comment, review, merge: fast-forward or merge-commit, optional deleteBranch on merge, CI enqueued on the base), tags and releases with markdown notes. Repos are created canonically at POST /v1/repos (owners under their own namespace; the legacy POST /git/:owner/:repo stays operator-only) and are born with an initial commit on main (authored by the creator), so branch → PR → merge works immediately — no client-side seed commit. A repo can be deleted outright (DELETE /v1/repos/:owner/:repo) by its owner's account session or the operator only — agent tokens can never delete. Account/agent principals are walled to their own owner namespace; agents need the \"forge\" scope. Every mutation lands in the forge audit log",
         endpoints: [
+          "POST /v1/repos",
           "DELETE /v1/repos/:owner/:repo",
           "GET /v1/repos/:owner/:repo/branches",
           "POST /v1/repos/:owner/:repo/branches",
@@ -401,6 +402,17 @@ export function buildCapabilities() {
           "GET /v1/compute/apps/:id/logs",
           "POST /v1/compute/apps/:id/preview",
           "DELETE /v1/compute/apps/:id/preview",
+        ],
+        mcpTools: [],
+      },
+      {
+        id: "templates",
+        title: "Creation templates — what a new repo is born with. POST /v1/repos accepts a template: a built-in license (MIT, Apache-2.0, GPL-3.0, BSD-3-Clause, none, or custom license text), a scaffold README, and a preset .gitignore (node/python) — all landing IN the initial commit. Accounts also save their OWN templates (license + flags + arbitrary files) and reference them by templateId at create time; inline fields override the saved template per-field, and a template's own files are never overwritten by scaffolding. Templates are per-account: another account's template id is a 404, never a borrow. The operator token has no account and cannot hold templates",
+        endpoints: [
+          "POST /v1/templates",
+          "GET /v1/templates",
+          "GET /v1/templates/:id",
+          "DELETE /v1/templates/:id",
         ],
         mcpTools: [],
       },
@@ -798,6 +810,109 @@ export function buildOpenApiDocument() {
               required: ["ok", "id"],
             }),
             "404": errorResponse("No such site"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/repos": {
+        post: {
+          operationId: "createRepo",
+          summary: "Create a repo (canonical, under /v1). Owners create under their own namespace (account session or forge-scoped agent token); the operator creates anywhere. The repo is born with an initial commit on main authored by the creator; the optional template scaffolds that commit (LICENSE / README.md / .gitignore / a saved template's files)",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              properties: {
+                owner: { type: "string", pattern: "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$" },
+                repo: { type: "string", pattern: "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$" },
+                description: { type: "string", maxLength: 1024 },
+                visibility: { type: "string", enum: ["private", "public"] },
+                template: { $ref: "#/components/schemas/RepoTemplate" },
+              },
+              required: ["owner", "repo"],
+            } } },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                owner: { type: "string" },
+                repo: { type: "string" },
+                cloneUrl: { type: "string" },
+                initialCommit: { type: "string" },
+                files: { type: "array", items: { type: "string" }, description: "Paths scaffolded into the initial commit" },
+                template: { type: "object", description: "The resolved template summary" },
+              },
+              required: ["ok", "owner", "repo", "initialCommit"],
+            }),
+            "400": errorResponse("Invalid name, template, license, or preset — the message says what to fix"),
+            "403": errorResponse("Creating under another account's namespace, or an agent token without the forge scope"),
+            "404": errorResponse("templateId names no template of the caller's account"),
+            "409": errorResponse("Repo already exists"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/templates": {
+        post: {
+          operationId: "createTemplate",
+          summary: "Save a creation template under your account (session or forge-scoped agent token; the operator has no account and gets a 403). Names are unique per account",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { $ref: "#/components/schemas/CreationTemplateInput" } } },
+          },
+          responses: {
+            "201": jsonResponse("Created", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, template: { $ref: "#/components/schemas/CreationTemplate" } },
+              required: ["ok", "template"],
+            }),
+            "400": errorResponse("Validation failed — the message says what to fix"),
+            "409": errorResponse("You already have a template with this name"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        get: {
+          operationId: "listTemplates",
+          summary: "List your account's saved creation templates",
+          responses: {
+            "200": jsonResponse("Your templates", {
+              type: "object",
+              properties: { templates: { type: "array", items: { $ref: "#/components/schemas/CreationTemplate" } } },
+              required: ["templates"],
+            }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/templates/{id}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" }, description: "Template id (tpl_…)" },
+        ],
+        get: {
+          operationId: "getTemplate",
+          summary: "One of your templates (another account's id answers 404 — templates are never shared implicitly)",
+          responses: {
+            "200": jsonResponse("Template", {
+              type: "object",
+              properties: { template: { $ref: "#/components/schemas/CreationTemplate" } },
+              required: ["template"],
+            }),
+            "404": errorResponse("No such template on your account"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "deleteTemplate",
+          summary: "Delete one of your templates (repos already created from it are unaffected)",
+          responses: {
+            "200": jsonResponse("Deleted", {
+              type: "object",
+              properties: { ok: { type: "boolean" }, id: { type: "string" } },
+              required: ["ok", "id"],
+            }),
+            "404": errorResponse("No such template on your account"),
             "401": errorResponse("Missing or invalid bearer token"),
           },
         },
@@ -1741,6 +1856,52 @@ export function buildOpenApiDocument() {
             revoked: { type: "boolean" },
           },
           required: ["id", "accountId", "name", "scopes", "createdAt", "revoked"],
+        },
+        RepoTemplate: {
+          type: "object",
+          description: "The template spec accepted by POST /v1/repos. A saved template (templateId) supplies defaults; inline fields override it per-field (the license fields act as one unit). Scaffolded files never overwrite a saved template's own files",
+          properties: {
+            license: { type: "string", description: "Built-in id (MIT, Apache-2.0, GPL-3.0, BSD-3-Clause), \"none\", or — when long (>60 chars) or multi-line — the custom license text itself. A short unknown string answers 400 (a typo is not a license)" },
+            licenseText: { type: "string", description: "Custom license text, verbatim; wins over license when present" },
+            readme: { type: "boolean", description: "Scaffold a README.md (title + the create description, when given)" },
+            gitignore: { type: "string", enum: ["node", "python", "none"], description: ".gitignore preset" },
+            templateId: { type: "string", description: "One of YOUR account's saved templates (tpl_…)" },
+          },
+        },
+        CreationTemplateInput: {
+          type: "object",
+          properties: {
+            name: { type: "string", maxLength: 120 },
+            license: { type: "string", description: "Same typing as RepoTemplate.license" },
+            licenseText: { type: "string" },
+            readme: { type: "boolean" },
+            gitignore: { type: "string", enum: ["node", "python", "none"] },
+            files: {
+              type: "array", maxItems: 50,
+              items: {
+                type: "object",
+                properties: { path: { type: "string" }, content: { type: "string" } },
+                required: ["path", "content"],
+              },
+              description: "Files the template carries into every repo created from it (≤64KB each, ≤256KB total)",
+            },
+          },
+          required: ["name"],
+        },
+        CreationTemplate: {
+          type: "object",
+          properties: {
+            id: { type: "string", pattern: "^tpl_" },
+            name: { type: "string" },
+            licenseId: { type: ["string", "null"], description: "Resolved built-in id, \"none\", or null when licenseText carries a custom license" },
+            licenseText: { type: ["string", "null"] },
+            readme: { type: "boolean" },
+            gitignore: { type: ["string", "null"] },
+            files: { type: "array", items: { type: "object" } },
+            createdAt: { type: "string", format: "date-time" },
+            updatedAt: { type: "string", format: "date-time" },
+          },
+          required: ["id", "name"],
         },
         Site: {
           type: "object",
