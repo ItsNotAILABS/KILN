@@ -89,7 +89,51 @@ app f1b10e2e (branch lane-b-oauth-app).
   flickered suites all pass standalone (known host flake family).
   ACCOUNTS.md carries env names + redirect URIs + the one gate.
   STAGED for next Doctor boot (404 live until then).
-- OAuth APP (f1b10e2e) still running at this checkpoint.
+- OAuth APP DONE (f1b10e2e): branch lane-b-oauth-app, 7 commits.
+  Slice 1 root cause PROVEN: "Sign-in failed" is the fallback literal of
+  the grok-auth wrapper in client-DRhaju3Z.js; the pre-v47 login chunk
+  called it against the stubbed lab stack, which always errors → the
+  catch wrote the literal into the banner. New wiring never uses that
+  banner for provider state. Built: oauthPreflight/oauthStartUrl/
+  oauthHandoff/oauthComplete + fragment handling at boot (handoff →
+  session in kiln.daemon.session.v1; pending → handle-pick, survives
+  reload; fragment always scrubbed); buttons preflight → navigate only
+  when configured, else the muted not-switched-on state; /account shows
+  Google/X link rows from account.oauthLinks (extra-provider linking
+  while signed in: no door in the contract — flagged, not invented).
+  Contract verified line-by-line vs the daemon branch — zero drift.
+  Ephemeral proof vs real daemon code 7/7; stub harness 6/6.
+  Disclosed shortfall: handle-pick submit click-through + 375px renders
+  not captured in-browser (Chromium wedged under load 17–58);
+  .scratch/flow.mjs committed as the one-command re-run.
+- OAuth app landing: DONE via finisher f0b130c7 (two predecessors died
+  in restarts; coordinator ran diff-sanity + node --check + load-sim
+  directly). LIVE as Worker v52 (0def9d21; deployment edf3a8ad @100%,
+  API-confirmed 2026-11-02T09:35:40Z; v51 was the typing round).
+  improve/ws-system-ui tip ff8a1eb (receipt). Bindings verified;
+  served-bytes MATCH 3/3.
+- FINDING (pre-boot click behavior): the staged OAuth start door
+  answers 401 operator-gate (not 404) through the proxy, and the OAuth
+  paths didn't treat it as not-yet-active (wallet doors do, via
+  isNotYetActive): chunk navigated to the raw 401 JSON; panel rendered
+  the raw daemon string. Post-boot the 503 path works as designed.
+  FIX child 0a3c75c4 dispatched same-pass: oauthPreflight + chunk map
+  404 + operator-gate 401 → {configured:false}; handoff staleness
+  checked for the same class; lands as its own Worker version.
+- Preflight fix: DONE + LIVE. Child died in a restart; its complete
+  edits survived uncommitted. Coordinator reviewed + gated directly
+  (node --check 3/3, load-sim RAN CLEAN, preflight harness 8/8 incl.
+  negative cases), committed 27d3762, fast-forwarded. Finisher
+  e9765355 deployed Worker v53 (1f0c8909; deployment d9ef04ca @100%,
+  API-confirmed 09:50:09Z; bindings verified; served-bytes MATCH 3/3;
+  receipt de76556). Live probe: endpoint still staged-401 pre-boot,
+  buttons now map it to the honest state. BUILD SIDE OF THE PROGRAM
+  IS COMPLETE: app v47 identity · v48 discovery · v49 parity ·
+  v52 OAuth · v53 preflight fix; daemon stack merged on
+  feat/l1-compute (tip 64c1982) awaiting the next Doctor boot.
+- Push round 3 child fd07ea51 dispatched (inventory-first: predecessor
+  push worktrees exist under .worktrees/push-round3/; house push
+  discipline + tree-verified receipts).
 
 ## Queued after parity lands
 1. Push round 3 LAST (reconcile vs moved remotes, disposable worktree,
