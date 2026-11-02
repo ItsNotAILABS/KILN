@@ -127,9 +127,9 @@ export class ComputeClient extends SwarmClient {
    * preview relay configured; the app still deploys privately without it).
    * Returns {appId, name, status, previewUrl?, preview?}.
    */
-  async deployApp({ name, repo, command, args, env, port, public: isPublic } = {}) {
+  async deployApp({ name, repo, command, args, env, port, memoryMB, public: isPublic } = {}) {
     if (!name || !repo || !command) throw new Error("deployApp: name, repo, command are required");
-    return this._req("POST", "/v1/compute/apps", { name, repo, command, args, env, port, public: isPublic });
+    return this._req("POST", "/v1/compute/apps", { name, repo, command, args, env, port, memoryMB, public: isPublic });
   }
 
   async listApps() {

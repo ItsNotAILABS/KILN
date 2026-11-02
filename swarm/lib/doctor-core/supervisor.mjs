@@ -22,13 +22,13 @@
  *   run()     the detached poll loop (the `_run` child)
  */
 import { spawn } from "node:child_process";
-import { openSync, closeSync, writeFileSync, unlinkSync, readFileSync, renameSync } from "node:fs";
+import { openSync, closeSync, unlinkSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   DOCTOR_POLL_MS,
   ensureDoctorDir, dlog, sleep,
-  readDoctorJson, readDoctorState, writeDoctorState,
+  readDoctorJson, readDoctorState, writeDoctorState, atomicWriteSync,
   doctorJsonPath, doctorLockPath, heartbeatPath,
   acquireExclusive, acquireTickLock, releaseTickLock,
   journalSince, readJournal, pidAlive,
@@ -176,7 +176,7 @@ export class Supervisor {
     });
     child.unref();
     closeSync(out);
-    writeFileSync(doctorJsonPath(this.dir), JSON.stringify({
+    atomicWriteSync(doctorJsonPath(this.dir), JSON.stringify({
       pid: child.pid,
       startedAt: new Date().toISOString(),
     }) + "\n");
@@ -217,9 +217,7 @@ export class Supervisor {
         status,
         detail: String(detail || ""),
       };
-      const tmp = heartbeatPath(this.dir) + ".tmp";
-      writeFileSync(tmp, JSON.stringify(hb));
-      renameSync(tmp, heartbeatPath(this.dir));
+      atomicWriteSync(heartbeatPath(this.dir), JSON.stringify(hb));
     } catch (e) {
       this.log(`doctor: heartbeat write failed (${(e && e.message) || e})`);
     }

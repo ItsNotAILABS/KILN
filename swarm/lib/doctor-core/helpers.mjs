@@ -7,14 +7,65 @@
  * node:os / node:child_process only.
  */
 import {
-  openSync, closeSync, readFileSync, writeFileSync, appendFileSync,
+  openSync, closeSync, readFileSync, appendFileSync,
   existsSync, mkdirSync, unlinkSync, statSync,
+  writeSync, fsyncSync, renameSync, chmodSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 
 export const DOCTOR_POLL_MS = 15000;
 export const TICK_LOCK_STALE_MS = 120000;
+
+/**
+ * Atomic file replacement: write the full payload to a temp file in the
+ * SAME directory, fsync it, rename over the target, then fsync the
+ * directory (best effort) so the rename itself is durable.
+ *
+ * The ONLY way doctor state files may be written. A plain writeFileSync
+ * truncates the target in place: a host write fault (or a kill) mid-write
+ * leaves a 0-byte / torn file behind — and the doctor's own state
+ * (doctor/state.json carries the recovery fence: expectedBootId /
+ * expectedStartId / recoveryExhausted) is the worst possible file to
+ * lose that way; a torn read silently resets the fence. With tmp+rename
+ * a faulted write leaves either the old complete file or the new
+ * complete file — never a truncated one.
+ *
+ * opts.mode: applied at tmp creation AND chmod'd after the rename
+ * (creation mode is umask-filtered; the chmod makes it exact).
+ *
+ * TEST-ONLY fault hook: DOCTOR_ATOMIC_WRITE_FAULT=1 writes half the
+ * payload to the temp file and then throws, simulating a host write
+ * fault mid-save. Never set in production; exists solely so tests can
+ * prove the target survives a faulted save byte-intact.
+ */
+export function atomicWriteSync(path, data, opts = {}) {
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  try {
+    const fd = openSync(tmp, "w", opts.mode ?? 0o666);
+    try {
+      if (process.env.DOCTOR_ATOMIC_WRITE_FAULT === "1") {
+        const half = typeof data === "string" ? data.slice(0, Math.ceil(data.length / 2)) : data.subarray(0, Math.ceil(data.length / 2));
+        writeSync(fd, half);
+        throw new Error("simulated host write fault mid-save (DOCTOR_ATOMIC_WRITE_FAULT)");
+      }
+      writeSync(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, path);
+    if (opts.mode) { try { chmodSync(path, opts.mode); } catch { /* best effort */ } }
+    try {
+      const dfd = openSync(dirname(path), "r");
+      try { fsyncSync(dfd); } finally { closeSync(dfd); }
+    } catch { /* directory fsync unsupported here — rename still atomic */ }
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* already renamed or never created */ }
+    throw e;
+  }
+}
 
 // ---------------------------------------------------------------- state layout
 
@@ -61,7 +112,7 @@ export function readDoctorState(dir) {
 }
 
 export function writeDoctorState(dir, state) {
-  try { writeFileSync(doctorStatePath(dir), JSON.stringify(state, null, 2) + "\n"); }
+  try { atomicWriteSync(doctorStatePath(dir), JSON.stringify(state, null, 2) + "\n"); }
   catch { /* best effort */ }
 }
 

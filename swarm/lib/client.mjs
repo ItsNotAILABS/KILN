@@ -108,6 +108,142 @@ export class SwarmClient {
     if (!owner || !repo) throw new Error("createRepo: owner and repo are required");
     return this._req("POST", `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
   }
+  /**
+   * Delete a repo outright (DELETE /v1/repos/:owner/:repo). Daemon-side
+   * rule: the owner's account session or the operator only — this
+   * client's operator token qualifies; agent tokens never do.
+   */
+  async deleteRepo({ owner, repo }) {
+    if (!owner || !repo) throw new Error("deleteRepo: owner and repo are required");
+    return this._req("DELETE", `/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+  }
+  /**
+   * Canonical repo creation under /v1 (POST /v1/repos): owners create
+   * under their own namespace with an account session or forge-scoped
+   * agent token (construct this client with that token — connect()
+   * reads the operator token); the operator creates anywhere. The
+   * optional template scaffolds the initial commit:
+   * {license?, licenseText?, readme?, gitignore?, templateId?}.
+   * Returns {ok, owner, repo, cloneUrl, initialCommit, files, template}.
+   */
+  async createRepoV1({ owner, repo, description, visibility, template }) {
+    if (!owner || !repo) throw new Error("createRepoV1: owner and repo are required");
+    return this._req("POST", "/v1/repos", { owner, repo, description, visibility, template });
+  }
+  // ---- creation templates (per-account; need an account principal) ----
+  async createTemplate(body) {
+    return (await this._req("POST", "/v1/templates", body)).template;
+  }
+  async listTemplates() {
+    return (await this._req("GET", "/v1/templates")).templates;
+  }
+  async getTemplate(id) {
+    return (await this._req("GET", `/v1/templates/${encodeURIComponent(id)}`)).template;
+  }
+  async deleteTemplate(id) {
+    return this._req("DELETE", `/v1/templates/${encodeURIComponent(id)}`);
+  }
+
+  // ---- per-repo memory (refs/kiln/memory; see lib/memory.mjs) ----
+  _memBase(owner, repo) {
+    return `/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/memory`;
+  }
+  /** Store a raw episode. Returns {event, commit}. */
+  async memoryRemember(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/episodes`, opts);
+  }
+  /** Assert a fact; opts.sourceEpisodes[] is mandatory provenance. Returns {event, fact, commit}. */
+  async memoryFact(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/facts`, opts);
+  }
+  async memorySupersede(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/supersede`, opts);
+  }
+  async memoryLink(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/links`, opts);
+  }
+  async memorySetCore(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/core`, opts);
+  }
+  async memoryCore(owner, repo) {
+    return (await this._req("GET", `${this._memBase(owner, repo)}/core`)).core;
+  }
+  async memoryFacts(owner, repo, { asOf, includeSuperseded } = {}) {
+    const qs = new URLSearchParams();
+    if (asOf) qs.set("asOf", asOf);
+    if (includeSuperseded) qs.set("includeSuperseded", "1");
+    const s = qs.toString();
+    return (await this._req("GET", `${this._memBase(owner, repo)}/facts${s ? "?" + s : ""}`)).facts;
+  }
+  /** Ranked recall: {repo, query, results[]}. */
+  async memoryRecall(owner, repo, q, opts = {}) {
+    const qs = new URLSearchParams({ q: String(q || "") });
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    if (opts.kinds && opts.kinds.length) qs.set("kinds", opts.kinds.join(","));
+    if (opts.tags && opts.tags.length) qs.set("tags", opts.tags.join(","));
+    if (opts.asOf) qs.set("asOf", opts.asOf);
+    if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
+    return this._req("GET", `${this._memBase(owner, repo)}/recall?${qs}`);
+  }
+  /**
+   * Cross-repo recall (phase 6): fused recall over EVERY repo chain
+   * in the state dir. Returns {crossRepo: true, query, results[],
+   * repos[], excluded[]} — each hit carries its repo, engine and
+   * chain signing posture; chains that fail verification are
+   * excluded and named in `excluded`, never silently skipped.
+   */
+  async memoryRecallAll(q, opts = {}) {
+    const qs = new URLSearchParams({ q: String(q || "") });
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    if (opts.kinds && opts.kinds.length) qs.set("kinds", opts.kinds.join(","));
+    if (opts.tags && opts.tags.length) qs.set("tags", opts.tags.join(","));
+    if (opts.asOf) qs.set("asOf", opts.asOf);
+    if (opts.since) qs.set("since", opts.since);
+    if (opts.until) qs.set("until", opts.until);
+    if (opts.includeSuperseded) qs.set("includeSuperseded", "1");
+    return this._req("GET", `/memory/recall?${qs}`);
+  }
+  /** Budgeted context pack: {core, facts, episodes, text, usedTokens, budgetTokens, overBudget}. */
+  async memoryContext(owner, repo, { query, budgetTokens, asOf } = {}) {
+    const qs = new URLSearchParams();
+    if (query) qs.set("q", query);
+    if (budgetTokens) qs.set("budget", String(budgetTokens));
+    if (asOf) qs.set("asOf", asOf);
+    const s = qs.toString();
+    return this._req("GET", `${this._memBase(owner, repo)}/context${s ? "?" + s : ""}`);
+  }
+  /** The brief to print before writing. {working, text, facts, episodes}. */
+  async memorySit(owner, repo, { query, budgetTokens, asOf } = {}) {
+    const qs = new URLSearchParams();
+    if (query) qs.set("q", query);
+    if (budgetTokens) qs.set("budget", String(budgetTokens));
+    if (asOf) qs.set("asOf", asOf);
+    const s = qs.toString();
+    return this._req("GET", `${this._memBase(owner, repo)}/sit${s ? "?" + s : ""}`);
+  }
+  /** Propose a fact/link/core write for ratification (phase 4). opts: {kind, payload, rationale?, actor?}. */
+  async memoryPropose(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/propose`, opts);
+  }
+  /** List consolidation proposals, optionally filtered by status (pending|ratified|rejected). */
+  async memoryProposals(owner, repo, status) {
+    const s = status ? `?status=${encodeURIComponent(status)}` : "";
+    return (await this._req("GET", `${this._memBase(owner, repo)}/proposals${s}`)).proposals;
+  }
+  /** Ratify or reject a proposal: {proposal, decision: "ratified"|"rejected", reason?, actor?}. */
+  async memoryResolveProposal(owner, repo, opts) {
+    return this._req("POST", `${this._memBase(owner, repo)}/proposals/resolve`, opts);
+  }
+  async memoryStats(owner, repo) {
+    return this._req("GET", `${this._memBase(owner, repo)}/stats`);
+  }
+  async memoryVerify(owner, repo) {
+    return this._req("POST", `${this._memBase(owner, repo)}/verify`);
+  }
+  /** Phase 2: the state dir's memory signing pubkey + this repo's signature posture. */
+  async memoryPubkey(owner, repo) {
+    return this._req("GET", `${this._memBase(owner, repo)}/pubkey`);
+  }
 
   // ---- receipts ----
   async verifyReceipts(node) {

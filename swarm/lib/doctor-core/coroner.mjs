@@ -13,10 +13,9 @@
  * A throwing collector is recorded as { __collectorError } — one bad
  * collector never sinks the bundle.
  */
-import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  ensureDoctorDir, deathsDir, journalEvent, memAvailableMb,
+  ensureDoctorDir, deathsDir, journalEvent, memAvailableMb, atomicWriteSync,
 } from "./helpers.mjs";
 
 export class Coroner {
@@ -93,7 +92,7 @@ export class Coroner {
     const path = join(deathsDir(this.dir), fname);
     death.bundle = path;
     bundle.death.bundle = path;
-    writeFileSync(path, JSON.stringify(bundle, null, 2) + "\n");
+    atomicWriteSync(path, JSON.stringify(bundle, null, 2) + "\n");
 
     journalEvent(this.dir, death);
     this.captured += 1;
