@@ -13,7 +13,9 @@ contract KilnOwnershipRegistryTest is Test {
     bytes32 internal projectId = keccak256("ItsNotAILABS/KILN");
     bytes32 internal licenseId = keccak256("MIT");
 
-    function setUp() public { registry = new KilnOwnershipRegistry(); }
+    function setUp() public {
+        registry = new KilnOwnershipRegistry();
+    }
 
     function register() internal {
         vm.prank(owner);
@@ -129,11 +131,7 @@ contract KilnOwnershipRegistryTest is Test {
         uint64 expiresAt
     );
 
-    function _registerAndAuthorize(
-        address agentAddr,
-        uint256 caps,
-        uint64 expiresAt
-    ) internal {
+    function _registerAndAuthorize(address agentAddr, uint256 caps, uint64 expiresAt) internal {
         vm.prank(owner);
         registry.registerProject(projectId, "ipfs://project", owner, licenseId);
         vm.prank(owner);
@@ -210,12 +208,7 @@ contract KilnOwnershipRegistryTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(KilnOwnershipRegistry.ExceedsParentGrant.selector);
-        registry.delegateGrant(
-            projectId,
-            child,
-            parentCaps | releaseCap,
-            uint64(block.timestamp + 12 hours)
-        );
+        registry.delegateGrant(projectId, child, parentCaps | releaseCap, uint64(block.timestamp + 12 hours));
 
         // Child grant was not created.
         assertEq(registry.getAgentGrant(projectId, child).expiresAt, 0);
