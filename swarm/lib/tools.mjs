@@ -14,6 +14,11 @@ import { appendEvent, newJobId } from "./queue.mjs";
 import { createNode } from "./nodes.mjs";
 import { loadApiToken } from "./state.mjs";
 import { runSandboxed } from "./sandbox.mjs";
+import { buildContextIndex, queryContextIndex } from "./context-index.mjs";
+import { appendContextReceipt } from "./context-receipts.mjs";
+import { agentAwareness } from "./memory.mjs";
+import { boundContextRequest } from "./context-policy.mjs";
+import { recordContextMetric } from "./context-metrics.mjs";
 
 export class ToolError extends Error {
   constructor(message) {
@@ -41,7 +46,7 @@ const DENY_PATTERNS = [
 ];
 
 /** Exported for compute app validation: same jail philosophy, no shell. */
-export function checkShellArgs(command, args) {
+export function checkShellArgs(command, args, workdir = null) {
   const bin = basename(String(command)).toLowerCase();
   if (SHELL_BINS.has(bin)) {
     throw new ToolError(`jail: shell binaries are not executable tools (got "${command}")`);
@@ -50,10 +55,23 @@ export function checkShellArgs(command, args) {
   for (const pat of DENY_PATTERNS) {
     if (joined.includes(pat)) throw new ToolError(`jail: denied pattern ${JSON.stringify(pat)} in command`);
   }
-  if (String(command).includes("/")) {
-    // A path command must stay inside the work dir.
-    return "path-command";
+  if (workdir) {
+    const base = resolve(workdir);
+    for (const raw of args || []) {
+      const value = String(raw);
+      const candidates = [value];
+      const eq = value.indexOf("=");
+      if (eq >= 0) candidates.push(value.slice(eq + 1));
+      for (const candidate of candidates) {
+        if (!candidate.startsWith("/")) continue;
+        const absolute = resolve(candidate);
+        if (absolute !== base && !absolute.startsWith(base + sep)) {
+          throw new ToolError(`jail: absolute argument escapes work dir: ${candidate}`);
+        }
+      }
+    }
   }
+  if (String(command).includes("/")) return "path-command";
   return "bin";
 }
 
@@ -61,7 +79,7 @@ const MAX_OUTPUT = 64 * 1024;
 
 /** Shared jailed execution for shell.exec and project.release. */
 async function execJailed(workdir, command, cmdArgs, timeoutMs, sandbox) {
-  const kind = checkShellArgs(command, cmdArgs);
+  const kind = checkShellArgs(command, cmdArgs, workdir);
   let bin = command;
   if (kind === "path-command") bin = jailPath(workdir, command);
   if (sandbox) return await execSandboxed(workdir, bin, cmdArgs.map(String), timeoutMs, sandbox);
@@ -233,6 +251,8 @@ export const TOOL_DEFS = [
   { name: "fs.read", caps: 0, desc: "Read a file inside the work dir", args: { path: "string" } },
   { name: "fs.write", caps: 0, desc: "Write a file inside the work dir (creates parents)", args: { path: "string", content: "string" } },
   { name: "fs.list", caps: 0, desc: "List a directory inside the work dir", args: { path: "string?" } },
+  { name: "context.query", caps: 0, desc: "Retrieve a bounded, provenance-rich context pack from this node worktree", args: { query: "string", maxBytes: "number?", maxChunks: "number?", knownHashes: "object?", expandDependencies: "boolean?" } },
+  { name: "context.sit", caps: 0, desc: "Assemble current code context plus this node own KILN-repo durable memory when available", args: { query: "string", maxBytes: "number?", maxChunks: "number?", memoryTokens: "number?", knownHashes: "object?" } },
   { name: "shell.exec", caps: 0, desc: "Run a binary with argv, no shell, jailed cwd, timeout. Optional sandbox: {memoryMB (64..2048, default 256), network (default false), metricsFile} runs a node runner inside Linux namespaces (fresh mount/pid/uts/ipc; net only if network:true), hides /home /root (/etc when offline), caps the JS heap, SIGKILLs past 2x RSS, timeout with SIGTERM-then-SIGKILL teeth.", args: { command: "string", args: "string[]?", timeoutMs: "number?", sandbox: "object?" } },
   { name: "git.status", caps: 0, desc: "git status --porcelain in the work dir", args: {} },
   { name: "git.log", caps: 0, desc: "git log --oneline in the work dir", args: { n: "number?" } },
@@ -247,6 +267,15 @@ function findDef(name) {
   const d = TOOL_DEFS.find((t) => t.name === name);
   if (!d) throw new ToolError(`unknown tool: ${name}`);
   return d;
+}
+
+function kilnRepoIdentity(repoRef) {
+  const value = String(repoRef || "");
+  let m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\.git\/?$/);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
+  if (m) return { owner: m[1], repo: m[2] };
+  return null;
 }
 
 // ---------------------------------------------------------------- impl
@@ -270,6 +299,85 @@ async function impl(ctx, name, args) {
       const st = statSync(p);
       if (!st.isDirectory()) throw new ToolError(`fs.list: not a directory: ${args.path}`);
       return { ok: true, out: readdirSync(p).join("\n") };
+    }
+    case "context.query": {
+      const started = Date.now();
+      let request;
+      try { request = boundContextRequest(args, "query"); }
+      catch (e) { throw new ToolError("context.query: " + e.message); }
+      const indexDir = join(ctx.dir, "context-indexes");
+      mkdirSync(indexDir, { recursive: true, mode: 0o700 });
+      const index = buildContextIndex(workdir, indexDir);
+      const pack = queryContextIndex(index, request.query, request);
+      const contextReceipt = appendContextReceipt(ctx.dir, {
+        operation: "node-query",
+        node: ctx.nodeId,
+        query: request.query,
+        indexDigest: index.digest,
+        packDigest: pack.digest,
+        revision: pack.revision,
+        worktreeDigest: pack.worktreeDigest,
+        emittedBytes: pack.stats.emittedBytes,
+        emittedChunks: pack.stats.emittedChunks,
+        unchangedChunks: pack.stats.unchangedChunks,
+      });
+      const metric = recordContextMetric(ctx.dir, {
+        kind: "query",
+        packDigest: pack.digest,
+        stats: pack.stats,
+        reusedFiles: index.stats.reusedFiles,
+        rebuiltFiles: index.stats.rebuiltFiles,
+        latencyMs: Date.now() - started,
+      });
+      return { ok: true, out: JSON.stringify(pack), contextReceipt, metric };
+    }
+    case "context.sit": {
+      const started = Date.now();
+      let request;
+      try { request = boundContextRequest(args, "sit"); }
+      catch (e) { throw new ToolError("context.sit: " + e.message); }
+      const indexDir = join(ctx.dir, "context-indexes");
+      mkdirSync(indexDir, { recursive: true, mode: 0o700 });
+      const index = buildContextIndex(workdir, indexDir);
+      const code = queryContextIndex(index, request.query, request);
+      let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
+      const identity = kilnRepoIdentity(ctx.node?.repo);
+      if (identity) {
+        try {
+          memory = {
+            available: true,
+            owner: identity.owner,
+            repo: identity.repo,
+            ...agentAwareness(ctx.dir, identity.owner, identity.repo, {
+              query: request.query,
+              budgetTokens: request.memoryTokens,
+            }),
+          };
+        } catch (e) {
+          memory = { available: false, owner: identity.owner, repo: identity.repo, reason: e.message };
+        }
+      }
+      const contextReceipt = appendContextReceipt(ctx.dir, {
+        operation: "node-sit",
+        node: ctx.nodeId,
+        query: request.query,
+        indexDigest: index.digest,
+        packDigest: code.digest,
+        revision: code.revision,
+        worktreeDigest: code.worktreeDigest,
+        emittedBytes: code.stats.emittedBytes,
+        emittedChunks: code.stats.emittedChunks,
+        unchangedChunks: code.stats.unchangedChunks,
+      });
+      const metric = recordContextMetric(ctx.dir, {
+        kind: "sit",
+        packDigest: code.digest,
+        stats: code.stats,
+        reusedFiles: index.stats.reusedFiles,
+        rebuiltFiles: index.stats.rebuiltFiles,
+        latencyMs: Date.now() - started,
+      });
+      return { ok: true, out: JSON.stringify({ schema: "kiln.context-sit.v1", code, memory }), contextReceipt, metric };
     }
     case "shell.exec": {
       return await execArgs(workdir, args, "shell.exec", 30000);
@@ -376,6 +484,24 @@ export async function runTool(ctx, name, args) {
   } catch (e) {
     result = { ok: false, error: e.code ? `${e.code}: ${e.message}` : e.message };
   }
-  appendReceipt(ctx.dir, ctx.nodeId, ctx.keypair, name, args || {}, result);
+  if (name === "context.query" || name === "context.sit") {
+    const safeArgs = {
+      queryDigest: result?.contextReceipt?.queryDigest || null,
+      maxBytes: args?.maxBytes ?? 24000,
+      maxChunks: args?.maxChunks ?? (name === "context.sit" ? 10 : 12),
+      memoryTokens: name === "context.sit" ? (args?.memoryTokens ?? 1200) : undefined,
+      expandDependencies: args?.expandDependencies !== false,
+    };
+    const safeResult = {
+      ok: !!result?.ok,
+      contextReceiptHash: result?.contextReceipt?.hash || null,
+      packDigest: result?.contextReceipt?.packDigest || null,
+      emittedBytes: result?.contextReceipt?.emittedBytes || 0,
+      emittedChunks: result?.contextReceipt?.emittedChunks || 0,
+    };
+    appendReceipt(ctx.dir, ctx.nodeId, ctx.keypair, name, safeArgs, safeResult);
+  } else {
+    appendReceipt(ctx.dir, ctx.nodeId, ctx.keypair, name, args || {}, result);
+  }
   return result;
 }

@@ -331,7 +331,7 @@
  *   GET  /v1/openapi.json           -> OpenAPI 3.1 document (lib/openapi.mjs)
  */
 import { createServer } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import {
@@ -346,6 +346,10 @@ import { loadKeypair } from "./keys.mjs";
 import { loadKeyFile } from "./state.mjs";
 import { createRepo, deleteRepo, listRepos, repoExists, repoPath, serveGitHttp, validRepoName } from "./git.mjs";
 import { promoteRepo } from "./promote.mjs";
+import { buildContextIndex, loadIndex, pruneContextCas, queryContextIndex } from "./context-index.mjs";
+import { appendContextReceipt, verifyContextReceipts } from "./context-receipts.mjs";
+import { boundContextRequest, contextLimits } from "./context-policy.mjs";
+import { recordContextMetric, loadContextMetrics, contextMetricsSummary } from "./context-metrics.mjs";
 import {
   remember, assertFact, supersedeFact, linkMemories, setCore,
   proposeMemory, resolveProposal,
@@ -446,6 +450,28 @@ function enqueueWelcomeMail(dir, account, context = {}) {
   } catch (e) {
     console.error(`mail: welcome enqueue failed for ${account.owner}: ${e.message}`);
   }
+}
+
+function contextIndexDir(dir) {
+  const p = join(dir, "context-indexes");
+  mkdirSync(p, { recursive: true, mode: 0o700 });
+  return p;
+}
+
+function resolveContextNode(dir, raw) {
+  const id = resolveNode(dir, String(raw));
+  const node = loadNode(dir, id);
+  if (!node.workdir || !existsSync(node.workdir)) throw new Error("node has no available workdir");
+  if (!existsSync(join(node.workdir, ".git"))) throw new Error("node workdir is not a Git checkout");
+  return { id, node };
+}
+
+function contextNodeRepoIdentity(repoRef) {
+  const value = String(repoRef || "");
+  let m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\.git\/?$/);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = value.match(/\/git\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
+  return m ? { owner: m[1], repo: m[2] } : null;
 }
 
 function nodeStatus(dir, cfg, node) {
@@ -599,7 +625,7 @@ export function startApiServer(dir, cfg) {
       const path = url.pathname;
 
       if (req.method === "GET" && path === "/health") {
-        return send(res, 200, { ok: true, version: 1, service: "kiln-swarm" });
+        return send(res, 200, { ok: true, version: 2, service: "kiln-swarm", contextFabric: "v2" });
       }
 
       // ---- git hosting: read routes are HELD for the auth gate below ----
@@ -1563,6 +1589,184 @@ export function startApiServer(dir, cfg) {
         }
       }
 
+      // ---- Context Fabric: authenticated, node-bound local repository cognition ----
+      {
+        const m = path.match(/^\/v1\/context\/nodes\/([A-Za-z0-9_.-]+)\/(index|query|sit|status)$/);
+        if (m) {
+          let bound;
+          try { bound = resolveContextNode(dir, m[1]); }
+          catch (e) { return send(res, 404, { error: e.message }); }
+          const action = m[2];
+          const idxDir = contextIndexDir(dir);
+
+          if (req.method === "POST" && action === "index") {
+            const b = await readBody(req);
+            const index = buildContextIndex(bound.node.workdir, idxDir, {
+              chunkLines: b.chunkLines,
+              overlap: b.overlap,
+            });
+            const receipt = appendContextReceipt(dir, {
+              operation: "api-index",
+              node: bound.id,
+              indexDigest: index.digest,
+              revision: index.revision,
+              worktreeDigest: index.worktreeDigest,
+            });
+            const metric = recordContextMetric(dir, {
+              kind: "index",
+              indexedBytes: index.stats.indexedBytes,
+              reusedFiles: index.stats.reusedFiles,
+              rebuiltFiles: index.stats.rebuiltFiles,
+            });
+            return send(res, 200, {
+              node: bound.id,
+              receipt,
+              metric,
+              index: {
+                schema: index.schema,
+                digest: index.digest,
+                revision: index.revision,
+                dirty: index.dirty,
+                worktreeDigest: index.worktreeDigest,
+                generatedAt: index.generatedAt,
+                stats: index.stats,
+                skipped: index.skipped,
+              },
+            });
+          }
+
+          if (req.method === "POST" && action === "query") {
+            const b = await readBody(req);
+            let request;
+            try { request = boundContextRequest(b, "query"); }
+            catch (e) { return send(res, 400, { error: e.message }); }
+            const started = Date.now();
+            let index = loadIndex(idxDir, bound.node.workdir);
+            if (!index || request.refresh) {
+              index = buildContextIndex(bound.node.workdir, idxDir, {
+                chunkLines: b.chunkLines,
+                overlap: b.overlap,
+              });
+            }
+            const pack = queryContextIndex(index, request.query, request);
+            const receipt = appendContextReceipt(dir, {
+              operation: "api-query",
+              node: bound.id,
+              query: request.query,
+              indexDigest: index.digest,
+              packDigest: pack.digest,
+              revision: pack.revision,
+              worktreeDigest: pack.worktreeDigest,
+              emittedBytes: pack.stats.emittedBytes,
+              emittedChunks: pack.stats.emittedChunks,
+              unchangedChunks: pack.stats.unchangedChunks,
+            });
+            const metric = recordContextMetric(dir, {
+              kind: "query",
+              packDigest: pack.digest,
+              stats: pack.stats,
+              reusedFiles: index.stats.reusedFiles,
+              rebuiltFiles: index.stats.rebuiltFiles,
+              latencyMs: Date.now() - started,
+            });
+            return send(res, 200, { node: bound.id, receipt, metric, pack });
+          }
+
+          if (req.method === "POST" && action === "sit") {
+            const b = await readBody(req);
+            let request;
+            try { request = boundContextRequest(b, "sit"); }
+            catch (e) { return send(res, 400, { error: e.message }); }
+            const started = Date.now();
+            let index = loadIndex(idxDir, bound.node.workdir);
+            if (!index || request.refresh) {
+              index = buildContextIndex(bound.node.workdir, idxDir, {
+                chunkLines: b.chunkLines,
+                overlap: b.overlap,
+              });
+            }
+            const code = queryContextIndex(index, request.query, request);
+            let memory = { available: false, reason: "node is not attached to a KILN-native repository" };
+            const identity = contextNodeRepoIdentity(bound.node.repo);
+            if (identity) {
+              try {
+                memory = {
+                  available: true,
+                  owner: identity.owner,
+                  repo: identity.repo,
+                  ...agentAwareness(dir, identity.owner, identity.repo, {
+                    query: request.query,
+                    budgetTokens: request.memoryTokens,
+                  }),
+                };
+              } catch (e) {
+                memory = { available: false, owner: identity.owner, repo: identity.repo, reason: e.message };
+              }
+            }
+            const receipt = appendContextReceipt(dir, {
+              operation: "api-sit",
+              node: bound.id,
+              query: request.query,
+              indexDigest: index.digest,
+              packDigest: code.digest,
+              revision: code.revision,
+              worktreeDigest: code.worktreeDigest,
+              emittedBytes: code.stats.emittedBytes,
+              emittedChunks: code.stats.emittedChunks,
+              unchangedChunks: code.stats.unchangedChunks,
+            });
+            const metric = recordContextMetric(dir, {
+              kind: "sit",
+              packDigest: code.digest,
+              stats: code.stats,
+              reusedFiles: index.stats.reusedFiles,
+              rebuiltFiles: index.stats.rebuiltFiles,
+              latencyMs: Date.now() - started,
+            });
+            return send(res, 200, {
+              node: bound.id,
+              receipt,
+              metric,
+              sit: { schema: "kiln.context-sit.v1", code, memory },
+            });
+          }
+
+          if (req.method === "GET" && action === "status") {
+            const index = loadIndex(idxDir, bound.node.workdir);
+            if (!index) return send(res, 404, { error: "context index not built" });
+            return send(res, 200, {
+              node: bound.id,
+              index: {
+                digest: index.digest,
+                revision: index.revision,
+                dirty: index.dirty,
+                worktreeDigest: index.worktreeDigest,
+                generatedAt: index.generatedAt,
+                stats: index.stats,
+              },
+            });
+          }
+
+          return send(res, 405, { error: "method not allowed" });
+        }
+      }
+
+      if (req.method === "POST" && path === "/v1/context/receipts/verify") {
+        const result = verifyContextReceipts(dir);
+        return send(res, result.ok ? 200 : 409, result);
+      }
+
+      if (req.method === "POST" && path === "/v1/context/gc") {
+        return send(res, 200, { gc: pruneContextCas(contextIndexDir(dir)) });
+      }
+
+      if (req.method === "GET" && path === "/v1/context/metrics") {
+        return send(res, 200, {
+          metrics: contextMetricsSummary(loadContextMetrics(dir)),
+          limits: contextLimits(),
+        });
+      }
+
       // ---- jobs ----
       if (req.method === "POST" && path === "/jobs") {
         const b = await readBody(req);
@@ -1684,10 +1888,11 @@ export function startApiServer(dir, cfg) {
           branch: b.branch ? String(b.branch) : undefined,
           rebase: !!b.rebase,
           force: !!b.force,
+          contextEvidence: b.contextEvidence,
         });
         const status = receipt.ok ? 200
           : receipt.error.stage === "repo_not_found" || receipt.error.stage === "github_repo_not_found" ? 404
-          : receipt.error.stage === "no_target" || receipt.error.stage === "bad_target" ? 400
+          : receipt.error.stage === "no_target" || receipt.error.stage === "bad_target" || receipt.error.stage === "bad_evidence" ? 400
           : receipt.error.stage === "not_fast_forward" || receipt.error.stage === "rebase_needs_root" ? 409
           : receipt.error.stage === "no_github_credential" ? 412
           : receipt.error.stage.startsWith("github_") ? 502

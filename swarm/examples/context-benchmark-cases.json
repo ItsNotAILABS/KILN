@@ -1,0 +1,7 @@
+[
+  {"query":"context index bm25 dependency delta retrieval","expectedPaths":["swarm/lib/context-index.mjs"]},
+  {"query":"context query node tool signed receipt privacy","expectedPaths":["swarm/lib/tools.mjs","swarm/lib/context-receipts.mjs"]},
+  {"query":"local daemon bearer context api node workdir","expectedPaths":["swarm/lib/httpapi.mjs"]},
+  {"query":"persistent repository memory recall context","expectedPaths":["swarm/lib/memory.mjs"]},
+  {"query":"github promotion fast forward receipt","expectedPaths":["swarm/lib/promote.mjs"]}
+]
