@@ -3,6 +3,25 @@
 All notable changes to KILN, newest first. Swarm rounds are tagged on
 `main` when they close (see docs/PRODUCTION.md → Releases).
 
+## 2026-11-25 — Agent transfer
+
+- `swarm/lib/transfer*.mjs`: agent-to-agent file and package transfer
+  with no size limit, streaming from and to disk in constant memory.
+  Chunks carry SHA-256 in a content-addressed manifest signed with
+  ed25519 (keys are Solana keypair files and base58 addresses).
+  Turbine-style Reed-Solomon stripes (16+2 by default) are spread over
+  8 parallel TCP streams. Shards are rejected on hash mismatch, rebuilt
+  from parity, sent in repair rounds, and resumed from a stripe bitmap.
+- Transport is parallel TCP behind a transport interface. QUIC was
+  measured and is not used: Node 24 has no `node:quic`, and
+  `@matrixai/quic` did 1.3 to 1.6 MiB/s against about 560 to 620 MiB/s
+  for TCP on the same box. Numbers and the probe script are in the doc.
+- `swarm.mjs send|recv|transfer`, the SDK (`sendFile`, `sendPath`,
+  `startReceiver`, `receiveIntoComputer`, `sendFromComputer`), transfers
+  into and out of vc homes (local and docker), an optional Solana Memo
+  receipt (offline, with a devnet/localhost-only submit guard),
+  `scripts/transfer-bench.mjs`, and `docs/KILN_AGENT_TRANSFER.md`.
+
 ## 2026-11-25 — Virtual computers
 
 - `swarm/lib/vcomputer*.mjs`: a persistent machine per agent. It has an

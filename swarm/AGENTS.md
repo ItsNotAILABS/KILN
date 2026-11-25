@@ -213,6 +213,23 @@ const done = await kiln.waitForHandBack(pc.id);              // {state: "returne
 
 Full reference: `docs/KILN_VIRTUAL_COMPUTERS.md`.
 
+## 6c. Sending files to another agent (any size)
+
+To hand another agent a zip, a build, a dataset or a directory, use agent
+transfer. It is peer to peer, needs no daemon, and has no size limit:
+
+```bash
+node swarm/swarm.mjs recv --out ./inbox --trust <sender-pubkey>       # prints address + your pubkey
+node swarm/swarm.mjs send ./dist.zip --to 127.0.0.1:PORT --expect <receiver-pubkey>
+node swarm/swarm.mjs recv --vc agent-1 --subdir inbox                 # straight into a vc home
+```
+
+Every chunk is hash-checked against a manifest signed with your ed25519
+key (`swarm.mjs transfer identity`). Lost or corrupt pieces are rebuilt
+or resent, and an interrupted `send` resumes when you re-run it.
+Bytes are **not encrypted**, so cross machines only over a tunnel. Full
+reference: `docs/KILN_AGENT_TRANSFER.md`.
+
 ## 7. Workspaces, project details, MCP — organization for any agent
 
 Repos group into **workspaces** (member repos + linked sites, nestable via
