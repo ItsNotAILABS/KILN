@@ -159,6 +159,15 @@ The app's environment is an explicit allowlist (`PATH`, `HOME`, `TMPDIR`,
 `PORT` if declared, plus your `env` entries) — it never inherits the
 worker's environment, so daemon secrets can't leak into a deployed app.
 
+## 4. Virtual computers: a whole machine per agent
+
+`invoke`/`map` are one-shot functions and `apps` are services. When an
+agent needs a **desktop, a browser, and a dev environment that persists**
+(and a human to take over for sign-ins), use a virtual computer:
+`POST /v1/vcomputers`, then screenshot / input / exec / jobs / hand-off.
+It's a container per computer with CPU/memory/pids limits, a home volume,
+and idle shutdown. See `docs/KILN_VIRTUAL_COMPUTERS.md`.
+
 ## From another repo
 
 ```js

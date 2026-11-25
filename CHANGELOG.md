@@ -3,6 +3,27 @@
 All notable changes to KILN, newest first. Swarm rounds are tagged on
 `main` when they close (see docs/PRODUCTION.md → Releases).
 
+## 2026-11-25 — Virtual computers
+
+- `swarm/lib/vcomputer*.mjs`: a persistent machine per agent. It has an
+  Xvfb + xfwm4 desktop, Chrome with a persisted profile, and a control API:
+  screenshot, input (pixels or 0..1), shell exec with timeouts, and
+  background jobs. Owner **hand-off** pauses the agent (423), serves a
+  one-time noVNC page with an instruction banner and a hand-back button,
+  and resumes the agent. Hand-off tokens are stored hashed only, and typed
+  text is never logged.
+- Docker backend: one container per computer with CPU/memory/pids limits,
+  `cap-drop ALL`, a home volume, and idle shutdown plus a disk soft quota
+  from the daemon tick. The local backend runs the same scripts without
+  isolation (opt-in, dev/test).
+- `swarm/vcomputer/image/`: a reproducible `kiln-vc` image. The base is
+  pinned by digest, apt by snapshot date, and every tool by sha256 (Node
+  LTS, pnpm, bun, gh, Rust 1.79 via rustup, Solana 1.18.26 + Anchor
+  0.30.1, Chrome for Testing).
+- API `/v1/vcomputers/*` (OpenAPI + capabilities + drift pin), the
+  `VComputerClient` SDK, the `swarm.mjs vc …` CLI, and
+  `docs/KILN_VIRTUAL_COMPUTERS.md`.
+
 ## 2026-10-26 — Production process pack
 
 - Added `docs/PRODUCTION.md` (the operating process: change loop, dual CI,
