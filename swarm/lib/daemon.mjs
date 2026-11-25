@@ -28,6 +28,7 @@ import { reconcileCiQueue } from "./ci.mjs";
 import { nowSec } from "./grant.mjs";
 import { startApiServer } from "./httpapi.mjs";
 import { settleComputeJobs } from "./compute.mjs";
+import { sweepComputers } from "./vcomputer.mjs";
 import {
   tickJsonPath, resolveTickStallMs, tickStalled, newTickStats,
   DEFAULT_TICK_STALL_ABORT_MS,
@@ -283,6 +284,15 @@ function tick(dir, cfg) {
     // exactly once per attempt — never on poll. Guarded: a compute-store
     // problem must never break the job-dispatch tick.
     try { settleComputeJobs(dir); } catch (e) { log("compute settle error:", e.message); }
+    // Virtual computers: expire hand-offs, measure disk, stop idle machines.
+    // Async + self-rate-limited (KILN_VC_SWEEP_MS, default 30s); never
+    // blocks or breaks the dispatch tick.
+    try {
+      const everyMs = parseInt(process.env.KILN_VC_SWEEP_MS || "30000", 10) || 30000;
+      sweepComputers(dir, { everyMs }).then((r) => {
+        for (const a of r.actions || []) log(`vcomputer ${a.id}: ${a.action}${a.error ? " " + a.error : ""}`);
+      }).catch((e) => log("vcomputer sweep error:", e.message));
+    } catch (e) { log("vcomputer sweep error:", e.message); }
 
     const pending = pendingJobs(dir);
     if (!pending.length) return;

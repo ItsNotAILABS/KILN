@@ -569,6 +569,30 @@ export function buildCapabilities() {
         mcpTools: [],
       },
       {
+        id: "vcomputers",
+        title: "Virtual computers — a persistent machine per agent: a real desktop (Xvfb + window manager) with Chrome whose logins persist, a pinned dev toolchain (git, gh, Node LTS + pnpm + bun, Python, Rust, Solana CLI + Anchor, poppler), and a control API: screenshot, mouse/keyboard input (pixels or 0..1 coordinates), shell exec with timeouts, and background jobs. Hand-off pauses the agent (423 on control calls) and gives the owner a one-time noVNC link with an instruction banner and a hand-back button — for sign-ins, device codes, 2FA and captchas; nothing typed during a hand-off passes through KILN. Docker backend = one container per computer with CPU/memory/pids limits and a home volume; idle machines stop automatically. Operator-only. Programmatic access is VComputerClient (lib/vcomputer-client.mjs); docs/KILN_VIRTUAL_COMPUTERS.md",
+        endpoints: [
+          "POST /v1/vcomputers",
+          "GET /v1/vcomputers",
+          "GET /v1/vcomputers/doctor",
+          "GET /v1/vcomputers/:id",
+          "DELETE /v1/vcomputers/:id",
+          "POST /v1/vcomputers/:id/start",
+          "POST /v1/vcomputers/:id/stop",
+          "GET /v1/vcomputers/:id/screenshot",
+          "POST /v1/vcomputers/:id/input",
+          "POST /v1/vcomputers/:id/exec",
+          "GET /v1/vcomputers/:id/jobs",
+          "GET /v1/vcomputers/:id/jobs/:jobId",
+          "POST /v1/vcomputers/:id/jobs/:jobId/kill",
+          "POST /v1/vcomputers/:id/handoff",
+          "GET /v1/vcomputers/:id/handoff",
+          "DELETE /v1/vcomputers/:id/handoff",
+          "GET /v1/vcomputers/:id/toolcheck",
+        ],
+        mcpTools: [],
+      },
+      {
         id: "templates",
         title: "Creation templates — what a new repo is born with. POST /v1/repos accepts a template: a built-in license (MIT, Apache-2.0, GPL-3.0, BSD-3-Clause, none, or custom license text), a scaffold README, and a preset .gitignore (node/python) — all landing IN the initial commit. Accounts also save their OWN templates (license + flags + arbitrary files) and reference them by templateId at create time; inline fields override the saved template per-field, and a template's own files are never overwritten by scaffolding. Templates are per-account: another account's template id is a 404, never a borrow. The operator token has no account and cannot hold templates",
         endpoints: [
@@ -2579,6 +2603,277 @@ export function buildOpenApiDocument() {
             "404": errorResponse("Receipt stage repo_not_found / github_repo_not_found"),
             "409": errorResponse("Receipt stage not_fast_forward / rebase_needs_root"),
             "412": errorResponse("Receipt stage no_github_credential"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers": {
+        post: {
+          operationId: "vcomputerCreate",
+          summary: "Create and start a virtual computer. backend docker (default; container isolation) or local (host processes, no isolation — daemon must run with KILN_VC_ALLOW_LOCAL=1). Operator-only",
+          requestBody: { required: true, content: { "application/json": { schema: {
+            type: "object",
+            properties: {
+              name: { type: "string", pattern: "^[a-z0-9][a-z0-9-]{0,39}$" },
+              backend: { type: "string", enum: ["docker", "local"] },
+              width: { type: "integer", minimum: 640, maximum: 3840 },
+              height: { type: "integer", minimum: 480, maximum: 2160 },
+              cpus: { type: "number", minimum: 0.25, maximum: 16 },
+              memoryMB: { type: "integer", minimum: 512, maximum: 65536 },
+              diskMB: { type: "integer", minimum: 512 },
+              pidsLimit: { type: "integer", minimum: 64, maximum: 32768 },
+              idleTimeoutSec: { type: "integer", minimum: 0, description: "0 = never idle-stop" },
+              browser: { type: "boolean" },
+              network: { type: "boolean" },
+            },
+            required: ["name"],
+          } } } },
+          responses: {
+            "201": jsonResponse("Computer view", { type: "object" }),
+            "400": errorResponse("Invalid spec"),
+            "409": errorResponse("Name already taken"),
+            "503": errorResponse("Backend unavailable (no docker, image not built, or local not allowed)"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        get: {
+          operationId: "vcomputerList",
+          summary: "List virtual computers with live status",
+          responses: {
+            "200": jsonResponse("Computers", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/doctor": {
+        get: {
+          operationId: "vcomputerDoctor",
+          summary: "Health: backend availability, image presence, and per-computer problems (should-be-running, over disk quota, stale hand-off)",
+          responses: {
+            "200": jsonResponse("Health report", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        get: {
+          operationId: "vcomputerGet",
+          summary: "One computer (status, config, usage, control: agent|owner, hand-off)",
+          responses: {
+            "200": jsonResponse("Computer view", { type: "object" }),
+            "404": errorResponse("No such computer"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "vcomputerDelete",
+          summary: "Remove a computer; ?purge=true also deletes its home (volume / dir)",
+          parameters: [{ name: "purge", in: "query", required: false, schema: { type: "boolean" } }],
+          responses: {
+            "200": jsonResponse("Deleted", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/start": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        post: {
+          operationId: "vcomputerStart",
+          summary: "Start (or restart) a computer; its home persists",
+          responses: {
+            "200": jsonResponse("Computer view", { type: "object" }),
+            "507": errorResponse("Over disk quota"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/stop": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        post: {
+          operationId: "vcomputerStop",
+          summary: "Stop a computer (cancels an open hand-off)",
+          responses: {
+            "200": jsonResponse("Computer view", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/screenshot": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        get: {
+          operationId: "vcomputerScreenshot",
+          summary: "PNG of the screen: JSON {width,height,png(base64)} or raw image/png with ?format=png",
+          parameters: [{ name: "format", in: "query", required: false, schema: { type: "string", enum: ["json", "png"] } }],
+          responses: {
+            "200": jsonResponse("Screenshot", { type: "object" }),
+            "423": errorResponse("The owner has the screen (open hand-off) — wait on GET …/handoff?waitMs="),
+            "409": errorResponse("Computer is not running"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/input": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        post: {
+          operationId: "vcomputerInput",
+          summary: "Mouse/keyboard: move, click, type (text never logged), key, scroll, drag. Points as pixels x,y or 0..1 nx,ny",
+          requestBody: { required: true, content: { "application/json": { schema: {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["move", "click", "type", "key", "scroll", "drag"] },
+              x: { type: "integer" }, y: { type: "integer" }, nx: { type: "number" }, ny: { type: "number" },
+              x2: { type: "integer" }, y2: { type: "integer" }, nx2: { type: "number" }, ny2: { type: "number" },
+              button: { type: "string", enum: ["left", "middle", "right"] },
+              count: { type: "integer", minimum: 1, maximum: 3 },
+              text: { type: "string" },
+              keys: { description: "X keysym combo(s), e.g. \"ctrl+l\" or [\"ctrl+l\", \"Return\"]" },
+              dx: { type: "integer" }, dy: { type: "integer" },
+            },
+            required: ["action"],
+          } } } },
+          responses: {
+            "200": jsonResponse("Done", { type: "object" }),
+            "400": errorResponse("Bad action or coordinates outside the screen"),
+            "423": errorResponse("The owner has the screen (open hand-off) — wait on GET …/handoff?waitMs="),
+            "409": errorResponse("Computer is not running"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/exec": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        post: {
+          operationId: "vcomputerExec",
+          summary: "Run a shell command inside the machine (bash -lc). Foreground: waits up to timeoutMs (1000..600000, default 60000) and returns exit code + output (1MB cap each). background:true starts a job and returns 202 {jobId}",
+          requestBody: { required: true, content: { "application/json": { schema: {
+            type: "object",
+            properties: {
+              command: { type: "string" },
+              timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
+              cwd: { type: "string" },
+              stdin: { type: "string" },
+              background: { type: "boolean" },
+            },
+            required: ["command"],
+          } } } },
+          responses: {
+            "200": jsonResponse("Result", { type: "object" }),
+            "202": jsonResponse("Background job started", { type: "object" }),
+            "423": errorResponse("The owner has the screen (open hand-off) — wait on GET …/handoff?waitMs="),
+            "409": errorResponse("Computer is not running"),
+            "507": errorResponse("Over disk quota (background jobs only)"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/jobs": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        get: {
+          operationId: "vcomputerJobs",
+          summary: "Background jobs and their status",
+          responses: {
+            "200": jsonResponse("Jobs", { type: "object" }),
+            "423": errorResponse("The owner has the screen (open hand-off) — wait on GET …/handoff?waitMs="),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/jobs/{jobId}": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+          { name: "jobId", in: "path", required: true, schema: { type: "string", pattern: "^job_[0-9a-f]{12}$" } },
+        ],
+        get: {
+          operationId: "vcomputerJob",
+          summary: "One job: status, exit code, and the last ?tail= bytes of output (default 16384)",
+          parameters: [{ name: "tail", in: "query", required: false, schema: { type: "integer" } }],
+          responses: {
+            "200": jsonResponse("Job", { type: "object" }),
+            "404": errorResponse("No such job"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/jobs/{jobId}/kill": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+          { name: "jobId", in: "path", required: true, schema: { type: "string", pattern: "^job_[0-9a-f]{12}$" } },
+        ],
+        post: {
+          operationId: "vcomputerKillJob",
+          summary: "Kill a job's process group (TERM, then KILL)",
+          responses: {
+            "200": jsonResponse("Killed", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/handoff": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        post: {
+          operationId: "vcomputerHandoff",
+          summary: "Hand the screen to the owner: pauses the agent and returns a one-time owner URL (shown once, never stored) for a page with the instruction banner, the live desktop over noVNC, and a hand-back button",
+          requestBody: { required: true, content: { "application/json": { schema: {
+            type: "object",
+            properties: {
+              reason: { type: "string", maxLength: 200, description: "What the owner must do, e.g. Sign in to GitHub" },
+              instructions: { type: "string", maxLength: 2000 },
+              timeoutSec: { type: "integer", minimum: 60, maximum: 3600 },
+            },
+            required: ["reason"],
+          } } } },
+          responses: {
+            "201": jsonResponse("Hand-off opened", { type: "object" }),
+            "400": errorResponse("reason missing / timeoutSec out of 60..3600"),
+            "409": errorResponse("Not running, or a hand-off is already open"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        get: {
+          operationId: "vcomputerHandoffStatus",
+          summary: "Current hand-off and who has control; ?waitMs= (0..300000) long-polls until it ends",
+          parameters: [{ name: "waitMs", in: "query", required: false, schema: { type: "integer", minimum: 0, maximum: 300000 } }],
+          responses: {
+            "200": jsonResponse("Hand-off", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        delete: {
+          operationId: "vcomputerHandoffCancel",
+          summary: "Withdraw an open hand-off (agent side)",
+          responses: {
+            "200": jsonResponse("Cancelled", { type: "object" }),
+            "409": errorResponse("No open hand-off"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/vcomputers/{id}/toolcheck": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string", pattern: "^vc_[0-9a-f]{12}$" } },
+        ],
+        get: {
+          operationId: "vcomputerToolcheck",
+          summary: "Versions of the pinned toolchain inside the machine (docker backend)",
+          responses: {
+            "200": jsonResponse("Toolcheck", { type: "object" }),
             "401": errorResponse("Missing or invalid bearer token"),
           },
         },

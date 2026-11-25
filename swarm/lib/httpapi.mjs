@@ -32,6 +32,10 @@
  *   DELETE /v1/compute/apps/:id/preview -> disable public preview
  *   GET  /v1/compute/apps/:id/logs?tail=N -> {appId, log}
  *   DELETE /v1/compute/apps/:id     -> {ok:true}
+ * Virtual computers — per-agent desktops (operator-only; routes and the
+ * pre-auth owner hand-off page are listed in lib/vcomputer-http.mjs):
+ *   /v1/vcomputers[/:id[/start|stop|screenshot|input|exec|jobs|handoff|toolcheck]]
+ *   GET /handoff/:token, POST /handoff/:token/return, WS /handoff/:token/websockify
  * Git hosting (KILN-native repos, served via git http-backend CGI):
  *   POST /git/:owner/:repo            create repo (operator only; the repo
  *                                     is born with an initial commit on
@@ -331,6 +335,7 @@
  *   GET  /v1/openapi.json           -> OpenAPI 3.1 document (lib/openapi.mjs)
  */
 import { createServer } from "node:http";
+import { handleVcomputerApi, handleHandoffPublic, handleHandoffUpgrade } from "./vcomputer-http.mjs";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
@@ -601,6 +606,11 @@ export function startApiServer(dir, cfg) {
       if (req.method === "GET" && path === "/health") {
         return send(res, 200, { ok: true, version: 1, service: "kiln-swarm" });
       }
+
+      // ---- virtual computers: owner hand-off page (pre-auth; the
+      // unguessable token in the path is the capability — see
+      // lib/vcomputer-http.mjs and docs/KILN_VIRTUAL_COMPUTERS.md) ----
+      if (await handleHandoffPublic(req, res, path, dir, { send, readBody })) return;
 
       // ---- git hosting: read routes are HELD for the auth gate below ----
       // (architect's rule, 2026-10-28: only our accounts see the forge —
@@ -1695,6 +1705,12 @@ export function startApiServer(dir, cfg) {
         return send(res, status, receipt);
       }
 
+      // ---- virtual computers: per-agent desktops (operator-only) ----
+      if (await handleVcomputerApi(req, res, path, url, dir, {
+        send, readBody,
+        baseUrl: () => process.env.KILN_VC_HANDOFF_BASE_URL || cfg.vcomputers?.handoffBaseUrl || `http://127.0.0.1:${apiPort}`,
+      })) return;
+
       // ---- compute: serverless functions ----
       if (req.method === "POST" && path === "/v1/compute/invoke") {
         const b = await readBody(req);
@@ -2545,6 +2561,12 @@ export function startApiServer(dir, cfg) {
     ? parseInt(process.env.KILN_SWARM_API_PORT, 10)
     : (cfg.apiPort ?? 18787); // 0 = ephemeral; ?? keeps 0, || would eat it
   server.on("close", () => { try { previews.stop(); } catch {} });
+  // WebSocket upgrades: only the virtual-computer hand-off viewer uses one.
+  server.on("upgrade", (req, socket, head) => {
+    try {
+      if (!handleHandoffUpgrade(req, socket, head, dir)) socket.destroy();
+    } catch { try { socket.destroy(); } catch {} }
+  });
   return new Promise((resolve, reject) => {
     server.on("error", reject);
     // 127.0.0.1 ONLY — the API never binds a public interface.
