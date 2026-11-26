@@ -3,6 +3,22 @@
 All notable changes to KILN, newest first. Swarm rounds are tagged on
 `main` when they close (see docs/PRODUCTION.md → Releases).
 
+## 2026-11-25 — Agent transfer encryption
+
+- Wire encryption is on by default. Each connection does an X25519
+  ephemeral exchange signed by the existing ed25519 identities (mutual
+  authentication, forward secrecy). HKDF-SHA-256 derives per-direction
+  AES-256-GCM keys; every frame is sealed with a non-repeating counter
+  nonce; a failed tag or a reused nonce closes the connection. `--insecure`
+  is refused unless both sides are on loopback. `--host` on `recv` is the
+  supported way to accept remote senders now that the wire is encrypted
+  (still pin `--trust` / `--expect`).
+- No new dependencies (`node:crypto` only). Tests cover tampered
+  ciphertext, a wrong-identity MITM, nonce uniqueness, resume, and the
+  1 GiB end-to-end SHA-256 match. Benchmarks (measured, same box, median
+  of 5): default 1 GiB throughput 575.5 → 385.9 MiB/s; 64 B ping p50
+  0.028 → 0.066 ms; 1 KiB full send p50 4.11 → 7.23 ms.
+
 ## 2026-11-25 — Agent transfer
 
 - `swarm/lib/transfer*.mjs`: agent-to-agent file and package transfer
