@@ -1,3 +1,6 @@
 # Foundry build artifacts
 cache/
 out/
+
+# KILN L1 local devnets (ledgers, pids, logs)
+l1/.devnet/

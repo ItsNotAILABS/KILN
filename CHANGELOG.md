@@ -3,6 +3,20 @@
 All notable changes to KILN, newest first. Swarm rounds are tagged on
 `main` when they close (see docs/PRODUCTION.md → Releases).
 
+## 2026-11-26 — KILN L1 (SVM network extension, multi-chain adapters)
+
+- Architecture: [docs/KILN_L1.md](docs/KILN_L1.md). Solana is the settlement
+  chain; KILN L1 is an SVM chain (Agave) intended as a network extension;
+  Ethereum is a first-class adapter. The earlier EVM-L1 docs remain as the
+  Ethereum contract surface and now point here.
+- `l1/`: chain-adapter interface with working Solana, KILN-SVM and Ethereum
+  adapters (health, block, balance, build/sign/submit). Submit is refused
+  on mainnet. Local devnets: `solana-genesis` / `solana-test-validator` and
+  Anvil, bound to 127.0.0.1. Transfer Memo receipts are submitted through
+  the adapters without changing `swarm/lib/transfer-receipt.mjs`.
+- Tests: `node --test l1/test/*.test.mjs` (unit always; integration skips
+  if the local validators are missing). Never targets a public network.
+
 ## 2026-11-25 — Agent transfer encryption
 
 - Wire encryption is on by default. Each connection does an X25519
