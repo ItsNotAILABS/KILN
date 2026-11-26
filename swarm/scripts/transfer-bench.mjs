@@ -68,7 +68,7 @@ async function main() {
     });
   }
 
-  results.latency.ping64B = await pingLatency({ host, port, count: 1000, size: 64 });
+  results.latency.ping64B = await pingLatency({ host, port, count: 1000, size: 64, keypair: kp });
   const tiny = join(root, "tiny.txt");
   const tinyMs = [];
   for (let i = 0; i < 100; i++) {

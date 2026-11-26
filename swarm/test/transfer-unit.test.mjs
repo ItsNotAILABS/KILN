@@ -17,6 +17,8 @@ import {
   buildManifest, signManifest, verifySignedManifest, geometry, stripeK, chunkLen, manifestId, canonicalJson, safeName,
 } from "../lib/transfer-manifest.mjs";
 import { buildMemoReceipt, verifyMemoReceipt, checkRpcUrl, MEMO_PROGRAM_ID } from "../lib/transfer-receipt.mjs";
+import { FrameCipher, deriveCiphers, clientHandshake, serverHandshake, finishHandshake, requireEncryptOrLoopback } from "../lib/transfer-crypto.mjs";
+
 
 const tmp = () => mkdtempSync(join(tmpdir(), "kiln-tx-unit-"));
 
@@ -164,5 +166,59 @@ describe("memo receipt (offline)", () => {
       assert.throws(() => checkRpcUrl(u), /never mainnet/);
     }
     for (const u of ["https://api.devnet.solana.com", "http://127.0.0.1:8899", "http://localhost:8899/"]) checkRpcUrl(u);
+  });
+});
+
+
+describe("wire encryption (AES-256-GCM + X25519)", () => {
+  it("round-trips a frame and rejects a flipped ciphertext byte", () => {
+    const key = randomBytes(32);
+    const send = new FrameCipher(key);
+    const recv = new FrameCipher(key);
+    const plain = Buffer.concat([Buffer.from([4]), randomBytes(1000)]);
+    const ok = recv.open(send.seal(plain, { record: true }));
+    assert.deepEqual(ok, plain);
+    const boxed = send.seal(plain, { record: true });
+    const bad = Buffer.from(boxed); bad[20] ^= 0x01;
+    assert.throws(() => recv.open(bad), /authentication tag/);
+  });
+  it("issues unique, strictly increasing nonces and refuses reuse", () => {
+    const key = randomBytes(32);
+    const send = new FrameCipher(key);
+    const recv = new FrameCipher(key);
+    const seen = new Set();
+    for (let i = 0; i < 1000; i++) {
+      const w = send.seal(Buffer.from([1, i % 256]), { record: true });
+      const n = w.subarray(0, 12).toString("hex");
+      assert.equal(seen.has(n), false, `nonce repeated at ${i}`);
+      seen.add(n);
+      recv.open(w);
+    }
+    assert.equal(seen.size, 1000);
+    assert.equal(send.sendCounter, 1000n);
+    // replay of the last frame
+    const last = send.seal(Buffer.from([1]), { record: true });
+    recv.open(last);
+    assert.throws(() => recv.open(last), /reused or out-of-order nonce/);
+    // a lower counter, even with a valid-looking layout
+    const low = Buffer.from(last);
+    low.writeBigUInt64BE(1n, 4);
+    assert.throws(() => recv.open(low), /reused or out-of-order nonce|authentication tag/);
+  });
+  it("binds derived keys to the signed identities (swapping the id changes the key)", () => {
+    const a = generateKeypair(), b = generateKeypair(), c = generateKeypair();
+    const hs = clientHandshake(a);
+    const srv = serverHandshake(b, hs.payload);
+    const fin = finishHandshake(hs.eph, hs.nonce, srv.payload, { expectReceiver: b.publicKey });
+    const right = deriveCiphers({ shared: fin.shared, clientEph: hs.eph.publicKeyBytes, serverEph: fin.serverEph, clientId: a.publicKey, serverId: b.publicKey, nonce: hs.nonce, side: "client" });
+    const wrong = deriveCiphers({ shared: fin.shared, clientEph: hs.eph.publicKeyBytes, serverEph: fin.serverEph, clientId: a.publicKey, serverId: c.publicKey, nonce: hs.nonce, side: "server" });
+    const w = right.send.seal(Buffer.from([9, 8, 7]));
+    assert.throws(() => wrong.recv.open(w), /authentication tag/);
+    assert.throws(() => finishHandshake(hs.eph, hs.nonce, srv.payload, { expectReceiver: c.publicKey }), /expected/);
+  });
+  it("refuses an insecure mode off loopback", () => {
+    assert.throws(() => requireEncryptOrLoopback(false, "8.8.8.8", "sendFile"), /only allowed on loopback/);
+    requireEncryptOrLoopback(false, "127.0.0.1", "sendFile");
+    requireEncryptOrLoopback(true, "8.8.8.8", "sendFile");
   });
 });

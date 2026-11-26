@@ -11,12 +11,14 @@
  * The shipped transport is parallel TCP: each transfer opens N TCP
  * connections and spreads shards across them (see KILN_AGENT_TRANSFER.md for
  * why this is TCP and not QUIC on Node 24). Frames are
- *   u32 length (of type byte + payload) | u8 type | payload
+ *   plaintext: u32 length (of type byte + payload) | u8 type | payload
+ *   encrypted (after the handshake): u32 length | nonce(12) | AES-256-GCM(type||payload) | tag(16)
  */
 import net from "node:net";
 
 export const T = Object.freeze({
   HELLO: 1, WELCOME: 2, JOIN: 3, SHARD: 4, CONN_END: 5, END: 6, MISSING: 7, COMPLETE: 8, ERROR: 9, PING: 10, PONG: 11, JOINED: 12,
+  HS: 13, HS_OK: 14,
 });
 const MAX_FRAME = 64 << 20;
 
@@ -37,6 +39,7 @@ class FramedConn {
     this._frameFns = [];
     this._closeFns = [];
     this._bufs = []; this._have = 0; this._need = -1;
+    this._sendC = null; this._recvC = null; this._tamperNext = false;
     sock.setNoDelay(true);
     sock.on("data", (d) => this._onData(d));
     let err = null;
@@ -44,10 +47,28 @@ class FramedConn {
     sock.on("close", () => { this.closed = true; for (const f of this._closeFns) f(err); });
   }
   get writableLength() { return this.sock.writableLength; }
+  /** Enable per-frame AES-256-GCM after a completed handshake. Further send/recv is encrypted. */
+  installCipher(send, recv) { this._sendC = send; this._recvC = recv; }
   onFrame(fn) { this._frameFns.push(fn); }
   onClose(fn) { if (this.closed) fn(null); else this._closeFns.push(fn); }
   send(type, payload = Buffer.alloc(0), body) {
     if (this.closed) return false;
+    if (this._sendC) {
+      const plain = Buffer.allocUnsafe(1 + payload.length + (body ? body.length : 0));
+      plain[0] = type;
+      if (payload.length) payload.copy(plain, 1);
+      if (body && body.length) body.copy(plain, 1 + payload.length);
+      const tamper = this._tamperNext ? 0 : undefined;
+      this._tamperNext = false;
+      const sealed = this._sendC.seal(plain, tamper === undefined ? {} : { tamper });
+      const h = Buffer.allocUnsafe(4);
+      h.writeUInt32BE(sealed.length, 0);
+      this.sock.cork();
+      this.sock.write(h);
+      const ok = this.sock.write(sealed);
+      this.sock.uncork();
+      return ok && this.sock.writableLength < (8 << 20);
+    }
     const len = 1 + payload.length + (body ? body.length : 0);
     const h = Buffer.allocUnsafe(5);
     h.writeUInt32BE(len, 0); h[4] = type;
@@ -102,8 +123,15 @@ class FramedConn {
       if (this._have < this._need) return;
       const frame = this._take(this._need);
       this._need = -1;
-      const type = frame[0];
-      const payload = frame.subarray(1);
+      let type, payload;
+      if (this._recvC) {
+        let plain;
+        try { plain = this._recvC.open(frame); }
+        catch (e) { this.sock.destroy(e); return; }
+        type = plain[0]; payload = plain.subarray(1);
+      } else {
+        type = frame[0]; payload = frame.subarray(1);
+      }
       for (const f of this._frameFns) {
         try { f(type, payload); } catch (e) { this.sock.destroy(e); return; }
       }

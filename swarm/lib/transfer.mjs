@@ -26,6 +26,10 @@ import { Worker } from "node:worker_threads";
 import { spawn } from "node:child_process";
 import { TRANSPORTS, T, jsonPayload, parseJson, shardHeader } from "./transfer-wire.mjs";
 import {
+  clientHandshake, serverHandshake, finishHandshake, deriveCiphers,
+  requireEncryptOrLoopback, isLoopback,
+} from "./transfer-crypto.mjs";
+import {
   buildManifest, signManifest, verifySignedManifest, geometry, stripeK, chunkLen, DEFAULTS, safeName,
 } from "./transfer-manifest.mjs";
 import { encodeParity, reconstructData } from "./transfer-rs.mjs";
@@ -35,6 +39,7 @@ import { writeFileAtomicSync } from "./state.mjs";
 export { buildManifest, signManifest, verifySignedManifest } from "./transfer-manifest.mjs";
 export { generateKeypair, loadOrCreateKeypair, loadKeypairFile } from "./transfer-identity.mjs";
 export { buildMemoReceipt, submitMemoReceipt, verifyMemoReceipt } from "./transfer-receipt.mjs";
+export { FrameCipher, isLoopback, requireEncryptOrLoopback } from "./transfer-crypto.mjs";
 
 export class TransferError extends Error {}
 
@@ -131,10 +136,11 @@ export async function sendFile(path, opts = {}) {
     host = "127.0.0.1", port, keypair, streams = 8, transport = "tcp", expectReceiver, name,
     chunkSize = DEFAULTS.chunkSize, dataShards = DEFAULTS.dataShards, parityShards = DEFAULTS.parityShards,
     workers = Math.max(1, Math.min(4, availableParallelism() - 1)), envelope: givenEnv,
-    onProgress, _hooks = {},
+    onProgress, _hooks = {}, encrypt = true,
   } = opts;
   if (!keypair) throw new TransferError("sendFile: keypair is required");
   if (!port) throw new TransferError("sendFile: port is required");
+  requireEncryptOrLoopback(encrypt, host, "sendFile");
   const tp = TRANSPORTS[transport];
   if (!tp) throw new TransferError(`unknown transport ${transport}`);
   const t0 = performance.now();
@@ -151,8 +157,23 @@ export async function sendFile(path, opts = {}) {
   const conns = [];
   let pool = null, fh = null;
   const stats = { id: env.id, name: m.name, bytes: m.size, stripes, skippedStripes: 0, sentStripes: 0, repairRounds: 0,
-    shardsSent: 0, wireBytes: 0, streams: Math.max(1, dataStreams), transport: tp.name };
+    shardsSent: 0, wireBytes: 0, streams: Math.max(1, dataStreams), transport: tp.name, encrypt };
   try {
+    if (encrypt) {
+      const hs = clientHandshake(keypair);
+      ctrl.send(T.HS, jsonPayload(hs.payload));
+      const ok = await nextCtrl(30000);
+      if (ok.type === T.ERROR) throw new TransferError(`receiver refused: ${parseJson(ok.payload).error}`);
+      if (ok.type !== T.HS_OK) throw new TransferError(`unexpected frame ${ok.type}`);
+      const fin = finishHandshake(hs.eph, hs.nonce, parseJson(ok.payload), { expectReceiver });
+      const ciphers = deriveCiphers({
+        shared: fin.shared, clientEph: hs.eph.publicKeyBytes, serverEph: fin.serverEph,
+        clientId: keypair.publicKey, serverId: fin.receiver, nonce: hs.nonce, context: "ctrl", side: "client",
+      });
+      ctrl.installCipher(ciphers.send, ciphers.recv);
+      stats.receiver = fin.receiver;
+    }
+    if (_hooks.tamperCiphertext) ctrl._tamperNext = true;
     const nonce = randomBytes(16).toString("hex");
     ctrl.send(T.HELLO, jsonPayload({ envelope: env, streams: dataStreams, nonce }));
     const w = await nextCtrl(60000);
@@ -174,8 +195,20 @@ export async function sendFile(path, opts = {}) {
         joins.push((async () => {
           const c = await tp.connect({ host, port });
           const p = waitFrame(c, [T.JOINED]);
-          c.send(T.JOIN, jsonPayload({ session: welcome.session }));
-          await p;
+          if (encrypt) {
+            const hs = clientHandshake(keypair, { session: welcome.session });
+            c.send(T.JOIN, jsonPayload({ session: welcome.session, ephPub: hs.payload.ephPub, nonce: hs.payload.nonce, sig: hs.payload.sig, v: 1 }));
+            const joined = await p;
+            const fin = finishHandshake(hs.eph, hs.nonce, parseJson(joined.payload), { session: welcome.session, expectReceiver: welcome.receiver });
+            const ciphers = deriveCiphers({
+              shared: fin.shared, clientEph: hs.eph.publicKeyBytes, serverEph: fin.serverEph,
+              clientId: keypair.publicKey, serverId: fin.receiver, nonce: hs.nonce, context: "data:" + welcome.session, side: "client",
+            });
+            c.installCipher(ciphers.send, ciphers.recv);
+          } else {
+            c.send(T.JOIN, jsonPayload({ session: welcome.session }));
+            await p;
+          }
           return c;
         })());
       }
@@ -191,6 +224,7 @@ export async function sendFile(path, opts = {}) {
         if (hook === "drop") return;
         if (hook === "corrupt") { shard = Buffer.from(body); shard[0] ^= 0xff; }
         if (conn.closed) conn = alive()[0];
+        if (hook === "tamper-wire") conn._tamperNext = true;
         stats.shardsSent++; stats.wireBytes += body.length;
         if (!conn.send(T.SHARD, shardHeader(s, idx), shard)) await conn.drained();
       };
@@ -478,18 +512,37 @@ class RecvSession {
  */
 export async function startReceiver(opts = {}) {
   const { outDir, host = "127.0.0.1", port = 0, keypair, trust, transport = "tcp", overwrite = false,
-    verifyFile = false, onComplete, maxSize = Infinity } = opts;
+    verifyFile = false, onComplete, maxSize = Infinity, encrypt = true } = opts;
   if (!outDir) throw new TransferError("startReceiver: outDir is required");
   if (!keypair) throw new TransferError("startReceiver: keypair is required");
+  requireEncryptOrLoopback(encrypt, host, "startReceiver");
   const tp = TRANSPORTS[transport];
   if (!tp) throw new TransferError(`unknown transport ${transport}`);
   await mkdir(outDir, { recursive: true });
   const rx = { outDir: resolvePath(outDir), overwrite, verifyFile, onComplete, sessions: new Map(), active: new Map(), closing: new Map(),
-    stats: { completed: 0, recoveredStripes: 0 } };
+    stats: { completed: 0, recoveredStripes: 0 }, encrypt, requireEncrypt: encrypt };
 
   const onConnection = (conn) => {
-    let sess = null, role = null;
+    let sess = null, role = null, hsSender = null;
     conn.onFrame(async (type, payload) => {
+      if (!role && type === T.HS) {
+        try {
+          const reply = serverHandshake(keypair, parseJson(payload));
+          conn.send(T.HS_OK, jsonPayload(reply.payload));
+          const ciphers = deriveCiphers({
+            shared: reply.shared, clientEph: reply.clientEph, serverEph: reply.serverEph,
+            clientId: reply.sender, serverId: keypair.publicKey, nonce: reply.nonce, context: "ctrl", side: "server",
+          });
+          conn.installCipher(ciphers.send, ciphers.recv);
+          hsSender = reply.sender;
+        } catch (e) {
+          conn.send(T.ERROR, jsonPayload({ error: e.message })); conn.end();
+        }
+        return;
+      }
+      if (rx.requireEncrypt && !conn._recvC && type !== T.JOIN) {
+        conn.send(T.ERROR, jsonPayload({ error: "encryption required" })); conn.end(); return;
+      }
       if (type === T.PING) { conn.send(T.PONG, payload); return; }
       if (!role && type === T.HELLO) {
         role = "ctrl";
@@ -497,6 +550,7 @@ export async function startReceiver(opts = {}) {
         try {
           hello = parseJson(payload);
           const id = verifySignedManifest(hello.envelope, { trust });
+          if (hsSender && hello.envelope.manifest.sender !== hsSender) throw new Error("manifest sender does not match handshake identity");
           if (hello.envelope.manifest.size > maxSize) throw new Error(`file exceeds this receiver's max size`);
           if (rx.active.has(id)) throw new Error("this manifest is already being received");
           sess = new RecvSession(rx, hello.envelope, id, conn, hello.streams);
@@ -519,9 +573,24 @@ export async function startReceiver(opts = {}) {
         let j; try { j = parseJson(payload); } catch { conn.destroy(); return; }
         sess = rx.sessions.get(j.session);
         if (!sess) { conn.send(T.ERROR, jsonPayload({ error: "unknown session" })); conn.end(); return; }
+        if (rx.requireEncrypt || j.ephPub) {
+          try {
+            const reply = serverHandshake(keypair, j, { session: j.session, expectedSender: sess.m.sender });
+            conn.send(T.JOINED, jsonPayload(reply.payload));
+            const ciphers = deriveCiphers({
+              shared: reply.shared, clientEph: reply.clientEph, serverEph: reply.serverEph,
+              clientId: sess.m.sender, serverId: keypair.publicKey, nonce: reply.nonce, context: "data:" + j.session, side: "server",
+            });
+            conn.installCipher(ciphers.send, ciphers.recv);
+          } catch (e) {
+            conn.send(T.ERROR, jsonPayload({ error: e.message })); conn.end(); return;
+          }
+        } else {
+          if (rx.requireEncrypt) { conn.send(T.ERROR, jsonPayload({ error: "encryption required" })); conn.end(); return; }
+          conn.send(T.JOINED);
+        }
         role = "data"; sess.conns.add(conn);
         if (sess.paused) conn.pause();
-        conn.send(T.JOINED);
         return;
       }
       if (!sess) { conn.destroy(); return; }
@@ -538,13 +607,33 @@ export async function startReceiver(opts = {}) {
     });
   };
   const srv = await tp.listen({ host, port, onConnection });
-  return { port: srv.port, host, publicKey: keypair.publicKey, outDir: rx.outDir, stats: rx.stats,
+  return { port: srv.port, host, publicKey: keypair.publicKey, outDir: rx.outDir, stats: rx.stats, encrypt,
     close: async () => { for (const s of [...rx.sessions.values()]) s.close(); await srv.close(); } };
 }
 
 /** Round-trip a small payload on an open connection (latency probe). */
-export async function pingLatency({ host = "127.0.0.1", port, count = 200, size = 64, transport = "tcp" }) {
+export async function pingLatency({ host = "127.0.0.1", port, count = 200, size = 64, transport = "tcp", keypair, expectReceiver, encrypt = true }) {
+  requireEncryptOrLoopback(encrypt, host, "pingLatency");
+  if (encrypt && !keypair) throw new TransferError("pingLatency: keypair is required when encryption is on");
   const conn = await TRANSPORTS[transport].connect({ host, port });
+  if (encrypt) {
+    const hs = clientHandshake(keypair);
+    const ok = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new TransferError("timed out waiting for handshake")), 15000);
+      conn.onFrame((type, payload) => {
+        if (type === T.HS_OK || type === T.ERROR) { clearTimeout(t); resolve({ type, payload }); }
+      });
+      conn.onClose((e) => { clearTimeout(t); reject(new TransferError(`connection closed${e ? ": " + e.message : ""}`)); });
+      conn.send(T.HS, jsonPayload(hs.payload));
+    });
+    if (ok.type === T.ERROR) throw new TransferError(parseJson(ok.payload).error);
+    const fin = finishHandshake(hs.eph, hs.nonce, parseJson(ok.payload), { expectReceiver });
+    const ciphers = deriveCiphers({
+      shared: fin.shared, clientEph: hs.eph.publicKeyBytes, serverEph: fin.serverEph,
+      clientId: keypair.publicKey, serverId: fin.receiver, nonce: hs.nonce, context: "ctrl", side: "client",
+    });
+    conn.installCipher(ciphers.send, ciphers.recv);
+  }
   const payload = randomBytes(size);
   const lat = [];
   let resolveFn = null;

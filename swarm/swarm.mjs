@@ -51,8 +51,10 @@
  *   swarm.mjs vc handoff-status|cancel-handoff <id|name>
  *   swarm.mjs recv [--out DIR] [--host H] [--port P] [--trust PK,PK] [--keypair FILE]
  *                        [--once] [--extract] [--verify] [--overwrite] [--vc ID --subdir S]
+ *                        [--insecure]
  *   swarm.mjs send <path> --to HOST:PORT [--expect PUBKEY] [--streams N] [--chunk-kb KB]
  *                        [--data K] [--parity M] [--keypair FILE] [--from-vc ID] [--json]
+ *                        [--insecure]
  *   swarm.mjs transfer identity|ping|receipt [...]   (see docs/KILN_AGENT_TRANSFER.md)
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
@@ -1284,6 +1286,7 @@ async function cmdRecv(args) {
     host: args.host ? String(args.host) : "127.0.0.1",
     port: args.port ? Number(args.port) : 0,
     keypair, trust, verifyFile: !!args.verify, overwrite: !!args.overwrite,
+    encrypt: !args.insecure,
     onComplete: async (r) => {
       if (args.extract && !args.vc && r.name.endsWith(".tar")) r.extracted = await T.extractTar(r.path, dirname(r.path));
       setImmediate(() => {
@@ -1315,6 +1318,7 @@ async function cmdSend(args) {
     chunkSize: args["chunk-kb"] ? Number(args["chunk-kb"]) * 1024 : undefined,
     dataShards: args.data !== undefined ? Number(args.data) : undefined,
     parityShards: args.parity !== undefined ? Number(args.parity) : undefined,
+    encrypt: !args.insecure,
   };
   for (const k of Object.keys(opts)) if (opts[k] === undefined) delete opts[k];
   const r = args["from-vc"]
@@ -1339,7 +1343,7 @@ async function cmdTransfer(args) {
     console.log(JSON.stringify({ publicKey: kp.publicKey, keypairFile: args.keypair ? resolve(String(args.keypair)) : T.identityPath(dir) }));
   } else if (sub === "ping") {
     const { host, port } = parseHostPort(need(args, "to"), "--to");
-    console.log(JSON.stringify(await T.pingLatency({ host, port, count: args.count ? Number(args.count) : 200 })));
+    console.log(JSON.stringify(await T.pingLatency({ host, port, count: args.count ? Number(args.count) : 200, keypair: txKeypair(args, dir, T), encrypt: !args.insecure })));
   } else if (sub === "receipt") {
     const id = String(need(args, "manifest-id"));
     const kp = txKeypair(args, dir, T);

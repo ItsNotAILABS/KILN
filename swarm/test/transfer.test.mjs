@@ -14,6 +14,10 @@ import { spawnSync } from "node:child_process";
 import {
   startReceiver, sendFile, sendPath, generateKeypair, pingLatency, receiveIntoComputer, sendFromComputer, homeRelative,
 } from "../lib/transfer.mjs";
+import { isLoopback, hsBytes } from "../lib/transfer-crypto.mjs";
+import { signBytes } from "../lib/transfer-identity.mjs";
+import net from "node:net";
+import { T, jsonPayload, parseJson } from "../lib/transfer-wire.mjs";
 import { makeStateDir } from "./helpers.mjs";
 
 const dirs = [], receivers = [];
@@ -70,7 +74,7 @@ describe("transfer: delivery", () => {
   });
   it("answers small-message pings in well under 50ms on loopback", async () => {
     const { rx } = await pair();
-    const l = await pingLatency({ port: rx.port, count: 50 });
+    const l = await pingLatency({ port: rx.port, count: 50, keypair: generateKeypair(), expectReceiver: rx.publicKey });
     await rx.close();
     assert.ok(l.p50 < 50, `p50 ${l.p50}ms`);
   });
@@ -199,3 +203,94 @@ describe("transfer: directories + vc homes", () => {
     assert.deepEqual(readFileSync(join(back.out, "report.zip")), data);
   });
 });
+
+describe("transfer: encryption", () => {
+  it("is on by default and a plaintext HELLO is refused", async () => {
+    const { rx, sk } = await pair();
+    const { p } = file(1000);
+    const r = await sendFile(p, { port: rx.port, keypair: sk, ...small });
+    assert.equal(r.encrypt, true);
+    await assert.rejects(sendFile(p, { port: rx.port, keypair: sk, encrypt: false, ...small }), /encryption required|timed out|closed/);
+    await rx.close();
+  });
+  it("refuses --insecure / encrypt:false off loopback", async () => {
+    assert.equal(isLoopback("127.0.0.1"), true);
+    assert.equal(isLoopback("0.0.0.0"), false);
+    const { p } = file(100);
+    await assert.rejects(sendFile(p, { host: "1.2.3.4", port: 9, keypair: generateKeypair(), encrypt: false }), /only allowed on loopback/);
+    await assert.rejects(startReceiver({ outDir: tmp(), host: "0.0.0.0", keypair: generateKeypair(), encrypt: false }), /only allowed on loopback/);
+  });
+  it("rejects tampered ciphertext and never writes the file", async () => {
+    const { rx, out, sk } = await pair();
+    const { p } = file(2 * 1024 * 1024);
+    await assert.rejects(sendFile(p, { port: rx.port, keypair: sk, ...small, _hooks: { tamperCiphertext: true } }),
+      /closed|tag|rejected|cipher|encryption|timed out/);
+    await new Promise((r) => setTimeout(r, 100));
+    await rx.close();
+    assert.equal(existsSync(join(out, "data.bin")), false, "tampered transfer must not finalize");
+  });
+  it("rejects a man-in-the-middle that presents the wrong identity", async () => {
+    const real = await pair();
+    const attacker = generateKeypair();
+    const proxy = await listenProxy(real.rx.port, (type, payload, clientHs) => {
+      if (type !== T.HS_OK || !clientHs) return null;
+      const clientEph = Buffer.from(clientHs.ephPub, "base64");
+      const nonce = Buffer.from(clientHs.nonce, "base64");
+      const msg = parseJson(payload);
+      const ephPub = Buffer.from(msg.ephPub, "base64");
+      // Re-sign the real server ephemeral under the attacker's identity.
+      const sig = signBytes(attacker, hsBytes("s", [ephPub, nonce, clientEph]));
+      return { type: T.HS_OK, payload: jsonPayload({ ephPub: msg.ephPub, receiver: attacker.publicKey, sig: sig.toString("base64") }) };
+    });
+    const { p } = file(1000);
+    await assert.rejects(
+      sendFile(p, { port: proxy.port, keypair: generateKeypair(), expectReceiver: real.rk.publicKey, ...small }),
+      /receiver is|handshake signature|expected/,
+    );
+    await proxy.close();
+    await real.rx.close();
+  });
+});
+
+/** A localhost TCP proxy that can rewrite one server-to-client frame (used for the MITM test). */
+function listenProxy(destPort, rewrite) {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer((client) => {
+      const up = net.connect({ host: "127.0.0.1", port: destPort });
+      let cBuf = Buffer.alloc(0), uBuf = Buffer.alloc(0), clientHs = null;
+      const pump = (from, to, isUp) => {
+        const side = isUp ? "u" : "c";
+        return (d) => {
+          if (side === "c") cBuf = Buffer.concat([cBuf, d]); else uBuf = Buffer.concat([uBuf, d]);
+          let buf = side === "c" ? cBuf : uBuf;
+          while (buf.length >= 4) {
+            const n = buf.readUInt32BE(0);
+            if (buf.length < 4 + n) break;
+            const frame = buf.subarray(4, 4 + n);
+            buf = buf.subarray(4 + n);
+            const type = frame[0], payload = frame.subarray(1);
+            if (side === "c" && type === T.HS) { try { clientHs = parseJson(payload); } catch { /* ignore */ } }
+            const swapped = isUp ? rewrite(type, payload, clientHs) : null;
+            const out = swapped ? Buffer.concat([Buffer.from([swapped.type]), swapped.payload]) : frame;
+            const h = Buffer.alloc(4 + out.length);
+            h.writeUInt32BE(out.length, 0); out.copy(h, 4);
+            if (!to.destroyed) to.write(h);
+          }
+          if (side === "c") cBuf = buf; else uBuf = buf;
+        };
+      };
+      client.on("data", pump(client, up, false));
+      up.on("data", pump(up, client, true));
+      const close = () => { client.destroy(); up.destroy(); };
+      client.on("error", close); up.on("error", close);
+      client.on("close", () => up.destroy()); up.on("close", () => client.destroy());
+    });
+    const sockets = new Set();
+    srv.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+    srv.listen(0, "127.0.0.1", () => resolve({
+      port: srv.address().port,
+      close: () => new Promise((r) => { for (const s of sockets) s.destroy(); srv.close(r); }),
+    }));
+    srv.on("error", reject);
+  });
+}
