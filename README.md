@@ -77,6 +77,19 @@ rebuilt — each one proved itself on live work, not in a design doc.*
   instead of claiming isolation that isn't there.
 
 
+## KILN L1 (Solana settlement, SVM chain, Ethereum adapter)
+
+KILN's own chain runs the Solana engine (SVM / Agave) and settles to Solana,
+the main chain. Ethereum is a first-class adapter (Cloudflare's Ethereum
+gateway in production, Anvil in tests). Files, compute and virtual computers
+stay off-chain. See [docs/KILN_L1.md](docs/KILN_L1.md) for the architecture,
+the trust model, the hire → escrow → receipt → payout flow, and the local
+devnets in `l1/`.
+
+The Foundry contracts below are the Ethereum-side ownership and compute
+surface. They are not the runtime of the KILN chain, and they are not
+deployed.
+
 ## L1 ownership foundation
 
 See [KILN L1: Code Ownership and Provenance](docs/KILN_L1_OWNERSHIP.md) for the account, code-commit anchoring, license, agent-capability, and receipt model.

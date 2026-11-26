@@ -1,0 +1,15 @@
+{
+  "name": "kiln-svm",
+  "description": "Local KILN-SVM genesis parameters. Applied by l1/lib/devnet.mjs via solana-genesis when that path works; otherwise solana-test-validator writes its own genesis and the running hash is recorded.",
+  "clusterType": "development",
+  "hashesPerTick": "sleep",
+  "slotsPerEpoch": 32,
+  "faucetLamports": 1000000000000,
+  "bootstrapValidatorLamports": 500000000000,
+  "bootstrapValidatorStakeLamports": 500000000,
+  "inflation": "none",
+  "bindAddress": "127.0.0.1",
+  "defaultRpcPort": 18899,
+  "defaultFaucetPort": 18901,
+  "note": "This is a development cluster, not a production network extension. Do not point these ports at a public interface."
+}

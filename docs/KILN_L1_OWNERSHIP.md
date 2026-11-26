@@ -1,5 +1,8 @@
 # KILN L1: Code Ownership and Provenance
 
+> **Architecture update (2026-11-26):** KILN's production chain is an SVM network extension that settles to Solana, with Ethereum as a first-class adapter. See [KILN_L1.md](KILN_L1.md). This document describes the earlier EVM scaffold, which remains the Ethereum-side contract surface.
+
+
 KILN is planned as an EVM-compatible Layer 1 for user-controlled code identity, provenance, and governed execution.
 
 ## What ownership means
