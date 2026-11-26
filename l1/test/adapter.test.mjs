@@ -7,7 +7,7 @@ import { openAdapter, openDefaultAdapters, ADAPTER_IDS } from "../lib/adapter.mj
 import { SolanaAdapter } from "../lib/solana-adapter.mjs";
 import { KilnSvmAdapter } from "../lib/kiln-svm-adapter.mjs";
 import { EthereumAdapter } from "../lib/ethereum-adapter.mjs";
-import { classifySvmNetwork, NETWORK, assertCanSubmit, SOLANA_SUBMIT_RPC, KILN_SVM_SUBMIT_RPC, ETHEREUM_SUBMIT_RPC } from "../lib/chains.mjs";
+import { classifySvmNetwork, NETWORK, assertCanSubmit, SOLANA_SUBMIT_RPC, KILN_SVM_SUBMIT_RPC, ETHEREUM_SUBMIT_RPC, normalizeEthRpcUrl, publicRpcLabel, sanitizeErrorMessage } from "../lib/chains.mjs";
 import { loadGenesisSpec } from "../lib/devnet.mjs";
 import { buildDeliveryReceipt, svmAdapter, memoText } from "../lib/receipts.mjs";
 import { generateKeypair } from "../../swarm/lib/transfer-identity.mjs";
@@ -122,5 +122,58 @@ describe("genesis spec", () => {
     assert.equal(g.hashesPerTick, "sleep");
     assert.ok(g.slotsPerEpoch >= 8);
     assert.equal(g.defaultRpcPort, 18899);
+  });
+});
+
+describe("ethereum RPC URL normalization", () => {
+  const fakeBare = "gateway.example.test/v1/mainnet";
+  const fakeHttps = "https://gateway.example.test/v1/mainnet";
+
+  it("trims whitespace and prepends https:// when no scheme is present", () => {
+    assert.equal(normalizeEthRpcUrl("  gateway.example.test/v1/mainnet  "), "https://gateway.example.test/v1/mainnet");
+    assert.equal(normalizeEthRpcUrl(fakeBare), fakeHttps);
+    assert.equal(normalizeEthRpcUrl("//gateway.example.test/v1/mainnet"), fakeHttps);
+  });
+
+  it("leaves an existing https:// URL alone (aside from URL normalization)", () => {
+    assert.equal(normalizeEthRpcUrl("https://gateway.example.test/v1/mainnet"), fakeHttps);
+    assert.equal(normalizeEthRpcUrl("HTTPS://gateway.example.test/v1/mainnet"), fakeHttps);
+  });
+
+  it("accepts http:// only for loopback hosts", () => {
+    assert.equal(normalizeEthRpcUrl("http://127.0.0.1:18545"), "http://127.0.0.1:18545/");
+    assert.equal(normalizeEthRpcUrl("http://localhost:8545"), "http://localhost:8545/");
+    assert.throws(() => normalizeEthRpcUrl("http://gateway.example.test/v1/mainnet"), /refusing http:\/\//);
+    assert.throws(() => normalizeEthRpcUrl("ftp://gateway.example.test/v1/mainnet"), /must be http or https/);
+  });
+
+  it("rejects empty or invalid URLs without echoing the input", () => {
+    for (const bad of ["", "   ", null, "https://"]) {
+      let err;
+      try { normalizeEthRpcUrl(bad); } catch (e) { err = e; }
+      assert.ok(err, `expected throw for ${JSON.stringify(bad)}`);
+      assert.doesNotMatch(String(err.message), /gateway\.example\.test/);
+    }
+  });
+
+  it("redacts hosts in error messages and public labels", () => {
+    assert.equal(publicRpcLabel(fakeHttps), "[redacted-rpc]");
+    assert.equal(publicRpcLabel("http://127.0.0.1:18545"), "http://127.0.0.1:18545");
+    const leaked = `fetch failed: ${fakeHttps} from gateway.example.test`;
+    const safe = sanitizeErrorMessage(leaked, fakeBare);
+    assert.doesNotMatch(safe, /gateway\.example\.test/);
+    assert.doesNotMatch(safe, /v1\/mainnet/);
+    assert.match(safe, /\[redacted\]/);
+  });
+
+  it("normalizes a bare host on the Ethereum adapter and redacts it in info() and submit errors", () => {
+    const a = new EthereumAdapter({ rpcUrl: "  gateway.example.test/v1/mainnet ", chainId: 1 });
+    assert.equal(a.rpcUrl, fakeHttps);
+    assert.equal(a.info().rpcUrl, "[redacted-rpc]");
+    let err;
+    try { a.assertCanSubmit(); } catch (e) { err = e; }
+    assert.ok(err);
+    assert.match(String(err.message), /mainnet/);
+    assert.doesNotMatch(String(err.message), /gateway\.example\.test/);
   });
 });

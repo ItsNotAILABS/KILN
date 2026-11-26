@@ -8,7 +8,7 @@
  */
 import {
   NETWORK, ETHEREUM_SUBMIT_RPC, assertCanSubmit, ethereumRpcFromEnv,
-  isLocalhostUrl, optionalEthHeaders,
+  isLocalhostUrl, optionalEthHeaders, normalizeEthRpcUrl, publicRpcLabel,
 } from "./chains.mjs";
 import { rpc } from "./rpc.mjs";
 import { BaseAdapter } from "./base-adapter.mjs";
@@ -55,7 +55,7 @@ export function buildLegacyTx({ nonce, gasPrice, gas, to, value, data = "0x", ch
 export class EthereumAdapter extends BaseAdapter {
   constructor(opts = {}) {
     super();
-    this._rpcUrl = opts.rpcUrl || ethereumRpcFromEnv();
+    this._rpcUrl = normalizeEthRpcUrl(opts.rpcUrl || ethereumRpcFromEnv());
     this._headers = opts.headers || optionalEthHeaders();
     this._allow = opts.allowList || ETHEREUM_SUBMIT_RPC;
     this._chainId = opts.chainId ?? null;
@@ -99,11 +99,11 @@ export class EthereumAdapter extends BaseAdapter {
         ok: true,
         blockNumber: Number(blockNumber),
         chainId,
-        rpcUrl: this._rpcUrl,
+        rpcUrl: publicRpcLabel(this._rpcUrl),
         network: this.network,
       };
     } catch (e) {
-      return { ok: false, error: e.message, rpcUrl: this._rpcUrl, network: this.network };
+      return { ok: false, error: e.message, rpcUrl: publicRpcLabel(this._rpcUrl), network: this.network };
     }
   }
 
@@ -160,7 +160,7 @@ export class EthereumAdapter extends BaseAdapter {
     const raw = signed.raw || signed.rawTransaction || signed.transaction;
     if (!raw) throw new Error("ethereum: submit requires a raw signed transaction");
     const hash = await this.rpc("eth_sendRawTransaction", [raw]);
-    return { hash, submitted: true, chain: this.id, rpcUrl: this._rpcUrl };
+    return { hash, submitted: true, chain: this.id, rpcUrl: publicRpcLabel(this._rpcUrl) };
   }
 
   /** Local-only: Anvil (and similar) unlocked-account send. Never on mainnet. */
@@ -175,7 +175,7 @@ export class EthereumAdapter extends BaseAdapter {
     };
     if (data && data !== "0x") tx.data = data;
     const hash = await this.rpc("eth_sendTransaction", [tx]);
-    return { hash, submitted: true, chain: this.id, via: "eth_sendTransaction", rpcUrl: this._rpcUrl };
+    return { hash, submitted: true, chain: this.id, via: "eth_sendTransaction", rpcUrl: publicRpcLabel(this._rpcUrl) };
   }
 
   async getTransaction(hash) {

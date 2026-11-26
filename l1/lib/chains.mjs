@@ -33,14 +33,89 @@ const MAINNET_SVM_RPC = [
   /solana-mainnet/i,
 ];
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
+export function isLoopbackHost(hostname) {
+  const h = String(hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return LOOPBACK_HOSTS.has(h);
+}
+
 export function isLocalhostUrl(url) {
   try {
     const u = new URL(String(url));
-    return (u.protocol === "http:" || u.protocol === "https:")
-      && (u.hostname === "127.0.0.1" || u.hostname === "localhost");
+    return (u.protocol === "http:" || u.protocol === "https:") && isLoopbackHost(u.hostname);
   } catch {
     return false;
   }
+}
+
+const HAS_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//;
+
+/**
+ * Normalize an Ethereum RPC URL from env or a caller.
+ * Trims whitespace, prepends https:// when no scheme is present,
+ * and refuses http:// for non-loopback hosts. Error messages never
+ * include the URL.
+ */
+export function normalizeEthRpcUrl(raw) {
+  if (raw == null || String(raw).trim() === "") {
+    throw new Error("ethereum: RPC URL is empty");
+  }
+  let s = String(raw).trim();
+  if (s.startsWith("//")) s = "https:" + s;
+  else if (!HAS_SCHEME.test(s)) s = "https://" + s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    throw new Error("ethereum: invalid RPC URL");
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("ethereum: RPC URL must be http or https");
+  }
+  if (u.protocol === "http:" && !isLoopbackHost(u.hostname)) {
+    throw new Error("ethereum: refusing http:// RPC for a non-loopback host (use https://)");
+  }
+  return u.href;
+}
+
+/** Safe label for logs and CLI. Loopback URLs are shown; anything else is redacted. */
+export function publicRpcLabel(url) {
+  try {
+    if (url && isLocalhostUrl(url)) return String(url);
+  } catch { /* fall through */ }
+  return "[redacted-rpc]";
+}
+
+/** Strip a URL and its host/path pieces out of an error message. */
+export function sanitizeErrorMessage(message, url) {
+  let msg = String(message ?? "");
+  if (!url) return msg;
+  const pieces = new Set();
+  const add = (v) => {
+    if (v == null) return;
+    const s = String(v).trim();
+    if (s.length >= 4) pieces.add(s);
+  };
+  add(url);
+  add(String(url).trim());
+  try {
+    const withScheme = HAS_SCHEME.test(String(url).trim()) ? String(url).trim() : "https://" + String(url).trim();
+    const u = new URL(withScheme);
+    add(u.href);
+    add(u.origin);
+    add(u.host);
+    add(u.hostname);
+    add(u.pathname);
+    add(`${u.host}${u.pathname}`);
+    add(String(url).replace(/^https?:\/\//i, "").trim());
+  } catch { /* ignore parse failures */ }
+  // Longest first so we don't leave remnants of a path after replacing the host.
+  for (const piece of [...pieces].sort((a, b) => b.length - a.length)) {
+    if (piece.length < 4) continue;
+    msg = msg.split(piece).join("[redacted]");
+  }
+  return msg;
 }
 
 export function classifySvmNetwork(url) {
@@ -68,7 +143,7 @@ export function assertCanSubmit({ network, chainId, rpcUrl, allowList, label }) 
     throw new Error(`refusing submit on ${label}: mainnet chain id is not allowed`);
   }
   if (!allowedSubmit(rpcUrl, allowList)) {
-    throw new Error(`refusing submit on ${label}: RPC ${rpcUrl} is not on the allow-list (localhost, and Solana devnet/testnet for the shared Solana adapter only)`);
+    throw new Error(`refusing submit on ${label}: RPC ${publicRpcLabel(rpcUrl)} is not on the allow-list (localhost, and Solana devnet/testnet for the shared Solana adapter only)`);
   }
 }
 
@@ -79,7 +154,8 @@ export function envOr(name, fallback) {
 
 /** Ethereum RPC: owner-supplied Cloudflare gateway, or local Anvil. Never hardcoded. */
 export function ethereumRpcFromEnv(defaultLocal = "http://127.0.0.1:18545") {
-  return envOr("KILN_ETH_RPC_URL", envOr("CLOUDFLARE_ETH_GATEWAY_URL", defaultLocal));
+  const raw = envOr("KILN_ETH_RPC_URL", envOr("CLOUDFLARE_ETH_GATEWAY_URL", defaultLocal));
+  return normalizeEthRpcUrl(raw);
 }
 
 export function optionalEthHeaders() {

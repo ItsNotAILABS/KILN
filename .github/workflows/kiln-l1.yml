@@ -85,6 +85,6 @@ jobs:
         with:
           node-version: "24"
       - name: Unit tests
-        run: node --test l1/test/adapter.test.mjs
+        run: node --test l1/test/*.test.mjs
       # Integration tests (solana-test-validator / anvil) are skipped on
       # this runner unless those binaries are installed; they run locally.

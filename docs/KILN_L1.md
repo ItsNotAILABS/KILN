@@ -364,12 +364,15 @@ Submit is **localhost only**. This is our chain: same keys and
 programs, our genesis.
 
 **Ethereum adapter.** JSON-RPC to `KILN_ETH_RPC_URL` or
-`CLOUDFLARE_ETH_GATEWAY_URL` (the Cloudflare Ethereum gateway, or
-Anvil). No gateway URL or token is stored in the repo. Reads may use
-a configured public or Cloudflare endpoint; **submit is localhost
-only**, and chain id 1 is always refused for submit. Existing Foundry
-contracts are the intended program surface on this adapter once an
-owner deploys them to a chain they have chosen.
+`CLOUDFLARE_ETH_GATEWAY_URL` (a Cloudflare Web3 gateway, or Anvil).
+A bare host-plus-path with no scheme is accepted; `https://` is
+prepended. `http://` is refused for any non-loopback host. No gateway
+URL or token is stored in the repo, and error messages and CLI output
+redact the URL. Reads may use a configured public or Cloudflare
+endpoint; **submit is localhost only**, and chain id 1 is always
+refused for submit. Existing Foundry contracts are the intended
+program surface on this adapter once an owner deploys them to a chain
+they have chosen.
 
 **Adding a chain.** Implement the interface, register it in
 `l1/lib/adapter.mjs`, give it an allow-list, and add tests that run
@@ -439,14 +442,25 @@ devnet exists so the adapters and programs can be built first.
 
 Ethereum is a sibling chain, not the KILN settlement layer.
 
-- Production RPC is expected to be **Cloudflare's Ethereum
-  gateway**, configured with `KILN_ETH_RPC_URL` or
-  `CLOUDFLARE_ETH_GATEWAY_URL`. If the gateway needs a token, that
-  belongs in the environment too (`KILN_ETH_RPC_TOKEN` or a
-  Cloudflare-specific secret), never in git. The URL itself is not
-  in this repository — it has to come from the owner's Cloudflare
-  account.
-- Local tests use Anvil on 127.0.0.1.
+- Production RPC is expected to be a **Cloudflare Web3 gateway**,
+  configured with `KILN_ETH_RPC_URL` or `CLOUDFLARE_ETH_GATEWAY_URL`.
+  The value may be a full `https://…` URL or a **bare host plus path**
+  with no scheme (for example `host/v1/mainnet`); the adapter trims
+  whitespace and prepends `https://` when no scheme is present.
+  `http://` is refused except on loopback. If the gateway needs a
+  token, that belongs in the environment too (`KILN_ETH_RPC_TOKEN`),
+  never in git. The URL itself is not in this repository, is never
+  printed by the CLI or tests, and is redacted in error messages.
+- A live read-only probe runs only when `KILN_ETH_RPC_URL` is set:
+  `node l1/kiln-l1.mjs eth health`. It checks `eth_chainId`,
+  `eth_blockNumber`, and a balance read on a well-known public
+  address, and prints only the chain id and block number (never the
+  URL). Writes and submits to mainnet stay refused. Some Cloudflare
+  Web3 hostnames answer `eth_chainId` but not every method; in that
+  case the command still prints the chain id, reports which reads
+  were not fulfilled, and exits non-zero.
+- Local tests use Anvil on 127.0.0.1. An optional live test
+  (`l1/test/eth-live.test.mjs`) is skipped unless the env var is set.
 - `KilnOwnershipRegistry` and the compute contracts are the
   Ethereum-side L1 surface that already exists in `contracts/`.
   Deploying them is an owner action, with a dedicated deployer key,
@@ -479,9 +493,10 @@ Ethereum is a sibling chain, not the KILN settlement layer.
 5. **Settlement mint** (USDC or something else; Token vs Token-2022;
    which mint addresses on which cluster).
 6. **Unify swarm node identities with Solana transfer keys?**
-7. **Cloudflare Ethereum gateway URL and whether it needs a token.**
-   Placeholder env vars are in place; the actual values have to come
-   from the owner.
+7. **Whether the Cloudflare Web3 gateway needs a token**, and which
+   Ethereum networks besides mainnet should be reachable through it.
+   The URL itself is supplied via `KILN_ETH_RPC_URL` (or
+   `CLOUDFLARE_ETH_GATEWAY_URL`) and is not stored in this repository.
 8. **When, if ever, to allow submit to Solana devnet or Ethereum
    testnets from this repo's tools** (already allow-listed for
    Solana devnet/testnet, never used by the default tests).
@@ -502,6 +517,10 @@ node l1/kiln-l1.mjs health --chain kiln-svm
 node l1/kiln-l1.mjs eth start
 node l1/kiln-l1.mjs health --chain ethereum
 
+# Live read-only probe (only when KILN_ETH_RPC_URL is set).
+# Prints chain id and block number only; never the RPC URL.
+node l1/kiln-l1.mjs eth health
+
 # Delivery receipt through the adapter (localhost only)
 node l1/kiln-l1.mjs receipt submit --chain kiln-svm --manifest-id <64 hex>
 
@@ -511,7 +530,8 @@ node l1/kiln-l1.mjs eth stop
 
 Unit tests do not need a validator. Integration tests start local
 chains and **skip** if `solana-test-validator` or `anvil` is missing.
-They never target a public network.
+They never submit to a public network. The optional Ethereum live
+read-only test runs only when `KILN_ETH_RPC_URL` is set.
 
 ```bash
 node --test l1/test/*.test.mjs

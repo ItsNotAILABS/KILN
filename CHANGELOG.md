@@ -16,6 +16,12 @@ All notable changes to KILN, newest first. Swarm rounds are tagged on
   the adapters without changing `swarm/lib/transfer-receipt.mjs`.
 - Tests: `node --test l1/test/*.test.mjs` (unit always; integration skips
   if the local validators are missing). Never targets a public network.
+- Ethereum RPC URLs are normalized: a bare host/path gets `https://`,
+  `http://` is refused off loopback, and the URL is redacted in errors
+  and CLI output. `node l1/kiln-l1.mjs eth health` is an opt-in
+  read-only probe (chain id and block number only) when
+  `KILN_ETH_RPC_URL` is set. Cloudflare Web3 gateways are supported.
+
 
 ## 2026-11-25 — Agent transfer encryption
 

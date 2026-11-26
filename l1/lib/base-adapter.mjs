@@ -1,4 +1,5 @@
 /** Shared adapter contract. Kept in its own file so adapters can import it without a cycle. */
+import { publicRpcLabel } from "./chains.mjs";
 export const DEFAULT_PORTS = Object.freeze({
   kilnSvmRpc: 18899,
   kilnSvmFaucet: 18901,
@@ -18,6 +19,6 @@ export class BaseAdapter {
   async submit(_signed) { throw new Error("adapter: submit"); }
   assertCanSubmit() { throw new Error("adapter: assertCanSubmit"); }
   info() {
-    return { id: this.id, family: this.family, network: this.network, rpcUrl: this.rpcUrl };
+    return { id: this.id, family: this.family, network: this.network, rpcUrl: publicRpcLabel(this.rpcUrl) };
   }
 }
