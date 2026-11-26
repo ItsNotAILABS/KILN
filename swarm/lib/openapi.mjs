@@ -593,6 +593,19 @@ export function buildCapabilities() {
         mcpTools: [],
       },
       {
+        id: "transfers",
+        title: "Agent transfer — start, list and cancel file transfers, and fetch or submit a Memo receipt (devnet/localhost only, never mainnet). Operator-only. Encryption is on by default. See docs/KILN_AGENT_TRANSFER.md",
+        endpoints: [
+          "POST /v1/transfers",
+          "GET /v1/transfers",
+          "GET /v1/transfers/:id",
+          "DELETE /v1/transfers/:id",
+          "GET /v1/transfers/:id/receipt",
+          "POST /v1/transfers/:id/receipt",
+        ],
+        mcpTools: [],
+      },
+      {
         id: "templates",
         title: "Creation templates — what a new repo is born with. POST /v1/repos accepts a template: a built-in license (MIT, Apache-2.0, GPL-3.0, BSD-3-Clause, none, or custom license text), a scaffold README, and a preset .gitignore (node/python) — all landing IN the initial commit. Accounts also save their OWN templates (license + flags + arbitrary files) and reference them by templateId at create time; inline fields override the saved template per-field, and a template's own files are never overwritten by scaffolding. Templates are per-account: another account's template id is a 404, never a borrow. The operator token has no account and cannot hold templates",
         endpoints: [
@@ -3073,6 +3086,86 @@ export function buildOpenApiDocument() {
           responses: {
             "200": jsonResponse("Preview state", { type: "object" }),
             "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/transfers": {
+        post: {
+          operationId: "startTransfer",
+          summary: "Start a recv, send, tree-send, or relay. Operator-only. Encryption is on by default.",
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", properties: {
+            role: { type: "string", enum: ["recv", "send", "relay"] },
+            path: { type: "string", description: "Local path to send (role=send)" },
+            to: { type: "string", description: "HOST:PORT of the receiver" },
+            host: { type: "string" }, port: { type: "integer" },
+            outDir: { type: "string" }, expect: { type: "string" },
+            transport: { type: "string", enum: ["tcp", "quic"] },
+            via: { type: "string", description: "Relay HOST:PORT" }, token: { type: "string" },
+            rendezvous: { type: "string" }, forceRelay: { type: "boolean" },
+            targets: { type: "array", items: { type: "object" }, description: "sendTree targets" },
+            fanout: { type: "integer" }, waitMs: { type: "integer" },
+            encrypt: { type: "boolean" }, receipt: { type: "object" },
+          } } } } },
+          responses: {
+            "201": jsonResponse("Transfer record", { type: "object" }),
+            "400": errorResponse("Bad request"),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+        get: {
+          operationId: "listTransfers",
+          summary: "List transfer records in this swarm state dir",
+          responses: {
+            "200": jsonResponse("Transfer list", { type: "object", properties: { transfers: { type: "array", items: { type: "object" } } } }),
+            "401": errorResponse("Missing or invalid bearer token"),
+          },
+        },
+      },
+      "/v1/transfers/{id}": {
+        get: {
+          operationId: "getTransfer",
+          summary: "Get one transfer record",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: {
+            "200": jsonResponse("Transfer record", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+            "404": errorResponse("Unknown transfer"),
+          },
+        },
+        delete: {
+          operationId: "cancelTransfer",
+          summary: "Cancel a running recv/relay (and mark a send cancelled if it is still running)",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: {
+            "200": jsonResponse("Transfer record", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+            "404": errorResponse("Unknown transfer"),
+          },
+        },
+      },
+      "/v1/transfers/{id}/receipt": {
+        get: {
+          operationId: "getTransferReceipt",
+          summary: "Fetch the Memo receipt for a completed send (offline or confirmed)",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: {
+            "200": jsonResponse("Receipt", { type: "object" }),
+            "401": errorResponse("Missing or invalid bearer token"),
+            "404": errorResponse("No receipt yet"),
+          },
+        },
+        post: {
+          operationId: "postTransferReceipt",
+          summary: "Build an offline receipt, or submit-and-confirm it on a localhost/devnet/testnet RPC (never mainnet)",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: { content: { "application/json": { schema: { type: "object", properties: {
+            manifestId: { type: "string" }, submit: { type: "boolean" }, rpcUrl: { type: "string" }, blockhash: { type: "string" },
+          } } } } },
+          responses: {
+            "200": jsonResponse("Receipt", { type: "object" }),
+            "400": errorResponse("Bad request"),
+            "401": errorResponse("Missing or invalid bearer token"),
+            "404": errorResponse("Unknown transfer"),
           },
         },
       },

@@ -85,8 +85,65 @@ async function rpc(url, method, params) {
 /** Opt-in: fetch a blockhash, sign, submit to devnet/testnet/localhost. */
 export async function submitMemoReceipt({ rpcUrl, keypair, manifestId }) {
   checkRpcUrl(rpcUrl);
-  const { value } = await rpc(rpcUrl, "getLatestBlockhash", [{ commitment: "confirmed" }]);
-  const r = buildMemoReceipt({ keypair, manifestId, recentBlockhash: value.blockhash });
-  const sig = await rpc(rpcUrl, "sendTransaction", [r.transaction, { encoding: "base64" }]);
-  return { ...r, submitted: sig, rpcUrl };
+  let lastErr;
+  for (let i = 0; i < 8; i++) {
+    try {
+      const { value } = await rpc(rpcUrl, "getLatestBlockhash", [{ commitment: "confirmed" }]);
+      const r = buildMemoReceipt({ keypair, manifestId, recentBlockhash: value.blockhash });
+      const sig = await rpc(rpcUrl, "sendTransaction", [r.transaction, { encoding: "base64", preflightCommitment: "confirmed" }]);
+      return { ...r, submitted: sig, rpcUrl };
+    } catch (e) {
+      lastErr = e;
+      if (!/blockhash/i.test(String(e.message || e))) throw e;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  throw lastErr;
+}
+
+/** Poll until the signature is confirmed (or finalized) on a allowed RPC. */
+export async function confirmMemoReceipt({ rpcUrl, signature, commitment = "confirmed", timeoutMs = 30000 }) {
+  checkRpcUrl(rpcUrl);
+  const t0 = Date.now();
+  let last = null;
+  while (Date.now() - t0 < timeoutMs) {
+    last = await rpc(rpcUrl, "getSignatureStatuses", [[signature], { searchTransactionHistory: true }]);
+    const s = last?.value?.[0];
+    if (s?.err) throw new Error(`receipt failed on chain: ${JSON.stringify(s.err)}`);
+    const st = s?.confirmationStatus;
+    if (st === "finalized" || st === commitment || (commitment === "confirmed" && st === "finalized")) {
+      const tx = await rpc(rpcUrl, "getTransaction", [signature, { encoding: "json", commitment: st === "finalized" ? "finalized" : "confirmed", maxSupportedTransactionVersion: 0 }]);
+      return { signature, confirmationStatus: st, slot: s.slot, memo: tx, rpcUrl };
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`receipt ${signature} not confirmed within ${timeoutMs}ms`);
+}
+
+/** Airdrop SOL on localhost or devnet, then submit + confirm a memo receipt. */
+export async function submitAndConfirmMemoReceipt({ rpcUrl, keypair, manifestId, airdropLamports = 1_000_000_000, timeoutMs = 45000 }) {
+  checkRpcUrl(rpcUrl);
+  let airdrop = null, airdropError = null;
+  try {
+    airdrop = await rpc(rpcUrl, "requestAirdrop", [keypair.publicKey, airdropLamports]);
+  } catch (e) {
+    airdropError = e.message || String(e);
+  }
+  const t0 = Date.now();
+  let funded = false;
+  while (Date.now() - t0 < Math.min(timeoutMs, 20000)) {
+    try {
+      const bal = await rpc(rpcUrl, "getBalance", [keypair.publicKey]);
+      const lamports = typeof bal === "number" ? bal : bal?.value;
+      if (Number(lamports) > 0) { funded = true; break; }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (!funded && airdropError) {
+    throw new Error(`payer has no SOL (${airdropError})`);
+  }
+  if (!funded) throw new Error(`payer ${keypair.publicKey} has no SOL after airdrop ${airdrop || "request"}`);
+  const sent = await submitMemoReceipt({ rpcUrl, keypair, manifestId });
+  const confirmed = await confirmMemoReceipt({ rpcUrl, signature: sent.submitted, timeoutMs });
+  return { ...sent, confirmed, airdrop };
 }

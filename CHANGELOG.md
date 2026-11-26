@@ -3,6 +3,32 @@
 All notable changes to KILN, newest first. Swarm rounds are tagged on
 `main` when they close (see docs/PRODUCTION.md → Releases).
 
+## 2026-11-26 — Agent transfer network
+
+- QUIC ships as an **opt-in** transport (`--transport quic`,
+  `KILN_QUIC_DIR` or `@matrixai/quic`). Tuned loopback probes (32 MiB,
+  2026-11-26, same box): **41.4 MiB/s** with 1 stream and 1 MiB writes;
+  15–20 MiB/s with many streams. TCP + AES-256-GCM stays the default
+  (385.9 MiB/s on a 1 GiB send, median of 5, 2026-11-25). Untuned QUIC
+  had been 1.3–1.6 MiB/s. Application-level X25519 + AEAD still runs on
+  every stream.
+- Blind transfer relay (`swarm.mjs transfer relay` / `startRelay`):
+  pairs by token, splices encrypted frames, never sees plaintext.
+  Rendezvous + TCP hole-punch with automatic relay fallback
+  (`--rendezvous`, `--force-relay`). Real NAT namespaces were not
+  available on this host (`ip netns` denied); fallback is tested by
+  simulating a failed punch.
+- Multi-receiver Turbine-style tree (`sendTree`, `swarm.mjs transfer
+  tree`): fan-out with origin-signed hop grants, each hop
+  hash-verifies then forwards, every receiver is byte-exact. Compared
+  against N unicast sends in `test/transfer-tree.test.mjs`.
+- Live Memo receipts: `confirmMemoReceipt` / `submitAndConfirmMemoReceipt`
+  against `solana-test-validator` (and a reported, non-fatal devnet
+  faucet attempt). Mainnet remains refused.
+- Daemon HTTP: operator-only `POST|GET|DELETE /v1/transfers` and
+  `GET|POST /v1/transfers/{id}/receipt` (OpenAPI + capabilities +
+  `SwarmClient`). Encryption stays on by default.
+
 ## 2026-11-25 — Agent transfer encryption
 
 - Wire encryption is on by default. Each connection does an X25519

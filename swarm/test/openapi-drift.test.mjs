@@ -166,6 +166,12 @@ const EXPECTED = [
   ["GET", "/v1/vcomputers/{id}/handoff"],
   ["DELETE", "/v1/vcomputers/{id}/handoff"],
   ["GET", "/v1/vcomputers/{id}/toolcheck"],
+  ["POST", "/v1/transfers"],
+  ["GET", "/v1/transfers"],
+  ["GET", "/v1/transfers/{id}"],
+  ["DELETE", "/v1/transfers/{id}"],
+  ["GET", "/v1/transfers/{id}/receipt"],
+  ["POST", "/v1/transfers/{id}/receipt"],
   // promote
   ["POST", "/v1/promote"],
   // discovery (served by the documents themselves)

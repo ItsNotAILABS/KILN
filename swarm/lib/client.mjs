@@ -307,6 +307,14 @@ export class SwarmClient {
     const receipts = await this.verifyReceipts(nodeId);
     return { nodeId, nodeName, jobId, commitHash, summary: job.summary, receipts };
   }
+
+  // ---- agent transfer (operator-only) ----
+  async startTransfer(body) { return this._req("POST", "/v1/transfers", body); }
+  async listTransfers() { return (await this._req("GET", "/v1/transfers")).transfers; }
+  async getTransfer(id) { return this._req("GET", `/v1/transfers/${id}`); }
+  async cancelTransfer(id) { return this._req("DELETE", `/v1/transfers/${id}`); }
+  async getTransferReceipt(id) { return this._req("GET", `/v1/transfers/${id}/receipt`); }
+  async postTransferReceipt(id, body) { return this._req("POST", `/v1/transfers/${id}/receipt`, body); }
 }
 
 /** Pull the short hash out of `git commit` output: "[main c081437] msg". */
