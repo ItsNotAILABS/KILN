@@ -39,6 +39,14 @@
 
 POCKET is listed in `projects/registry.json` and seeded as `itsnotailabs/pocket` in the Kiln app (`E:\KILN`).
 
+## Agent machines
+
+Agents that need a browser or a full dev environment get a KILN virtual
+computer (`docs/KILN_VIRTUAL_COMPUTERS.md`). Sign-ins, device codes, 2FA
+and captchas go through **hand-off**: the agent pauses, the owner finishes
+the step on the live desktop and hands back. Agents never handle those
+secrets themselves.
+
 ## Authority boundary
 
 KILN may read and propose changes through tools. Sensitive writes require an owner approval record. Wallet signing remains outside agent reasoning. Every material action must produce a receipt with actor, namespace, request digest, policy outcome, and source commit when available.

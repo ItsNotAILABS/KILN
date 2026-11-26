@@ -266,3 +266,25 @@ resolution (default 10min, config `tickStallAbortMs`, env
 loop → exit(1) + loud TICK STALL line via the test-only
 `KILN_TICK_WEDGE_TEST` hook), and the `daemon status` tick line (including
 `no tick data yet` before the first tick).
+
+## Virtual computers
+
+The doctor's supervision stays about the daemon. Virtual computers have
+their own health surface, which the daemon tick feeds:
+
+- **Sweep.** Every daemon tick runs a rate-limited sweep
+  (`KILN_VC_SWEEP_MS`, default 30 s). It is async and never blocks or
+  breaks dispatch. It expires overdue hand-offs and tears down their
+  viewers, measures each running computer's home against `diskMB`, and
+  stops computers idle past `idleTimeoutSec`. Actions are logged to
+  `daemon.log` as `vcomputer <id>: <action>`.
+- **`GET /v1/vcomputers/doctor` / `swarm.mjs vc doctor`.** Reports backend
+  availability (docker reachable, `kiln-vc` image built, local backend
+  allowed) and per-computer problems: should be running but isn't (idle
+  stops excluded), over the disk quota, or an open hand-off past expiry.
+  `vc doctor` exits 1 when there is a problem.
+- **`doctor report`.** Prints a one-line virtual-computer summary plus any
+  problems. `doctor check` (the cron) does not, so it stays quiet about
+  anything but the daemon itself.
+
+See `docs/KILN_VIRTUAL_COMPUTERS.md`.

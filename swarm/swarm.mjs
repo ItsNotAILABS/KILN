@@ -37,11 +37,23 @@
  *                        [--link-site ID] [--unlink-site ID]
  *                        [--parent ID|SLUG] [--no-parent] [--dir PATH]
  *   swarm.mjs workspaces remove <id|slug> --confirm SLUG [--dir PATH]
+ *   swarm.mjs vc create --name N [--backend docker|local] [--width W --height H]
+ *                        [--cpus C] [--memory MB] [--disk MB] [--idle SEC]
+ *                        [--no-browser] [--no-network] [--dir PATH]
+ *   swarm.mjs vc list|doctor [--dir PATH]
+ *   swarm.mjs vc show|start|stop|toolcheck <id|name> [--dir PATH]
+ *   swarm.mjs vc delete <id|name> [--purge] [--dir PATH]
+ *   swarm.mjs vc exec <id|name> --cmd "<command>" [--timeout MS] [--background]
+ *   swarm.mjs vc screenshot <id|name> --out FILE.png
+ *   swarm.mjs vc input <id|name> --json '{"action":"click","nx":0.5,"ny":0.5}'
+ *   swarm.mjs vc jobs <id|name> | vc job <id|name> <jobId> [--tail BYTES] | vc kill-job <id|name> <jobId>
+ *   swarm.mjs vc handoff <id|name> --reason R [--instructions I] [--timeout SEC] [--wait]
+ *   swarm.mjs vc handoff-status|cancel-handoff <id|name>
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
 import { spawn } from "node:child_process";
-import { readFileSync, appendFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { readFileSync, appendFileSync, existsSync, openSync, closeSync, writeFileSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -408,6 +420,16 @@ async function cmdDoctor(args) {
     }
     console.log(`diagnosis: ${dg.verdict}`);
     console.log(dg.hypothesis);
+    // Virtual computers ride along in the report (never in `check`: the
+    // cron stays quiet about anything but the daemon itself).
+    try {
+      const vc = await apiCall(dir, "GET", "/v1/vcomputers/doctor");
+      const up = vc.computers.filter((c) => c.status === "running").length;
+      console.log(`virtual computers: ${vc.computers.length} (${up} running); backends: ${Object.entries(vc.backends).map(([n, b]) => `${n}=${b.ok ? "ok" : "unavailable"}`).join(" ")}`);
+      for (const p of vc.problems) console.log(`  problem: ${p}`);
+    } catch (e) {
+      console.log(`virtual computers: unknown (${e.message})`);
+    }
   } else if (sub === "check") {
     const { lines, exitCode } = await doctorCheck(dir);
     for (const l of lines) console.log(l);
@@ -1123,6 +1145,110 @@ async function cmdCompute(args) {
   }
 }
 
+// ---------------------------------------------------------------- vc (virtual computers)
+
+async function vcResolve(dir, ref) {
+  if (!ref) { console.error("missing computer <id|name>"); process.exit(2); }
+  if (/^vc_[0-9a-f]{12}$/.test(ref)) return ref;
+  const { computers } = await apiCall(dir, "GET", "/v1/vcomputers");
+  const c = computers.find((x) => x.name === ref);
+  if (!c) throw new Error(`no virtual computer named ${ref}`);
+  return c.id;
+}
+
+function vcLine(c) {
+  const ho = c.control === "owner" ? `  HANDED OFF (${c.handoff.reason})` : "";
+  return `${c.id}  ${c.name.padEnd(16)} ${c.backend.padEnd(6)} ${c.status.padEnd(8)} ${c.config.width}x${c.config.height}  ${c.config.cpus}cpu ${c.config.memoryMB}MB${ho}`;
+}
+
+async function cmdVc(args) {
+  const sub = args._[1];
+  const dir = dirOf(args);
+  ensureStateDir(dir);
+  const num = (k) => (args[k] !== undefined ? Number(args[k]) : undefined);
+  if (sub === "create") {
+    const c = await apiCall(dir, "POST", "/v1/vcomputers", {
+      name: need(args, "name"), backend: args.backend,
+      width: num("width"), height: num("height"), cpus: num("cpus"),
+      memoryMB: num("memory"), diskMB: num("disk"), idleTimeoutSec: num("idle"),
+      browser: args["no-browser"] ? false : undefined, network: args["no-network"] ? false : undefined,
+    });
+    console.log(vcLine(c));
+  } else if (sub === "list") {
+    const { computers } = await apiCall(dir, "GET", "/v1/vcomputers");
+    if (!computers.length) console.log("(no virtual computers)");
+    for (const c of computers) console.log(vcLine(c));
+  } else if (sub === "doctor") {
+    const d = await apiCall(dir, "GET", "/v1/vcomputers/doctor");
+    for (const [n, b] of Object.entries(d.backends)) console.log(`backend ${n}: ${b.ok ? "ok" : "unavailable"} (${b.isolation})${b.reason ? ` — ${b.reason}` : ""}`);
+    for (const c of d.computers) console.log(vcLine(c));
+    for (const p of d.problems) console.log(`PROBLEM: ${p}`);
+    if (!d.ok) process.exit(1);
+  } else if (["show", "start", "stop", "toolcheck", "jobs", "handoff-status"].includes(sub)) {
+    const id = await vcResolve(dir, args._[2]);
+    const r = sub === "show" ? await apiCall(dir, "GET", `/v1/vcomputers/${id}`)
+      : sub === "toolcheck" ? await apiCall(dir, "GET", `/v1/vcomputers/${id}/toolcheck`)
+      : sub === "jobs" ? await apiCall(dir, "GET", `/v1/vcomputers/${id}/jobs`)
+      : sub === "handoff-status" ? await apiCall(dir, "GET", `/v1/vcomputers/${id}/handoff`)
+      : await apiCall(dir, "POST", `/v1/vcomputers/${id}/${sub}`);
+    if (sub === "toolcheck") { process.stdout.write(r.output); if (!r.ok) process.exit(1); }
+    else if (sub === "start" || sub === "stop") console.log(vcLine(r));
+    else console.log(JSON.stringify(r, null, 2));
+  } else if (sub === "delete") {
+    const id = await vcResolve(dir, args._[2]);
+    await apiCall(dir, "DELETE", `/v1/vcomputers/${id}${args.purge ? "?purge=true" : ""}`);
+    console.log(args.purge ? "deleted (home purged)" : "deleted (home kept)");
+  } else if (sub === "exec") {
+    const id = await vcResolve(dir, args._[2]);
+    const command = args.cmd !== undefined ? String(args.cmd) : args._.slice(3).join(" ");
+    const r = await apiCall(dir, "POST", `/v1/vcomputers/${id}/exec`, {
+      command, timeoutMs: num("timeout"), background: args.background ? true : undefined,
+    });
+    if (r.jobId) { console.log(`${r.jobId} running`); return; }
+    process.stdout.write(r.stdout);
+    process.stderr.write(r.stderr);
+    if (r.timedOut) console.error(`(timed out after ${r.durationMs}ms)`);
+    process.exit(r.exitCode ?? 1);
+  } else if (sub === "screenshot") {
+    const id = await vcResolve(dir, args._[2]);
+    const r = await apiCall(dir, "GET", `/v1/vcomputers/${id}/screenshot`);
+    const out = String(need(args, "out"));
+    writeFileSync(out, Buffer.from(r.png, "base64"));
+    console.log(`${out} (${r.width}x${r.height})`);
+  } else if (sub === "input") {
+    const id = await vcResolve(dir, args._[2]);
+    console.log(JSON.stringify(await apiCall(dir, "POST", `/v1/vcomputers/${id}/input`, JSON.parse(String(need(args, "json"))))));
+  } else if (sub === "job" || sub === "kill-job") {
+    const id = await vcResolve(dir, args._[2]);
+    const jobId = args._[3];
+    const r = sub === "job"
+      ? await apiCall(dir, "GET", `/v1/vcomputers/${id}/jobs/${jobId}${args.tail ? `?tail=${Number(args.tail)}` : ""}`)
+      : await apiCall(dir, "POST", `/v1/vcomputers/${id}/jobs/${jobId}/kill`);
+    if (sub === "job") { console.log(`${r.id} ${r.status}${r.exitCode !== null ? ` exit=${r.exitCode}` : ""}`); if (r.log) process.stdout.write(r.log); }
+    else console.log(r.ok ? "killed" : "kill failed");
+  } else if (sub === "handoff") {
+    const id = await vcResolve(dir, args._[2]);
+    const r = await apiCall(dir, "POST", `/v1/vcomputers/${id}/handoff`, {
+      reason: need(args, "reason"), instructions: args.instructions, timeoutSec: num("timeout"),
+    });
+    console.log(`hand-off ${r.handoff.id} open until ${new Date(r.handoff.expiresAt).toISOString()}`);
+    console.log(`owner link (shown once): ${r.url}`);
+    if (args.wait) {
+      for (;;) {
+        const s = await apiCall(dir, "GET", `/v1/vcomputers/${id}/handoff?waitMs=60000`);
+        if (s.control === "agent") { console.log(`hand-off ${s.handoff.state}${s.handoff.outcome ? ` (${s.handoff.outcome})` : ""}`); break; }
+      }
+    }
+  } else if (sub === "cancel-handoff") {
+    const id = await vcResolve(dir, args._[2]);
+    const r = await apiCall(dir, "DELETE", `/v1/vcomputers/${id}/handoff`);
+    console.log(`hand-off ${r.handoff.id} ${r.handoff.state}`);
+  } else {
+    console.error("usage: vc create|list|show|start|stop|delete|exec|screenshot|input|jobs|job|kill-job|handoff|handoff-status|cancel-handoff|toolcheck|doctor");
+    process.exit(2);
+  }
+}
+
 // ---------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
@@ -1134,6 +1260,7 @@ try {
   else if (cmd === "node") await cmdNode(args);
   else if (cmd === "job") cmdJob(args);
   else if (cmd === "compute") await cmdCompute(args);
+  else if (cmd === "vc") await cmdVc(args);
   else if (cmd === "receipts") cmdReceipts(args);
   else if (cmd === "repo") await cmdRepo(args);
   else if (cmd === "promote") await cmdPromote(args);
@@ -1141,7 +1268,7 @@ try {
   else if (cmd === "sites") await cmdSites(args);
   else if (cmd === "workspaces") await cmdWorkspaces(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|receipts|repo|promote|memory|sites|workspaces");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|vc|receipts|repo|promote|memory|sites|workspaces");
     process.exit(2);
   }
 } catch (e) {

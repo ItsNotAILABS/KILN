@@ -101,6 +101,10 @@ forge test
 
 Deployments must use a dedicated deployer key supplied through the environment and require explicit network approval.
 
+## Agent machines
+
+- [Virtual computers](docs/KILN_VIRTUAL_COMPUTERS.md): a persistent machine per agent, with a desktop, Chrome, a pinned toolchain, a control API, and owner hand-off for sign-ins and 2FA
+
 ## Public verification and sovereign network
 
 - [Public project verifier](verification/index.html)

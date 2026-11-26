@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# kiln-vc-vnc start|stop|status — the owner hand-off viewer.
+# Runs ONLY while a hand-off is open: x11vnc on localhost behind a
+# one-time password file (consumed and deleted on read), plus websockify
+# so a browser (noVNC) can reach it. Never logs keystrokes or the password.
+#
+# Env: KILN_VC_DISPLAY (:0) KILN_VC_RUNDIR (/tmp/kiln-vc)
+#      KILN_VC_VNC_PORT (5900) KILN_VC_WS_PORT (6080)
+#      KILN_VC_WS_LISTEN (0.0.0.0 in a container; the daemon passes 127.0.0.1 locally)
+#      KILN_VC_VNC_PASSFILE (start only; deleted by x11vnc after reading)
+set -u
+RUN="${KILN_VC_RUNDIR:-/tmp/kiln-vc}"
+VNC_PORT="${KILN_VC_VNC_PORT:-5900}"
+WS_PORT="${KILN_VC_WS_PORT:-6080}"
+LISTEN="${KILN_VC_WS_LISTEN:-0.0.0.0}"
+mkdir -p "$RUN" && chmod 700 "$RUN"
+
+stop() {
+  for f in websockify x11vnc; do
+    if [ -f "$RUN/$f.pid" ]; then kill "$(cat "$RUN/$f.pid")" 2>/dev/null; rm -f "$RUN/$f.pid"; fi
+  done
+  return 0
+}
+
+case "${1:-}" in
+  start)
+    stop
+    pf="${KILN_VC_VNC_PASSFILE:-}"
+    [ -n "$pf" ] && [ -f "$pf" ] || { echo "KILN_VC_VNC_PASSFILE missing" >&2; exit 2; }
+    x11vnc -display "${KILN_VC_DISPLAY:-:0}" -localhost -rfbport "$VNC_PORT" \
+      -passwdfile "rm:$pf" -shared -forever -noxdamage -norc -quiet -nopw \
+      >"$RUN/x11vnc.log" 2>&1 &
+    echo $! > "$RUN/x11vnc.pid"
+    websockify "$LISTEN:$WS_PORT" "127.0.0.1:$VNC_PORT" >"$RUN/websockify.log" 2>&1 &
+    echo $! > "$RUN/websockify.pid"
+    for _ in $(seq 1 100); do
+      if (exec 3<>"/dev/tcp/127.0.0.1/$WS_PORT") 2>/dev/null && (exec 3<>"/dev/tcp/127.0.0.1/$VNC_PORT") 2>/dev/null; then
+        echo started; exit 0
+      fi
+      sleep 0.1
+    done
+    echo "vnc did not come up" >&2; stop; exit 1 ;;
+  stop) stop; echo stopped ;;
+  status)
+    up=0
+    [ -f "$RUN/websockify.pid" ] && kill -0 "$(cat "$RUN/websockify.pid")" 2>/dev/null && up=1
+    echo "$up" ;;
+  *) echo "usage: kiln-vc-vnc start|stop|status" >&2; exit 2 ;;
+esac

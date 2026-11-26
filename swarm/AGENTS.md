@@ -183,6 +183,36 @@ Function results are real: `ok:true` + JSON `result`, or `ok:false` + the
 function's real error. A module without `main()` fails loudly. Limits:
 code ≤ 256KB, `timeoutMs` 100..300000ms, results > 1MB are not returned.
 
+## 6b. Virtual computers: your own machine, and handing the screen to a human
+
+When a task needs a browser, a GUI, or a long-lived dev environment (not
+a one-shot function), use a virtual computer. It's a persistent machine
+with a desktop, Chrome (logins persist), git/gh/Node/pnpm/bun/Python/
+Rust/Solana/Anchor, and a control API:
+
+```js
+import { VComputerClient } from "<kiln>/swarm/lib/vcomputer-client.mjs";
+const kiln = await VComputerClient.connect();
+const pc = await kiln.createComputer({ name: "agent-1" });   // or reuse yours
+await kiln.exec(pc.id, "git clone … && pnpm i", { timeoutMs: 600000 });
+const { jobId } = await kiln.startJob(pc.id, "pnpm dev");    // long-running
+await kiln.click(pc.id, { nx: 0.5, ny: 0.07 });             // 0..1 coords
+await kiln.type(pc.id, "hello");
+const shot = await kiln.screenshot(pc.id);                   // look before you act
+```
+
+**Never type a password, code, or card you were not given, and never try
+to read one off the screen.** When a sign-in, device code, 2FA prompt, or
+captcha needs the owner, hand off:
+
+```js
+const ho = await kiln.handoff(pc.id, { reason: "Sign in to GitHub", instructions: "Enter code ABCD-1234 at github.com/login/device" });
+// Send ho.url to the owner (it is shown once). You get 423 until they hand back.
+const done = await kiln.waitForHandBack(pc.id);              // {state: "returned", outcome: "done"|"could_not_finish"}
+```
+
+Full reference: `docs/KILN_VIRTUAL_COMPUTERS.md`.
+
 ## 7. Workspaces, project details, MCP — organization for any agent
 
 Repos group into **workspaces** (member repos + linked sites, nestable via

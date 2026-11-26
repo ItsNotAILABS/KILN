@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# kiln-vc-session — one virtual computer's desktop, supervised in the
+# foreground: Xvfb (virtual display) + xfwm4 (window manager) + Chrome.
+# Used as the container CMD and, by the local backend, spawned directly.
+#
+# Env: KILN_VC_DISPLAY (:0) KILN_VC_WIDTH (1280) KILN_VC_HEIGHT (800)
+#      KILN_VC_BROWSER (1) KILN_VC_RUNDIR (/tmp/kiln-vc)
+#      KILN_VC_CHROME (chrome) KILN_VC_CHROME_FLAGS ("")
+# Exits when Xvfb exits; SIGTERM tears the whole desktop down.
+set -u
+DISPLAY_NUM="${KILN_VC_DISPLAY:-:0}"
+W="${KILN_VC_WIDTH:-1280}"; H="${KILN_VC_HEIGHT:-800}"
+RUN="${KILN_VC_RUNDIR:-/tmp/kiln-vc}"
+CHROME="${KILN_VC_CHROME:-chrome}"
+mkdir -p "$RUN" && chmod 700 "$RUN"
+export DISPLAY="$DISPLAY_NUM"
+n="${DISPLAY_NUM#:}"
+
+# A crashed Xvfb leaves its lock behind; clear it only if its pid is dead.
+lock="/tmp/.X${n}-lock"
+if [ -f "$lock" ]; then
+  lp="$(tr -d ' ' < "$lock" 2>/dev/null || true)"
+  if [ -n "$lp" ] && ! kill -0 "$lp" 2>/dev/null; then rm -f "$lock" "/tmp/.X11-unix/X${n}"; fi
+fi
+
+cleanup() { trap - TERM INT EXIT; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; exit "${1:-0}"; }
+trap 'cleanup 0' TERM INT
+trap 'cleanup $?' EXIT
+
+Xvfb "$DISPLAY_NUM" -screen 0 "${W}x${H}x24" -nolisten tcp -noreset >"$RUN/xvfb.log" 2>&1 &
+xpid=$!
+echo "$xpid" > "$RUN/xvfb.pid"
+for _ in $(seq 1 100); do
+  xdotool getdisplaygeometry >/dev/null 2>&1 && break
+  kill -0 "$xpid" 2>/dev/null || { echo "Xvfb died at start" >&2; exit 1; }
+  sleep 0.1
+done
+
+xfwm4 --compositor=off --sm-client-disable >"$RUN/wm.log" 2>&1 &
+echo $! > "$RUN/wm.pid"
+
+if [ "${KILN_VC_BROWSER:-1}" = "1" ]; then
+  profile="$HOME/.config/kiln-chrome"
+  mkdir -p "$profile"
+  (
+    backoff=2
+    while kill -0 "$xpid" 2>/dev/null; do
+      # Singleton files from a previous boot (different hostname/pid) make
+      # Chrome refuse the profile; nothing else is running it here.
+      rm -f "$profile"/Singleton* 2>/dev/null
+      started=$(date +%s)
+      # Give the new browser window keyboard focus once it maps, so keys
+      # the agent sends land in Chrome without a click first.
+      (
+        for _ in $(seq 1 150); do
+          w="$(xdotool search --onlyvisible --class chrom 2>/dev/null | tail -n1)"
+          if [ -n "$w" ]; then sleep 1; xdotool windowfocus "$w" 2>/dev/null; break; fi
+          sleep 0.2
+        done
+      ) &
+      # shellcheck disable=SC2086
+      "$CHROME" --user-data-dir="$profile" --no-first-run --no-default-browser-check \
+        --password-store=basic --disable-dev-shm-usage --start-maximized \
+        --window-position=0,0 --window-size="${W},${H}" ${KILN_VC_CHROME_FLAGS:-} \
+        about:blank >>"$RUN/chrome.log" 2>&1
+      # Closed or crashed: relaunch, backing off if it dies fast.
+      if [ $(( $(date +%s) - started )) -lt 10 ]; then backoff=$(( backoff < 60 ? backoff * 2 : 60 )); else backoff=2; fi
+      sleep "$backoff"
+    done
+  ) &
+  echo $! > "$RUN/browser.pid"
+fi
+
+echo ready > "$RUN/session.state"
+wait "$xpid"
+echo "Xvfb exited" >&2
+exit 1

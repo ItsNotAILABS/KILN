@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# kiln-vc-toolcheck — print every pinned tool's version; non-zero if any is
+# missing. Run at image build (fails the build) and by `vc doctor`.
+set -u
+. /etc/profile.d/kiln-vc.sh 2>/dev/null || true
+fail=0
+check() { local name="$1"; shift; local out; if out="$("$@" 2>&1 | head -n1)"; then printf '%-10s %s\n' "$name" "$out"; else printf '%-10s MISSING (%s)\n' "$name" "$out"; fail=1; fi; }
+check git git --version
+check gh gh --version
+check node node --version
+check pnpm pnpm --version
+check bun bun --version
+check python3 python3 --version
+check rustc rustc --version
+check cargo cargo --version
+check solana solana --version
+check anchor anchor --version
+check pdftotext pdftotext -v
+check gcc gcc --version
+check chrome "${KILN_VC_CHROME:-/opt/chrome/chrome}" --version
+check Xvfb sh -c 'command -v Xvfb'
+check xdotool sh -c 'command -v xdotool'
+check ffmpeg ffmpeg -version
+check x11vnc sh -c 'command -v x11vnc'
+check websockify sh -c 'command -v websockify'
+exit "$fail"
