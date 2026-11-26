@@ -49,6 +49,13 @@
  *   swarm.mjs vc jobs <id|name> | vc job <id|name> <jobId> [--tail BYTES] | vc kill-job <id|name> <jobId>
  *   swarm.mjs vc handoff <id|name> --reason R [--instructions I] [--timeout SEC] [--wait]
  *   swarm.mjs vc handoff-status|cancel-handoff <id|name>
+ *   swarm.mjs recv [--out DIR] [--host H] [--port P] [--trust PK,PK] [--keypair FILE]
+ *                        [--once] [--extract] [--verify] [--overwrite] [--vc ID --subdir S]
+ *                        [--insecure]
+ *   swarm.mjs send <path> --to HOST:PORT [--expect PUBKEY] [--streams N] [--chunk-kb KB]
+ *                        [--data K] [--parity M] [--keypair FILE] [--from-vc ID] [--json]
+ *                        [--insecure]
+ *   swarm.mjs transfer identity|ping|receipt [...]   (see docs/KILN_AGENT_TRANSFER.md)
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -1249,6 +1256,110 @@ async function cmdVc(args) {
   }
 }
 
+
+// ---------------------------------------------------------------- agent transfer
+
+function txKeypair(args, dir, T) {
+  return args.keypair ? T.loadKeypairFile(resolve(String(args.keypair))) : T.loadIdentity(dir);
+}
+
+function parseHostPort(v, what) {
+  const m = /^(.*):(\d+)$/.exec(String(v || ""));
+  if (!m) { console.error(`${what} must be HOST:PORT`); process.exit(2); }
+  return { host: m[1].replace(/^\[|\]$/g, "") || "127.0.0.1", port: Number(m[2]) };
+}
+
+function fmtBytes(n) {
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+
+async function cmdRecv(args) {
+  const T = await import("./lib/transfer.mjs");
+  const dir = dirOf(args);
+  const keypair = txKeypair(args, dir, T);
+  const trust = args.trust ? csv(args.trust) : undefined;
+  let finish;
+  const done = new Promise((r) => { finish = r; });
+  const opts = {
+    host: args.host ? String(args.host) : "127.0.0.1",
+    port: args.port ? Number(args.port) : 0,
+    keypair, trust, verifyFile: !!args.verify, overwrite: !!args.overwrite,
+    encrypt: !args.insecure,
+    onComplete: async (r) => {
+      if (args.extract && !args.vc && r.name.endsWith(".tar")) r.extracted = await T.extractTar(r.path, dirname(r.path));
+      setImmediate(() => {
+        console.log(JSON.stringify({ event: "received", ...r }));
+        if (args.once) finish();
+      });
+    },
+  };
+  const rx = args.vc
+    ? await T.receiveIntoComputer(dir, String(args.vc), { ...opts, subdir: args.subdir ? String(args.subdir) : "inbox", extract: !!args.extract })
+    : await T.startReceiver({ ...opts, outDir: resolve(String(args.out || ".")) });
+  console.log(JSON.stringify({ event: "listening", address: `${rx.host}:${rx.port}`, publicKey: rx.publicKey, outDir: rx.outDir }));
+  process.on("SIGINT", () => finish());
+  process.on("SIGTERM", () => finish());
+  await done;
+  await rx.close();
+}
+
+async function cmdSend(args) {
+  const T = await import("./lib/transfer.mjs");
+  const dir = dirOf(args);
+  const path = args._[1];
+  if (!path) { console.error("usage: swarm.mjs send <path> --to HOST:PORT"); process.exit(2); }
+  const { host, port } = parseHostPort(need(args, "to"), "--to");
+  const opts = {
+    host, port, keypair: txKeypair(args, dir, T),
+    expectReceiver: args.expect ? String(args.expect) : undefined,
+    streams: args.streams ? Number(args.streams) : 8,
+    chunkSize: args["chunk-kb"] ? Number(args["chunk-kb"]) * 1024 : undefined,
+    dataShards: args.data !== undefined ? Number(args.data) : undefined,
+    parityShards: args.parity !== undefined ? Number(args.parity) : undefined,
+    encrypt: !args.insecure,
+  };
+  for (const k of Object.keys(opts)) if (opts[k] === undefined) delete opts[k];
+  const r = args["from-vc"]
+    ? await T.sendFromComputer(dir, String(args["from-vc"]), String(path), opts)
+    : await T.sendPath(resolve(String(path)), opts);
+  if (args.json) { console.log(JSON.stringify(r)); return; }
+  console.log(`sent ${r.name} (${fmtBytes(r.bytes)}) to ${r.receiver}`);
+  console.log(`  manifest ${r.id}`);
+  console.log(`  ${r.transferSeconds.toFixed(2)}s on the wire, ${r.throughputMBps.toFixed(1)} MiB/s over ${r.streams} ${r.transport} streams` +
+    ` (hash pass ${r.hashSeconds.toFixed(2)}s)`);
+  if (r.skippedStripes) console.log(`  resumed: ${r.skippedStripes}/${r.stripes} stripes were already there`);
+  if (r.repairRounds) console.log(`  repair rounds: ${r.repairRounds}`);
+  console.log(`  receiver path: ${r.result.homePath || r.result.path}`);
+}
+
+async function cmdTransfer(args) {
+  const T = await import("./lib/transfer.mjs");
+  const dir = dirOf(args);
+  const sub = args._[1];
+  if (sub === "identity") {
+    const kp = txKeypair(args, dir, T);
+    console.log(JSON.stringify({ publicKey: kp.publicKey, keypairFile: args.keypair ? resolve(String(args.keypair)) : T.identityPath(dir) }));
+  } else if (sub === "ping") {
+    const { host, port } = parseHostPort(need(args, "to"), "--to");
+    console.log(JSON.stringify(await T.pingLatency({ host, port, count: args.count ? Number(args.count) : 200, keypair: txKeypair(args, dir, T), encrypt: !args.insecure })));
+  } else if (sub === "receipt") {
+    const id = String(need(args, "manifest-id"));
+    const kp = txKeypair(args, dir, T);
+    if (args.submit) {
+      console.log(JSON.stringify(await T.submitMemoReceipt({ rpcUrl: String(need(args, "rpc")), keypair: kp, manifestId: id })));
+    } else {
+      const bh = args.blockhash ? String(args.blockhash) : "11111111111111111111111111111111";
+      console.log(JSON.stringify({ ...T.buildMemoReceipt({ keypair: kp, manifestId: id, recentBlockhash: bh }), submitted: false,
+        note: args.blockhash ? undefined : "placeholder blockhash: offline receipt only; pass --blockhash or --submit --rpc <devnet|localhost>" }));
+    }
+  } else {
+    console.error("usage: swarm.mjs transfer identity|ping --to HOST:PORT|receipt --manifest-id ID [--blockhash B | --submit --rpc URL]");
+    process.exit(2);
+  }
+}
+
 // ---------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
@@ -1267,8 +1378,11 @@ try {
   else if (cmd === "memory") await cmdMemory(args);
   else if (cmd === "sites") await cmdSites(args);
   else if (cmd === "workspaces") await cmdWorkspaces(args);
+  else if (cmd === "send") await cmdSend(args);
+  else if (cmd === "recv") await cmdRecv(args);
+  else if (cmd === "transfer") await cmdTransfer(args);
   else {
-    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|vc|receipts|repo|promote|memory|sites|workspaces");
+    console.error("usage: swarm.mjs init|daemon|doctor|node|job|compute|vc|receipts|repo|promote|memory|sites|workspaces|send|recv|transfer");
     process.exit(2);
   }
 } catch (e) {

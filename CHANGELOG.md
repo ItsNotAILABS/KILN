@@ -3,6 +3,41 @@
 All notable changes to KILN, newest first. Swarm rounds are tagged on
 `main` when they close (see docs/PRODUCTION.md → Releases).
 
+## 2026-11-25 — Agent transfer encryption
+
+- Wire encryption is on by default. Each connection does an X25519
+  ephemeral exchange signed by the existing ed25519 identities (mutual
+  authentication, forward secrecy). HKDF-SHA-256 derives per-direction
+  AES-256-GCM keys; every frame is sealed with a non-repeating counter
+  nonce; a failed tag or a reused nonce closes the connection. `--insecure`
+  is refused unless both sides are on loopback. `--host` on `recv` is the
+  supported way to accept remote senders now that the wire is encrypted
+  (still pin `--trust` / `--expect`).
+- No new dependencies (`node:crypto` only). Tests cover tampered
+  ciphertext, a wrong-identity MITM, nonce uniqueness, resume, and the
+  1 GiB end-to-end SHA-256 match. Benchmarks (measured, same box, median
+  of 5): default 1 GiB throughput 575.5 → 385.9 MiB/s; 64 B ping p50
+  0.028 → 0.066 ms; 1 KiB full send p50 4.11 → 7.23 ms.
+
+## 2026-11-25 — Agent transfer
+
+- `swarm/lib/transfer*.mjs`: agent-to-agent file and package transfer
+  with no size limit, streaming from and to disk in constant memory.
+  Chunks carry SHA-256 in a content-addressed manifest signed with
+  ed25519 (keys are Solana keypair files and base58 addresses).
+  Turbine-style Reed-Solomon stripes (16+2 by default) are spread over
+  8 parallel TCP streams. Shards are rejected on hash mismatch, rebuilt
+  from parity, sent in repair rounds, and resumed from a stripe bitmap.
+- Transport is parallel TCP behind a transport interface. QUIC was
+  measured and is not used: Node 24 has no `node:quic`, and
+  `@matrixai/quic` did 1.3 to 1.6 MiB/s against about 560 to 620 MiB/s
+  for TCP on the same box. Numbers and the probe script are in the doc.
+- `swarm.mjs send|recv|transfer`, the SDK (`sendFile`, `sendPath`,
+  `startReceiver`, `receiveIntoComputer`, `sendFromComputer`), transfers
+  into and out of vc homes (local and docker), an optional Solana Memo
+  receipt (offline, with a devnet/localhost-only submit guard),
+  `scripts/transfer-bench.mjs`, and `docs/KILN_AGENT_TRANSFER.md`.
+
 ## 2026-11-25 — Virtual computers
 
 - `swarm/lib/vcomputer*.mjs`: a persistent machine per agent. It has an
