@@ -51,11 +51,13 @@
  *   swarm.mjs vc handoff-status|cancel-handoff <id|name>
  *   swarm.mjs recv [--out DIR] [--host H] [--port P] [--trust PK,PK] [--keypair FILE]
  *                        [--once] [--extract] [--verify] [--overwrite] [--vc ID --subdir S]
- *                        [--insecure]
+ *                        [--insecure] [--transport tcp|quic] [--via HOST:PORT --token T]
+ *                        [--rendezvous HOST:PORT]
  *   swarm.mjs send <path> --to HOST:PORT [--expect PUBKEY] [--streams N] [--chunk-kb KB]
  *                        [--data K] [--parity M] [--keypair FILE] [--from-vc ID] [--json]
- *                        [--insecure]
- *   swarm.mjs transfer identity|ping|receipt [...]   (see docs/KILN_AGENT_TRANSFER.md)
+ *                        [--insecure] [--transport tcp|quic] [--via HOST:PORT --token T]
+ *                        [--rendezvous HOST:PORT] [--force-relay]
+ *   swarm.mjs transfer identity|ping|receipt|relay|tree [...]   (see docs/KILN_AGENT_TRANSFER.md)
  *
  * State dir: --dir, else $KILN_SWARM_DIR, else ~/.kiln-swarm.
  */
@@ -1259,6 +1261,19 @@ async function cmdVc(args) {
 
 // ---------------------------------------------------------------- agent transfer
 
+
+function txNetOpts(args) {
+  const o = {
+    transport: args.transport ? String(args.transport) : "tcp",
+    via: args.via ? String(args.via) : undefined,
+    token: args.token ? String(args.token) : undefined,
+    rendezvous: args.rendezvous ? String(args.rendezvous) : undefined,
+    forceRelay: !!args["force-relay"],
+  };
+  for (const k of Object.keys(o)) if (o[k] === undefined || o[k] === false) delete o[k];
+  return o;
+}
+
 function txKeypair(args, dir, T) {
   return args.keypair ? T.loadKeypairFile(resolve(String(args.keypair))) : T.loadIdentity(dir);
 }
@@ -1287,6 +1302,7 @@ async function cmdRecv(args) {
     port: args.port ? Number(args.port) : 0,
     keypair, trust, verifyFile: !!args.verify, overwrite: !!args.overwrite,
     encrypt: !args.insecure,
+    ...txNetOpts(args),
     onComplete: async (r) => {
       if (args.extract && !args.vc && r.name.endsWith(".tar")) r.extracted = await T.extractTar(r.path, dirname(r.path));
       setImmediate(() => {
@@ -1319,6 +1335,7 @@ async function cmdSend(args) {
     dataShards: args.data !== undefined ? Number(args.data) : undefined,
     parityShards: args.parity !== undefined ? Number(args.parity) : undefined,
     encrypt: !args.insecure,
+    ...txNetOpts(args),
   };
   for (const k of Object.keys(opts)) if (opts[k] === undefined) delete opts[k];
   const r = args["from-vc"]
@@ -1348,14 +1365,37 @@ async function cmdTransfer(args) {
     const id = String(need(args, "manifest-id"));
     const kp = txKeypair(args, dir, T);
     if (args.submit) {
-      console.log(JSON.stringify(await T.submitMemoReceipt({ rpcUrl: String(need(args, "rpc")), keypair: kp, manifestId: id })));
+      const rpcUrl = String(need(args, "rpc"));
+      const fn = args.confirm ? T.submitAndConfirmMemoReceipt : T.submitMemoReceipt;
+      console.log(JSON.stringify(await fn({ rpcUrl, keypair: kp, manifestId: id })));
     } else {
       const bh = args.blockhash ? String(args.blockhash) : "11111111111111111111111111111111";
       console.log(JSON.stringify({ ...T.buildMemoReceipt({ keypair: kp, manifestId: id, recentBlockhash: bh }), submitted: false,
         note: args.blockhash ? undefined : "placeholder blockhash: offline receipt only; pass --blockhash or --submit --rpc <devnet|localhost>" }));
     }
+  } else if (sub === "relay") {
+    const r = await T.startRelay({ host: args.host ? String(args.host) : "127.0.0.1", port: args.port ? Number(args.port) : 0 });
+    console.log(JSON.stringify({ event: "relay-listening", address: `${r.host}:${r.port}` }));
+    await new Promise((finish) => { process.on("SIGINT", finish); process.on("SIGTERM", finish); });
+    await r.close();
+  } else if (sub === "tree") {
+    const path = args._[2];
+    if (!path) { console.error("usage: swarm.mjs transfer tree <path> --to HOST:PORT@PUBKEY,HOST:PORT@PUBKEY [--fanout N]"); process.exit(2); }
+    const targets = csv(need(args, "to")).map((spec) => {
+      const at = String(spec).lastIndexOf("@");
+      if (at < 0) { console.error("each --to entry must be HOST:PORT@PUBKEY"); process.exit(2); }
+      const { host, port } = parseHostPort(spec.slice(0, at), "--to");
+      return { host, port, publicKey: spec.slice(at + 1) };
+    });
+    const r = await T.sendTree(resolve(String(path)), targets, {
+      keypair: txKeypair(args, dir, T), fanout: args.fanout ? Number(args.fanout) : 2,
+      encrypt: !args.insecure, ...txNetOpts(args),
+      streams: args.streams ? Number(args.streams) : undefined,
+      chunkSize: args["chunk-kb"] ? Number(args["chunk-kb"]) * 1024 : undefined,
+    });
+    console.log(args.json ? JSON.stringify(r) : `tree-sent ${r.name} to ${r.receivers} receivers in ${r.totalSeconds.toFixed(2)}s (aggregate ${r.throughputMBps.toFixed(1)} MiB/s)`);
   } else {
-    console.error("usage: swarm.mjs transfer identity|ping --to HOST:PORT|receipt --manifest-id ID [--blockhash B | --submit --rpc URL]");
+    console.error("usage: swarm.mjs transfer identity|ping --to HOST:PORT|receipt --manifest-id ID [--blockhash B | --submit --rpc URL]|relay [--host H --port P]|tree <path> --to HOST:PORT@PK,...");
     process.exit(2);
   }
 }

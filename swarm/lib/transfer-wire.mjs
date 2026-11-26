@@ -32,7 +32,7 @@ export function shardHeader(stripe, index) {
   return h;
 }
 
-class FramedConn {
+export class FramedConn {
   constructor(sock) {
     this.sock = sock;
     this.closed = false;
@@ -166,3 +166,24 @@ export const tcpTransport = {
 };
 
 export const TRANSPORTS = { tcp: tcpTransport };
+
+export function registerTransport(name, t) {
+  if (!t || typeof t.listen !== "function" || typeof t.connect !== "function") {
+    throw new Error(`registerTransport(${name}): listen and connect are required`);
+  }
+  TRANSPORTS[name] = t;
+  return t;
+}
+
+/** Resolve a named transport, lazily loading the optional QUIC backend. */
+export async function resolveTransport(name) {
+  if (!name) name = "tcp";
+  if (name === "quic" && !TRANSPORTS.quic) {
+    const { ensureQuicTransport } = await import("./transfer-quic.mjs");
+    await ensureQuicTransport();
+  }
+  const t = TRANSPORTS[name];
+  if (!t) throw new Error(`unknown transport ${name} (built-in: tcp; optional: quic)`);
+  return t;
+}
+

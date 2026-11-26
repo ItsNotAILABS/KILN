@@ -104,7 +104,7 @@ Deployments must use a dedicated deployer key supplied through the environment a
 ## Agent machines
 
 - [Virtual computers](docs/KILN_VIRTUAL_COMPUTERS.md): a persistent machine per agent, with a desktop, Chrome, a pinned toolchain, a control API, and owner hand-off for sign-ins and 2FA
-- [Agent transfer](docs/KILN_AGENT_TRANSFER.md): agent-to-agent file/zip/directory transfer of any size: erasure-coded stripes over parallel streams, per-chunk SHA-256, an ed25519-signed (Solana-format) manifest, resume, and an optional devnet Memo receipt
+- [Agent transfer](docs/KILN_AGENT_TRANSFER.md): agent-to-agent file/zip/directory transfer of any size: erasure-coded stripes over parallel TCP (QUIC opt-in), a blind relay + rendezvous with punch-or-relay fallback, a Turbine-style multi-receiver tree, per-chunk SHA-256, an ed25519-signed (Solana-format) manifest, resume, optional local/devnet Memo receipts, and daemon HTTP routes
 
 ## Public verification and sovereign network
 

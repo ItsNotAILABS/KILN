@@ -24,7 +24,9 @@ import { join, resolve as resolvePath, basename, dirname, posix } from "node:pat
 import { tmpdir, availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { spawn } from "node:child_process";
-import { TRANSPORTS, T, jsonPayload, parseJson, shardHeader } from "./transfer-wire.mjs";
+import { TRANSPORTS, T, jsonPayload, parseJson, shardHeader, resolveTransport } from "./transfer-wire.mjs";
+import { relayDial, newToken as newRelayToken, punchOrRelay } from "./transfer-relay.mjs";
+import { signHopGrant, verifyHopGrant, canonicalJson } from "./transfer-manifest.mjs";
 import {
   clientHandshake, serverHandshake, finishHandshake, deriveCiphers,
   requireEncryptOrLoopback, isLoopback,
@@ -38,10 +40,20 @@ import { writeFileAtomicSync } from "./state.mjs";
 
 export { buildManifest, signManifest, verifySignedManifest } from "./transfer-manifest.mjs";
 export { generateKeypair, loadOrCreateKeypair, loadKeypairFile } from "./transfer-identity.mjs";
-export { buildMemoReceipt, submitMemoReceipt, verifyMemoReceipt } from "./transfer-receipt.mjs";
+export { buildMemoReceipt, submitMemoReceipt, verifyMemoReceipt, confirmMemoReceipt, submitAndConfirmMemoReceipt, checkRpcUrl } from "./transfer-receipt.mjs";
+export { startRelay, relayDial, punchOrRelay, newToken as newRelayToken } from "./transfer-relay.mjs";
+export { ensureQuicTransport, TransferQuicUnavailable } from "./transfer-quic.mjs";
+export { signHopGrant, verifyHopGrant } from "./transfer-manifest.mjs";
 export { FrameCipher, isLoopback, requireEncryptOrLoopback } from "./transfer-crypto.mjs";
 
 export class TransferError extends Error {}
+
+export function parseAddr(v) {
+  if (v && typeof v === "object" && v.port != null) return { host: v.host || "127.0.0.1", port: Number(v.port) };
+  const m = /^(.*):(\d+)$/.exec(String(v || ""));
+  if (!m) throw new TransferError(`address must be HOST:PORT, got ${JSON.stringify(v)}`);
+  return { host: m[1].replace(/^\[|\]$/g, "") || "127.0.0.1", port: Number(m[2]) };
+}
 
 export function identityPath(stateDir) { return join(stateDir, "transfer", "id.json"); }
 export function loadIdentity(stateDir) { return loadOrCreateKeypair(identityPath(stateDir)); }
@@ -133,16 +145,39 @@ async function readFull(fh, buf, len, pos) {
  */
 export async function sendFile(path, opts = {}) {
   const {
-    host = "127.0.0.1", port, keypair, streams = 8, transport = "tcp", expectReceiver, name,
+    host = "127.0.0.1", port, keypair, transport = "tcp", expectReceiver, name,
     chunkSize = DEFAULTS.chunkSize, dataShards = DEFAULTS.dataShards, parityShards = DEFAULTS.parityShards,
     workers = Math.max(1, Math.min(4, availableParallelism() - 1)), envelope: givenEnv,
-    onProgress, _hooks = {}, encrypt = true,
+    onProgress, _hooks = {}, encrypt = true, via, token, rendezvous, forceRelay = false,
+    tree, hopAuth, connect: givenConnect,
   } = opts;
+  // QUIC is faster on a single stream in our probes (~40 MiB/s vs ~18 with 8).
+  const streams = opts.streams ?? (transport === "quic" ? 1 : 8);
   if (!keypair) throw new TransferError("sendFile: keypair is required");
-  if (!port) throw new TransferError("sendFile: port is required");
-  requireEncryptOrLoopback(encrypt, host, "sendFile");
-  const tp = TRANSPORTS[transport];
-  if (!tp) throw new TransferError(`unknown transport ${transport}`);
+  const viaAddr = via && (typeof via === "string" ? parseAddr(via) : via);
+  const rendAddr = rendezvous && (typeof rendezvous === "string" ? parseAddr(rendezvous) : rendezvous);
+  if (!port && !viaAddr && !rendAddr) throw new TransferError("sendFile: port, via, or rendezvous is required");
+  requireEncryptOrLoopback(encrypt, (viaAddr || rendAddr || { host }).host, "sendFile");
+  const tp = await resolveTransport(transport);
+  let pathMode = "direct";
+  let connect = givenConnect || ((hp) => tp.connect(hp));
+  if (viaAddr) {
+    if (!token) throw new TransferError("sendFile: --via requires a token (the one recv printed)");
+    connect = () => relayDial({ host: viaAddr.host, port: viaAddr.port, token, role: "send" });
+    pathMode = "relay";
+  } else if (rendAddr) {
+    if (!token) throw new TransferError("sendFile: rendezvous requires a token");
+    let session;
+    connect = async () => {
+      if (!session) {
+        session = await punchOrRelay({ rendezvous: rendAddr, token, role: "send", forceRelay, holePunchMs: opts.holePunchMs });
+        pathMode = session.path;
+        return session.conn;
+      }
+      if (session.path === "relay") return relayDial({ host: rendAddr.host, port: rendAddr.port, token, role: "send" });
+      return tp.connect({ host: session.peerHost || host, port: session.peerPort || port });
+    };
+  }
   const t0 = performance.now();
   const env = givenEnv || signManifest(await buildManifest(path, { name, chunkSize, dataShards, parityShards, sender: keypair.publicKey, workers: Math.max(1, workers) }), keypair);
   const m = env.manifest;
@@ -152,12 +187,12 @@ export async function sendFile(path, opts = {}) {
   // handshakes, no worker threads. Big files fan out over `streams` sockets.
   const dataStreams = stripes <= 1 ? 0 : Math.max(0, Math.min(64, streams));
 
-  const ctrl = await tp.connect({ host, port });
+  const ctrl = await connect({ host, port });
   const nextCtrl = frameQueue(ctrl);
   const conns = [];
   let pool = null, fh = null;
   const stats = { id: env.id, name: m.name, bytes: m.size, stripes, skippedStripes: 0, sentStripes: 0, repairRounds: 0,
-    shardsSent: 0, wireBytes: 0, streams: Math.max(1, dataStreams), transport: tp.name, encrypt };
+    shardsSent: 0, wireBytes: 0, streams: Math.max(1, dataStreams), transport: tp.name, encrypt, path: pathMode };
   try {
     if (encrypt) {
       const hs = clientHandshake(keypair);
@@ -175,7 +210,7 @@ export async function sendFile(path, opts = {}) {
     }
     if (_hooks.tamperCiphertext) ctrl._tamperNext = true;
     const nonce = randomBytes(16).toString("hex");
-    ctrl.send(T.HELLO, jsonPayload({ envelope: env, streams: dataStreams, nonce }));
+    ctrl.send(T.HELLO, jsonPayload({ envelope: env, streams: dataStreams, nonce, tree: tree || undefined, hopAuth: hopAuth || undefined, forwardGrant: opts.forwardGrant }));
     const w = await nextCtrl(60000);
     if (w.type === T.ERROR) throw new TransferError(`receiver refused: ${parseJson(w.payload).error}`);
     if (w.type !== T.WELCOME) throw new TransferError(`unexpected frame ${w.type}`);
@@ -193,7 +228,7 @@ export async function sendFile(path, opts = {}) {
       const joins = [];
       for (let i = 0; i < dataStreams; i++) {
         joins.push((async () => {
-          const c = await tp.connect({ host, port });
+          const c = await connect({ host, port });
           const p = waitFrame(c, [T.JOINED]);
           if (encrypt) {
             const hs = clientHandshake(keypair, { session: welcome.session });
@@ -307,6 +342,7 @@ export async function sendFile(path, opts = {}) {
   stats.totalSeconds = (t1 - t0) / 1000;
   stats.throughputMBps = m.size / 1048576 / Math.max(stats.transferSeconds, 1e-9);
   stats.peakRssMB = Math.round(process.resourceUsage().maxRSS / 1024);
+  stats.path = pathMode;
   return stats;
 }
 
@@ -483,6 +519,17 @@ class RecvSession {
     const result = { status: "complete", id: this.id, name: this.m.name, path: dest, bytes: this.m.size,
       sender: this.m.sender, root: this.m.root, mismatchesDropped: this.mismatches,
       receiverPeakRssMB: Math.round(process.resourceUsage().maxRSS / 1024) };
+    if (this.tree && this.tree.length) {
+      const hops = [];
+      for (const child of this.tree) {
+        hops.push(sendFile(dest, {
+          host: child.host, port: child.port, keypair: this.rx.keypair, envelope: this.env,
+          expectReceiver: child.publicKey, encrypt: this.rx.encrypt, transport: this.rx.transport,
+          tree: child.children, hopAuth: this.forwardGrant, forwardGrant: child.hopAuth,
+        }));
+      }
+      result.forwarded = await Promise.all(hops);
+    }
     this.rx.sessions.delete(this.session); this.rx.active.delete(this.id);
     this.rx.stats.completed++;
     if (this.rx.onComplete) {
@@ -512,15 +559,16 @@ class RecvSession {
  */
 export async function startReceiver(opts = {}) {
   const { outDir, host = "127.0.0.1", port = 0, keypair, trust, transport = "tcp", overwrite = false,
-    verifyFile = false, onComplete, maxSize = Infinity, encrypt = true } = opts;
+    verifyFile = false, onComplete, maxSize = Infinity, encrypt = true, via, token, rendezvous, forceRelay = false } = opts;
   if (!outDir) throw new TransferError("startReceiver: outDir is required");
   if (!keypair) throw new TransferError("startReceiver: keypair is required");
-  requireEncryptOrLoopback(encrypt, host, "startReceiver");
-  const tp = TRANSPORTS[transport];
-  if (!tp) throw new TransferError(`unknown transport ${transport}`);
+  const viaAddr = via && (typeof via === "string" ? parseAddr(via) : via);
+  const rendAddr = rendezvous && (typeof rendezvous === "string" ? parseAddr(rendezvous) : rendezvous);
+  requireEncryptOrLoopback(encrypt, (viaAddr || rendAddr || { host }).host, "startReceiver");
+  const tp = await resolveTransport(transport);
   await mkdir(outDir, { recursive: true });
   const rx = { outDir: resolvePath(outDir), overwrite, verifyFile, onComplete, sessions: new Map(), active: new Map(), closing: new Map(),
-    stats: { completed: 0, recoveredStripes: 0 }, encrypt, requireEncrypt: encrypt };
+    stats: { completed: 0, recoveredStripes: 0 }, encrypt, requireEncrypt: encrypt, keypair, transport };
 
   const onConnection = (conn) => {
     let sess = null, role = null, hsSender = null;
@@ -550,10 +598,19 @@ export async function startReceiver(opts = {}) {
         try {
           hello = parseJson(payload);
           const id = verifySignedManifest(hello.envelope, { trust });
-          if (hsSender && hello.envelope.manifest.sender !== hsSender) throw new Error("manifest sender does not match handshake identity");
+          if (hsSender && hello.envelope.manifest.sender !== hsSender) {
+            const grant = hello.hopAuth;
+            if (!grant || !verifyHopGrant(hello.envelope.manifest.sender, grant, { manifestId: id, hop: hsSender })
+                || !Array.isArray(grant.children) || !grant.children.includes(keypair.publicKey)) {
+              throw new Error("hop grant is missing, invalid, or does not name this receiver");
+            }
+          }
           if (hello.envelope.manifest.size > maxSize) throw new Error(`file exceeds this receiver's max size`);
           if (rx.active.has(id)) throw new Error("this manifest is already being received");
           sess = new RecvSession(rx, hello.envelope, id, conn, hello.streams);
+          sess.wireSender = hsSender || hello.envelope.manifest.sender;
+          if (hello.tree) sess.tree = hello.tree;
+          if (hello.forwardGrant) sess.forwardGrant = hello.forwardGrant;
           rx.active.set(id, sess);
           rx.sessions.set(sess.session, sess);
           if (rx.closing.has(id)) await rx.closing.get(id);
@@ -575,11 +632,12 @@ export async function startReceiver(opts = {}) {
         if (!sess) { conn.send(T.ERROR, jsonPayload({ error: "unknown session" })); conn.end(); return; }
         if (rx.requireEncrypt || j.ephPub) {
           try {
-            const reply = serverHandshake(keypair, j, { session: j.session, expectedSender: sess.m.sender });
+            const expectedSender = sess.wireSender || sess.m.sender;
+            const reply = serverHandshake(keypair, j, { session: j.session, expectedSender });
             conn.send(T.JOINED, jsonPayload(reply.payload));
             const ciphers = deriveCiphers({
               shared: reply.shared, clientEph: reply.clientEph, serverEph: reply.serverEph,
-              clientId: sess.m.sender, serverId: keypair.publicKey, nonce: reply.nonce, context: "data:" + j.session, side: "server",
+              clientId: expectedSender, serverId: keypair.publicKey, nonce: reply.nonce, context: "data:" + j.session, side: "server",
             });
             conn.installCipher(ciphers.send, ciphers.recv);
           } catch (e) {
@@ -606,16 +664,55 @@ export async function startReceiver(opts = {}) {
       else if (role === "ctrl" && !sess.done) sess.close();
     });
   };
+  const tok = token || (viaAddr || rendAddr ? newRelayToken() : undefined);
+  let closed = false;
+  const acceptAbort = new AbortController();
+  if (viaAddr) {
+    const loops = [];
+    const acceptOnce = async () => {
+      const conn = await relayDial({ host: viaAddr.host, port: viaAddr.port, token: tok, role: "recv", signal: acceptAbort.signal });
+      if (closed) { conn.destroy(); return; }
+      onConnection(conn);
+    };
+    // Keep a few pending accept dials so a sender's parallel streams can pair quickly.
+    const run = async () => {
+      while (!closed) {
+        try { await acceptOnce(); } catch (e) { if (!closed) await new Promise((r) => setTimeout(r, 50)); }
+      }
+    };
+    for (let i = 0; i < 12; i++) loops.push(run());
+    return { port: viaAddr.port, host: viaAddr.host, publicKey: keypair.publicKey, outDir: rx.outDir, stats: rx.stats, encrypt,
+      token: tok, via: true, path: "relay",
+      close: async () => { closed = true; acceptAbort.abort(); for (const s of [...rx.sessions.values()]) s.close(); } };
+  }
   const srv = await tp.listen({ host, port, onConnection });
+  if (rendAddr) {
+    // Publish our listen port so the sender can try a direct dial, and also
+    // accept relay-fallback connections under the same token.
+    import("./transfer-relay.mjs").then((R) =>
+      R.rendezvousExchange({ host: rendAddr.host, port: rendAddr.port, token: tok, role: "recv",
+        candidates: [{ host, port: srv.port }], waitMs: opts.holePunchMs || 4000 }).catch(() => {}));
+    const run = async () => {
+      while (!closed) {
+        try {
+          const conn = await relayDial({ host: rendAddr.host, port: rendAddr.port, token: tok, role: "recv", signal: acceptAbort.signal });
+          if (!closed) onConnection(conn);
+        } catch { if (!closed) await new Promise((r) => setTimeout(r, 50)); }
+      }
+    };
+    for (let i = 0; i < 12; i++) run();
+  }
   return { port: srv.port, host, publicKey: keypair.publicKey, outDir: rx.outDir, stats: rx.stats, encrypt,
-    close: async () => { for (const s of [...rx.sessions.values()]) s.close(); await srv.close(); } };
+    token: tok, rendezvous: !!rendAddr,
+    close: async () => { closed = true; acceptAbort.abort(); for (const s of [...rx.sessions.values()]) s.close(); await srv.close(); } };
 }
 
 /** Round-trip a small payload on an open connection (latency probe). */
 export async function pingLatency({ host = "127.0.0.1", port, count = 200, size = 64, transport = "tcp", keypair, expectReceiver, encrypt = true }) {
   requireEncryptOrLoopback(encrypt, host, "pingLatency");
   if (encrypt && !keypair) throw new TransferError("pingLatency: keypair is required when encryption is on");
-  const conn = await TRANSPORTS[transport].connect({ host, port });
+  const tp = await resolveTransport(transport);
+  const conn = await tp.connect({ host, port });
   if (encrypt) {
     const hs = clientHandshake(keypair);
     const ok = await new Promise((resolve, reject) => {
@@ -758,4 +855,77 @@ export async function receiveIntoComputer(stateDir, ref, { subdir = "inbox", ext
     if (userDone) await userDone(r, env);
     return { vc: vc.id, homePath: inside, path: undefined };
   } });
+}
+
+
+// ---------------------------------------------------------------- multi-receiver tree (Turbine-style fan-out)
+
+/** Breadth-first tree over `targets`, each node having at most `fanout` children. */
+export function buildTree(targets, fanout = 2) {
+  const n = Math.max(1, Math.min(16, Number(fanout) || 2));
+  const nodes = targets.map((t) => ({ host: t.host, port: t.port, publicKey: t.publicKey, children: [] }));
+  const roots = nodes.slice(0, Math.min(n, nodes.length));
+  const q = [...roots];
+  let i = roots.length, qi = 0;
+  while (i < nodes.length) {
+    const parent = q[qi++];
+    for (let k = 0; k < n && i < nodes.length; k++) {
+      parent.children.push(nodes[i]);
+      q.push(nodes[i]);
+      i++;
+    }
+  }
+  return roots;
+}
+
+function markHopGrants(kp, manifestId, node) {
+  for (const c of node.children) markHopGrants(kp, manifestId, c);
+  if (node.children.length) {
+    node.hopAuth = signHopGrant(kp, { manifestId, hop: node.publicKey, children: node.children.map((c) => c.publicKey) });
+  }
+}
+
+function publicTree(node) {
+  return {
+    host: node.host, port: node.port, publicKey: node.publicKey,
+    hopAuth: node.hopAuth, children: (node.children || []).map(publicTree),
+  };
+}
+
+/**
+ * Send one file to many receivers through a tree. The origin only talks to
+ * the first-level nodes (at most `fanout`). Each hop hash-verifies the
+ * whole file, then forwards it to its children under an origin-signed hop
+ * grant (so a stranger cannot insert themselves mid-tree). Resolves when
+ * every node in the tree has confirmed (COMPLETE bubbles up).
+ */
+export async function sendTree(path, targets, opts = {}) {
+  if (!Array.isArray(targets) || targets.length < 1) throw new TransferError("sendTree: targets[] is required");
+  const { keypair, fanout = 2, envelope: givenEnv, ...rest } = opts;
+  if (!keypair) throw new TransferError("sendTree: keypair is required");
+  const env = givenEnv || signManifest(await buildManifest(path, { name: rest.name, chunkSize: rest.chunkSize, dataShards: rest.dataShards, parityShards: rest.parityShards, sender: keypair.publicKey, workers: rest.workers }), keypair);
+  const roots = buildTree(targets, fanout);
+  for (const r of roots) markHopGrants(keypair, env.id, r);
+  const t0 = performance.now();
+  const branches = await Promise.all(roots.map((r) => sendFile(path, {
+    ...rest, envelope: env, keypair, host: r.host, port: r.port, expectReceiver: r.publicKey,
+    tree: r.children.map(publicTree), forwardGrant: r.hopAuth,
+  })));
+  const totalSeconds = (performance.now() - t0) / 1000;
+  return {
+    id: env.id, name: env.manifest.name, bytes: env.manifest.size, receivers: targets.length, fanout: Math.max(1, Math.min(16, Number(fanout) || 2)),
+    branches, totalSeconds,
+    throughputMBps: (env.manifest.size * targets.length) / 1048576 / Math.max(totalSeconds, 1e-9),
+    originThroughputMBps: env.manifest.size / 1048576 / Math.max(totalSeconds, 1e-9),
+  };
+}
+
+/** N independent unicast sends of the same file (baseline for the tree bench). */
+export async function sendUnicastAll(path, targets, opts = {}) {
+  const t0 = performance.now();
+  const env = opts.envelope || signManifest(await buildManifest(path, { name: opts.name, chunkSize: opts.chunkSize, dataShards: opts.dataShards, parityShards: opts.parityShards, sender: opts.keypair.publicKey, workers: opts.workers }), opts.keypair);
+  const results = await Promise.all(targets.map((t) => sendFile(path, { ...opts, envelope: env, host: t.host, port: t.port, expectReceiver: t.publicKey })));
+  const totalSeconds = (performance.now() - t0) / 1000;
+  return { id: env.id, bytes: env.manifest.size, receivers: targets.length, results, totalSeconds,
+    throughputMBps: (env.manifest.size * targets.length) / 1048576 / Math.max(totalSeconds, 1e-9) };
 }

@@ -19,6 +19,7 @@ import { basename } from "node:path";
 import { Worker } from "node:worker_threads";
 import { availableParallelism } from "node:os";
 import { signBytes, verifyBytes } from "./transfer-identity.mjs";
+
 import { checkParams } from "./transfer-rs.mjs";
 
 export const MANIFEST_TYPE = "kiln.transfer/1";
@@ -156,4 +157,16 @@ export function verifySignedManifest(env, { trust } = {}) {
   }
   if (trust && trust.length && !trust.includes(m.sender)) throw new Error(`manifest: sender ${m.sender} is not trusted`);
   return id;
+}
+
+/** Origin authorizes a hop to forward this manifest to `children`. */
+export function signHopGrant(kp, { manifestId, hop, children = [] }) {
+  const body = { manifestId, hop, children };
+  return { ...body, sig: signBytes(kp, Buffer.from("kiln-transfer/1:hop:" + canonicalJson(body))).toString("base64") };
+}
+
+export function verifyHopGrant(originPub, grant, { manifestId, hop }) {
+  if (!grant || grant.manifestId !== manifestId || grant.hop !== hop) return false;
+  const body = { manifestId: grant.manifestId, hop: grant.hop, children: grant.children || [] };
+  return verifyBytes(originPub, Buffer.from("kiln-transfer/1:hop:" + canonicalJson(body)), Buffer.from(String(grant.sig || ""), "base64"));
 }

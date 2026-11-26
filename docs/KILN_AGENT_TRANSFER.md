@@ -100,39 +100,46 @@ default chunk size.
 staging dir, using disk rather than memory, and sends that. `recv
 --extract` unpacks it on arrival. Zips and tars send as-is.
 
-## Transport: why TCP, not QUIC (measured)
+## Transport: TCP default, QUIC opt-in (measured)
 
-The brief asked for QUIC if it is usable. What we found on this box (Node
-v24.22.1, 8 vCPU):
+The transport interface (`listen` / `connect` / framed `conn` in
+`swarm/lib/transfer-wire.mjs`, registry `TRANSPORTS`) is implemented twice:
+**parallel TCP is the default**, and **QUIC is opt-in** (`--transport quic`
+or `{ transport: "quic" }`). Node v24 still has no `node:quic`. The
+optional binding is `@matrixai/quic` 2.0.9 (Cloudflare quiche via N-API),
+loaded from `KILN_QUIC_DIR` or a normal import; it is not a required
+dependency. Application-level X25519 + AES-256-GCM still runs on every
+stream either way — the QUIC layer is transport only.
 
-- **Node has no built-in QUIC in v24.** `require("node:quic")` and
-  `--experimental-quic` both fail with `ERR_UNKNOWN_BUILTIN_MODULE`.
-- **The best-maintained userland QUIC, `@matrixai/quic` 2.0.9** (Cloudflare
-  quiche via N-API), works but is slow under Node. Over loopback, with 8
-  streams, 1 MiB writes, and flow-control windows raised to 64 MiB / 16 MiB,
-  it measured **1.6 MiB/s for 256 MiB** and **1.3 MiB/s for 128 MiB**. A
-  64 B stream round trip took 3.14 ms / 2.11 ms at p50. Reproduce with
-  `swarm/scripts/transfer-quic-probe.mjs` (the dependency is installed
-  outside the repo).
-- **Parallel TCP on the same box** moves the same data at about 560 to
-  620 MiB/s, roughly 400× faster, with no dependency.
+Untuned, the earlier probe on this box measured **1.3 to 1.6 MiB/s**.
+Raising flow-control windows to 1 GiB, `readableChunkSize` to 1 MiB, and
+the UDP payload to 65527, and preferring a single stream, improved that
+a lot, but not enough to unseat TCP:
 
-So the shipped transport is **parallel TCP**: N independent TCP
-connections with length-prefixed frames and `TCP_NODELAY`. Running
-separate connections, rather than HTTP/2 streams on one connection, keeps
-one slow or lost connection from stalling the others, which is the point
-of spreading shards. It sits behind a small transport interface
-(`listen` / `connect` / framed `conn` in `swarm/lib/transfer-wire.mjs`,
-registry `TRANSPORTS`). A QUIC transport can be added there without
-touching chunking, erasure coding, manifests or resume once Node ships
-`node:quic` (or a faster binding exists). Erasure coding still matters on
-TCP: it absorbs dropped connections, corrupt shards and partial sends
-without a round trip.
+| probe (loopback, 32 MiB, 2026-11-26, same box) | MiB/s |
+|---|---|
+| QUIC, 1 stream, 1 MiB writes | **41.4** |
+| QUIC, 8 streams, 4 MiB writes, batch 2 | 20.4 |
+| QUIC, 8 streams, 1 MiB writes | 18.7 |
+| QUIC, 32 streams, 256 KiB writes, batch 16 | 15.0 |
+| TCP + AES-256-GCM (default 1 GiB send, median of 5, 2026-11-25) | **385.9** |
 
-What TCP does not give you that QUIC would: TLS as the session layer,
-connection migration, and a single 0-RTT handshake. Confidentiality and
-mutual authentication are provided by the X25519 + AES-256-GCM handshake
-above, not by TLS.
+So QUIC ships as `--transport quic` with those numbers in the open, and
+TCP stays the default. On QUIC, `sendFile` defaults to 1 data stream
+because that was the fastest setting we measured. Reproduce the raw
+probe with `swarm/scripts/transfer-quic-probe.mjs`.
+
+A transfer-level comparison on the same box (32 MiB file, encryption
+on, default Reed-Solomon, 2026-11-26): TCP 8 streams **81.0 MiB/s**
+(0.40 s); QUIC 1 stream **19.0 MiB/s** (1.69 s). A 2 MiB QUIC send in
+`test/transfer-quic.test.mjs` was about 3.8 MiB/s — handshake and
+hashing dominate at that size. These are loopback/CPU numbers, not a
+link measurement.
+
+What TCP does not give you that QUIC would: UDP-level connection
+migration, and a single 0-RTT handshake. Confidentiality and mutual
+authentication are provided by the X25519 + AES-256-GCM handshake
+above, not by the transport's TLS.
 
 ## Benchmarks (measured, not estimated)
 
@@ -194,11 +201,15 @@ the 32-byte manifest hash would ever go on chain.
 `--submit --rpc <url>` sends it, but only to `https://api.devnet.solana.com`,
 `https://api.testnet.solana.com`, or `http://127.0.0.1|localhost:<port>`
 (solana-test-validator). Mainnet and every other URL are refused in code
-(`checkRpcUrl`). The payer needs devnet/local SOL first (`solana airdrop 1
-<pubkey> -u devnet`). **Not done:** a live devnet/local-validator
-submission. Devnet airdrops need an outside faucet, and the box has no
-`solana-test-validator`. The offline build plus web3.js verification is
-what was tested.
+(`checkRpcUrl`). `--submit --confirm` waits until the signature is
+`confirmed` or `finalized` (`confirmMemoReceipt` /
+`submitAndConfirmMemoReceipt`). The payer needs devnet/local SOL first
+(the helper will try `requestAirdrop` on allowed RPCs). Live submission
+is covered by `test/transfer-receipt-live.test.mjs` against
+`solana-test-validator` when the toolchain is on the PATH (Solana
+1.18.26 is present on this box). A public devnet faucet airdrop is
+attempted in the same test and reported if it is rate-limited; paid
+RPCs and mainnet are never used.
 
 ## Identities
 
@@ -232,13 +243,17 @@ SDK: `receiveIntoComputer(stateDir, ref, {subdir, extract, keypair})` and
 ```
 swarm.mjs recv [--out DIR] [--host H] [--port P] [--trust PK,PK] [--keypair FILE]
                [--once] [--extract] [--verify] [--overwrite] [--vc ID --subdir S]
-               [--insecure]
+               [--insecure] [--transport tcp|quic]
+               [--via HOST:PORT --token T] [--rendezvous HOST:PORT]
 swarm.mjs send <path> --to HOST:PORT [--expect PUBKEY] [--streams N] [--chunk-kb KB]
                [--data K] [--parity M] [--keypair FILE] [--from-vc ID] [--json]
-               [--insecure]
+               [--insecure] [--transport tcp|quic]
+               [--via HOST:PORT --token T] [--rendezvous HOST:PORT] [--force-relay]
 swarm.mjs transfer identity [--keypair FILE]
 swarm.mjs transfer ping --to HOST:PORT [--count N] [--insecure]
-swarm.mjs transfer receipt --manifest-id ID [--blockhash B58 | --submit --rpc URL]
+swarm.mjs transfer receipt --manifest-id ID [--blockhash B58 | --submit [--confirm] --rpc URL]
+swarm.mjs transfer relay [--host H] [--port P]
+swarm.mjs transfer tree <path> --to HOST:PORT@PUBKEY,HOST:PORT@PUBKEY [--fanout N] [--json]
 ```
 
 `recv` prints one JSON line per event (`listening`, `received`). `send
@@ -268,6 +283,69 @@ swarm.mjs transfer receipt --manifest-id ID [--blockhash B58 | --submit --rpc UR
 - Names are sanitized to a basename, so a manifest cannot write outside
   `--out`.
 
+## NAT traversal and the relay
+
+`swarm.mjs transfer relay` (or `startRelay()` / `POST /v1/transfers` with
+`role: "relay"`) is a **blind byte splice**. Peers present a short
+plaintext pairing header (`RELAY_OPEN` / `RELAY_OK` plus a shared token);
+after that the relay copies raw bytes and never decrypts. The usual
+X25519 + AES-256-GCM handshake still runs end-to-end through the pipe, so
+the relay cannot read the file, the manifest, or the identities' secrets.
+
+The same process is a **rendezvous**. Each side announces listen
+candidates (`REND_ANNOUNCE` / `REND_PEERS`) and learns the peer's
+observed address, then tries a direct TCP dial and falls back to the
+relay if the punch does not land in time (`punchOrRelay`, or
+`--rendezvous HOST:PORT --token T` on `send` / `recv`). `--force-relay`
+skips the punch (tests, or a known-blocked path).
+
+**What is real vs simulated.** The relay, the pairing token, the
+rendezvous exchange, the loopback direct dial, and automatic fallback
+are real and tested. Creating network namespaces (`ip netns add`) on
+this host failed with `Permission denied` on `/run/netns`, so a true
+NAT hole-punch (two sides behind distinct NATs) was **not** measured;
+`forceRelay` stands in for a failed punch. Docker networks were left
+for a follow-up if a closer NAT simulation is needed.
+
+## Multi-receiver tree (Turbine-style fan-out)
+
+`sendTree(path, targets, { fanout, keypair, … })` and `swarm.mjs transfer
+tree` send one file to N receivers through a breadth-first tree of
+fanout `fanout` (default 2). The origin only talks to the first-level
+nodes. Each hop hash-verifies the whole file, then forwards the verified
+file to its children (store-and-forward, not mid-stripe pipelining)
+under an **origin-signed hop grant** (`kiln-transfer/1:hop:` plus
+canonical JSON of `{manifestId, hop, children}`). A hop whose identity
+does not match the grant, or that tries to send to a receiver the grant
+does not name, is refused. `COMPLETE` bubbles up only after the subtree
+has finished, so `sendTree` resolves when every receiver has a
+byte-exact file.
+
+On loopback, N parallel unicasts are often *faster* on the wall clock
+because the tree is store-and-forward along the depth of the tree; the
+win is origin bandwidth (the origin sends `fanout` copies, not N). The
+test (`test/transfer-tree.test.mjs`, 8 receivers, 2 MiB, fanout 2)
+prints both wall-clock numbers. Mid-stripe pipelining is not
+implemented.
+
+## Daemon HTTP routes
+
+The swarm daemon exposes operator-only routes, behind the same bearer
+token and account-scope guard as `/v1/vcomputers`:
+
+- `POST /v1/transfers` — start a `recv`, `send`, tree-send (`targets`),
+  or `relay`. A send can pass `waitMs` to wait for completion, and
+  `receipt.rpcUrl` to submit-and-confirm a Memo (allowed RPCs only).
+- `GET /v1/transfers` — list.
+- `GET /v1/transfers/{id}` — status.
+- `DELETE /v1/transfers/{id}` — cancel a listening recv/relay.
+- `GET` / `POST /v1/transfers/{id}/receipt` — fetch, or build / submit
+  a receipt.
+
+`SwarmClient` has matching methods (`startTransfer`, `listTransfers`,
+`getTransfer`, `cancelTransfer`, `getTransferReceipt`,
+`postTransferReceipt`). Encryption stays on by default.
+
 ## Tests
 
 - `test/transfer-unit.test.mjs` (18): the original 14, plus AES-256-GCM
@@ -285,15 +363,27 @@ swarm.mjs transfer receipt --manifest-id ID [--blockhash B58 | --submit --rpc UR
 - `test/transfer-vc-docker.test.mjs` (1): into and out of a real docker vc
   home, with the owner checked. It skips when docker or the image is
   missing.
+- `test/transfer-quic.test.mjs`: opt-in QUIC byte-exact send; skips
+  honestly when `@matrixai/quic` is not loadable.
+- `test/transfer-relay.test.mjs`: hop grants, a real blind relay, force
+  relay fallback, and a loopback rendezvous punch (not a real NAT).
+- `test/transfer-tree.test.mjs`: 8 receivers, fanout 2, every file
+  byte-exact, plus a unicast baseline and a rejected stranger hop.
+- `test/transfer-http.test.mjs`: daemon routes against a real daemon
+  (auth, start/list/receipt/cancel).
+- `test/transfer-receipt-live.test.mjs`: mainnet URL still refused; a
+  memo submitted to `solana-test-validator` and confirmed when the
+  binary starts; a devnet faucet attempt that is reported, not failed,
+  if rate-limited.
 
 ## Not done / limits
 
-- QUIC transport: not shipped (see the measurements above). The interface
-  is ready for it.
-- No live devnet or local-validator receipt submission.
-- No NAT traversal or relay: the receiver must be reachable (directly or
-  through a tunnel).
-- No daemon HTTP routes. Transfer is peer to peer through the CLI or SDK
-  and does not need the swarm daemon.
-- A single sender process fans out to one receiver. There is no
-  multi-receiver Turbine tree (retransmit layers).
+- QUIC is opt-in and still much slower than TCP on this binding (see
+  the measurements above). TCP + AEAD remains the default.
+- Tree forwarding is store-and-forward of a verified file, not
+  mid-stripe pipelining, so loopback wall-clock often favours N unicast
+  sends.
+- True NAT hole-punching was not measured: `ip netns` is denied on this
+  host. Fallback to the relay is real and tested via `forceRelay`.
+- A public devnet faucet may be rate-limited; the suite reports that
+  instead of failing. Paid RPCs and mainnet are never used.

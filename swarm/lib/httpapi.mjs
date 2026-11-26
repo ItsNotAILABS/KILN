@@ -35,6 +35,8 @@
  * Virtual computers — per-agent desktops (operator-only; routes and the
  * pre-auth owner hand-off page are listed in lib/vcomputer-http.mjs):
  *   /v1/vcomputers[/:id[/start|stop|screenshot|input|exec|jobs|handoff|toolcheck]]
+ * Agent transfer (operator-only; lib/transfer-http.mjs):
+ *   /v1/transfers[/:id[/receipt]]
  *   GET /handoff/:token, POST /handoff/:token/return, WS /handoff/:token/websockify
  * Git hosting (KILN-native repos, served via git http-backend CGI):
  *   POST /git/:owner/:repo            create repo (operator only; the repo
@@ -336,6 +338,7 @@
  */
 import { createServer } from "node:http";
 import { handleVcomputerApi, handleHandoffPublic, handleHandoffUpgrade } from "./vcomputer-http.mjs";
+import { handleTransferApi } from "./transfer-http.mjs";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
@@ -1710,6 +1713,9 @@ export function startApiServer(dir, cfg) {
         send, readBody,
         baseUrl: () => process.env.KILN_VC_HANDOFF_BASE_URL || cfg.vcomputers?.handoffBaseUrl || `http://127.0.0.1:${apiPort}`,
       })) return;
+
+      // ---- agent transfer: send/recv/relay/receipts (operator-only) ----
+      if (await handleTransferApi(req, res, path, url, dir, { send, readBody })) return;
 
       // ---- compute: serverless functions ----
       if (req.method === "POST" && path === "/v1/compute/invoke") {
